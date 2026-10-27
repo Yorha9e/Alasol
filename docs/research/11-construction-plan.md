@@ -49,6 +49,7 @@
 ### 其他已知事实
 - Go module path 含大写字母时，缓存路径用 `!` 转义（`Yorha9e` → `!yorha!9e`）——**可用**，只是缓存路径不美观
 - 私有仓库：需 `GOPRIVATE=github.com/Yorha9e/*` 才能免鉴权拉取本 module
+- **Windows 上 `go test -race` 必须 `CGO_ENABLED=1`**（race 检测需 cgo，本机有 gcc）；产品构建仍 `CGO_ENABLED=0` 禁 cgo——两者分开跑，别合成一条命令
 
 ### CI 参数（阶段 0 定稿，2026-10-27 施工 session）
 
@@ -72,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0（地基）+ 阶段 1（contracts）已完成**（2026-10-27）：仓库/目录/go.mod/CI · 12 份契约 schema（2020-12）+ 自写受限 codegen + 生成 Go 类型入库 + TS 最小消费端 + CI schema/YAML 门禁；**阶段退出评审循环已走完（critic 判定无问题）**；下一步：阶段 2 core 骨架 |
+| **代码** | **阶段 0–2 已完成**（2026-10-27）：仓库/CI/契约（12 schema + codegen + Go 类型 + TS 消费端）+ **core 骨架**（bus / policy / registry / 根接口，69 测 + race 干净）；阶段 2 退出评审循环 critic clean；下一步：阶段 3 runtime + 索引器 |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -130,11 +131,11 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 ### 阶段 2 · core 骨架（无 IO）
 - 事件总线（`durable` 区分，F8）/ 扩展注册表 + 生命周期 + 能力裁决 / 策略链（fail-close，deny·ask 跨来源并集，H5）
 - **core 只定义能力接口（exec / fs / net / proc），不含任何 IO 实现**（P0-4）
-- **验收**：
-  - [ ] **core 在没有 runtime 的情况下跑完全部单测**
-  - [ ] 换 `Store` 实现 → core 零改动
-  - [ ] 换 `Approver` → core 零改动
-  - [ ] 注册新 `Tool` → 不修改任何已有文件
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] **core 在没有 runtime 的情况下跑完全部单测**
+  - [x] 换 `Store` 实现 → core 零改动
+  - [x] 换 `Approver` → core 零改动
+  - [x] 注册新 `Tool` → 不修改任何已有文件
 
 ### 阶段 3 · runtime + 索引器
 - SQLite（`ncruces/go-sqlite3` v0.35.6，`_txlock=immediate` + `busy_timeout`）/ 事件日志（`seq` 由 AUTOINCREMENT 分配）/ **索引器**

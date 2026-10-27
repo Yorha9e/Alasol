@@ -7,9 +7,9 @@ type PolicyRule struct {
 	ID *string `json:"id,omitempty"`
 	// deny / ask / allow（H2）。
 	Effect Effect `json:"effect"`
-	// 工具名；裸工具名 deny = 移出模型可见集（H4）。
+	// 工具名；裸工具名 deny = 移出模型可见集（H4）。支持 `*` 通配（匹配所有工具）。
 	Tool string `json:"tool"`
-	// 参数化匹配（H4：参数化 deny = 拦截调用）。
+	// 参数化匹配（H4：参数化 deny = 拦截调用）。glob（path.Match 语法），与参数对象中任意字符串值匹配即命中。
 	ArgsPattern *string `json:"args_pattern,omitempty"`
 	// 规则来源（H5）：deny/ask 跨来源取并集；只有 allow 按来源优先级解析。workflow 来源的规则只可收窄、不可放宽（H5/H24）。
 	Source RuleSource `json:"source"`

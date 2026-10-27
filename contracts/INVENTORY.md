@@ -39,6 +39,7 @@ kind 是开放字符串（D6），core 定义核心子集。**本阶段必须定
 ## 3. 生成与编码约定（schema 与 codegen 共同遵守）
 
 - **演进铁律（F7）**：只增不删、不改义；弃用字段标 `x-deprecated`；envelope 带版本字段 `v`
+- **破坏性变更的分界规则**：**对外发布前**允许破坏性变更（直接改字段名 / 删字段），但必须在本清单 §5「契约变更记账」留痕；**发布后**必须走 `x-deprecated` + 版本递增，只增不删（改字段名会打断已发布的消费端——发布前可以，发布后不行）
 - **可选字段一律指针 + `json:",omitempty"`**（D2）——**例外：`json.RawMessage` 字段保持裸类型（nil 即缺省），见 D2 实现**；枚举 = 命名类型 + 常量；union = 接口 + Marshal/Unmarshal 包装
 - **codegen = 自写受限子集**（D2）：object / array / string / number / bool / enum / required / optional / nested / 非循环 `$ref`；禁 `$ref` 循环与复杂组合
 - **id 纪律（S 系，`08`）**：
@@ -59,6 +60,14 @@ kind 是开放字符串（D6），core 定义核心子集。**本阶段必须定
 5. ✅ CI schema job 点亮（再生成 diff 为空 + TS 消费端 + 类型检查 + 坏样本必须被拒）
 
 **硬门槛（11 §2 阶段 1 验收）**：生成物入库 + 再生成 diff 为空 · 可选字段指针+omitempty · TS 消费端可读 · `Tool.schema` 元嵌套按原始 JSON 处理。**契约稳定前不写 core 实现。**
+
+## 5. 契约变更记账
+
+**破坏性契约变更**（改字段名 / 删字段 / 改语义）在这里留痕——口径见 §3 的分界规则：**发布前**允许直接改（但必须记账），**发布后**只走 `x-deprecated` + 版本递增。非破坏性的说明性澄清（只改 description）不记账。
+
+| 日期 | 契约 | 变更 | 原因 | 阶段 |
+|---|---|---|---|---|
+| 2026-10-27 | `transport.SubscribeRequest` | `kinds` → `kind_prefixes` | 字段名与语义漂移：原名 `kinds` 暗示"精确 kind 列表"，description 却写"前缀匹配由实现定义"——改为 `kind_prefixes` 并把语义钉死为**按 kind 前缀匹配**（如 `tool.call.`）。**发布前破例一次**（发布后须走 `x-deprecated` + 版本递增） | 阶段 2 core 骨架（P2-7 修语义漂移） |
 
 ---
 

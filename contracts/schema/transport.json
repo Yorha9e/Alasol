@@ -43,10 +43,10 @@
           "$ref": "common.json#/$defs/Ulid",
           "description": "只订阅某 session；缺省 = 全部。"
         },
-        "kinds": {
+        "kind_prefixes": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "只订阅这些 kind（前缀匹配由实现定义）；缺省 = 全部。"
+          "description": "只订阅 kind 以这些前缀开头的事件（按 kind 前缀匹配，如 \"tool.call.\"）；缺省 = 全部。"
         },
         "durable_only": {
           "type": "boolean",

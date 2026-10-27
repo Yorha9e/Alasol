@@ -23,8 +23,8 @@ type TransportMessage struct {
 type SubscribeRequest struct {
 	// 只订阅某 session；缺省 = 全部。
 	SessionID *Ulid `json:"session_id,omitempty"`
-	// 只订阅这些 kind（前缀匹配由实现定义）；缺省 = 全部。
-	Kinds []string `json:"kinds,omitempty"`
+	// 只订阅 kind 以这些前缀开头的事件（按 kind 前缀匹配，如 "tool.call."）；缺省 = 全部。
+	KindPrefixes []string `json:"kind_prefixes,omitempty"`
 	// true = 只收事实事件（不含流事件）。
 	DurableOnly *bool `json:"durable_only,omitempty"`
 }

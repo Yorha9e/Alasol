@@ -18,11 +18,11 @@
         },
         "tool": {
           "type": "string",
-          "description": "工具名；裸工具名 deny = 移出模型可见集（H4）。"
+          "description": "工具名；裸工具名 deny = 移出模型可见集（H4）。支持 `*` 通配（匹配所有工具）。"
         },
         "args_pattern": {
           "type": "string",
-          "description": "参数化匹配（H4：参数化 deny = 拦截调用）。"
+          "description": "参数化匹配（H4：参数化 deny = 拦截调用）。glob（path.Match 语法），与参数对象中任意字符串值匹配即命中。"
         },
         "source": {
           "$ref": "#/$defs/RuleSource",
