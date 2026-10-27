@@ -129,6 +129,21 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Error.Code == nil {
 				t.Errorf("line %d: error.code is missing", lineNo)
 			}
+		case "context.assembled":
+			var p ContextSnapshot
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ContextSnapshot: %v", lineNo, err)
+				break
+			}
+			if p.SessionID == "" {
+				t.Errorf("line %d: context snapshot session_id is empty", lineNo)
+			}
+			if p.TokensBudget == 0 {
+				t.Errorf("line %d: context snapshot tokens_budget is zero", lineNo)
+			}
+			if len(p.Parts) == 0 {
+				t.Errorf("line %d: context snapshot parts are empty", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -147,8 +162,9 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	if seen == 0 {
 		t.Fatalf("%s has no events", sampleEventsPath)
 	}
-	// The three tool.call kinds must all be covered by the sample.
-	for _, kind := range []string{"tool.call.intent", "tool.call.completed", "tool.call.failed"} {
+	// Every kind with a frozen payload mapping must be covered by the sample
+	// and must decode into its type (x-kind-payload in event.json is the source).
+	for _, kind := range []string{"tool.call.intent", "tool.call.completed", "tool.call.failed", "context.assembled"} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)
 		}
