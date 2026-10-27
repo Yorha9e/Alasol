@@ -4,15 +4,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
 
 // nodeKind is the (small) set of schema shapes the generator understands.
 //
-// This is the "restricted subset" of D2: object / array / string / integer /
-// number / boolean / enum / non-cyclic $ref / x-go-type raw JSON. Anything
-// outside it is a hard error, never a silent fallback.
+// This is the "restricted subset" of JSON Schema 2020-12 (D2): object / array /
+// string / integer / number / boolean / enum / non-cyclic $ref / x-go-type raw
+// JSON. Anything outside it is a hard error, never a silent fallback.
 type nodeKind int
 
 const (
@@ -256,6 +257,28 @@ func parseNode(v *jsonValue, ctx string) (*schemaNode, error) {
 		if ref == "" {
 			return nil, fmt.Errorf("%s: $ref must not be empty", ctx)
 		}
+		// A $ref node may only carry the keywords of the allow-list below
+		// plus "x-" annotations. An assertion keyword (allOf/type/enum/
+		// items/properties/...) would be silently dropped, which is exactly
+		// the "guessing" the subset forbids: reject instead.
+		if err := checkRefSiblings(v, ctx); err != nil {
+			return nil, err
+		}
+		n.description = schemaDoc(v)
+		// x-go-type wins over $ref: the schema explicitly asks for raw JSON,
+		// so the referenced type is not used.
+		if xg, ok := v.Member("x-go-type"); ok {
+			s, err := xg.stringValue(ctx, "x-go-type")
+			if err != nil {
+				return nil, err
+			}
+			if s != "json.RawMessage" {
+				return nil, fmt.Errorf("%s: unsupported x-go-type %q (only \"json.RawMessage\")", ctx, s)
+			}
+			n.kind = nodeRaw
+			n.xGoType = s
+			return n, nil
+		}
 		n.kind = nodeRef
 		n.ref = ref
 		return n, nil
@@ -341,6 +364,42 @@ func parseNode(v *jsonValue, ctx string) (*schemaNode, error) {
 func hasProperties(v *jsonValue) bool {
 	p, ok := v.Member("properties")
 	return ok && p.Kind == jsonObject
+}
+
+// refSiblingAllowList lists the standard keywords that may sit next to a
+// "$ref".
+//
+// "$ref" is a reference: the codegen follows it and ignores everything else,
+// so an *assertion* keyword next to it would be a silent lie ("type":
+// "string" next to a $ref to an object would compile into the referenced
+// type). The list keeps the keywords that carry information the generator can
+// honour (description / title → doc comment). Everything else that is not an
+// "x-" annotation is a hard error.
+//
+// The "x-" annotations (x-go-type, x-id-kind, x-invariants, x-deprecated, ...)
+// are allowed next to a reference: they are machine-readable notes, not
+// assertions, and the codegen ignores them (the F7 evolution rule marks a
+// deprecated field with "x-deprecated", which must not break the build).
+var refSiblingAllowList = []string{"$ref", "description", "title"}
+
+// refSiblingAnnotationPrefix is the prefix of the machine-readable notes that
+// may sit next to a "$ref".
+const refSiblingAnnotationPrefix = "x-"
+
+// checkRefSiblings rejects a "$ref" node that carries an assertion keyword
+// next to the reference.
+func checkRefSiblings(v *jsonValue, ctx string) error {
+	for _, m := range v.Members {
+		if slices.Contains(refSiblingAllowList, m.Key) {
+			continue
+		}
+		if strings.HasPrefix(m.Key, refSiblingAnnotationPrefix) {
+			continue // x- annotation: a note, not an assertion
+		}
+		return fmt.Errorf("%s: %q cannot be combined with \"$ref\": next to a reference the codegen only accepts %s and %s* annotations (reject, never guess)",
+			ctx, m.Key, strings.Join(refSiblingAllowList, ", "), refSiblingAnnotationPrefix)
+	}
+	return nil
 }
 
 func (n *schemaNode) compileObject(v *jsonValue, ctx string) (*schemaNode, error) {

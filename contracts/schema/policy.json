@@ -49,8 +49,8 @@
       "required": ["verdict"],
       "properties": {
         "verdict": {
-          "$ref": "#/$defs/Verdict",
-          "description": "allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。"
+          "$ref": "#/$defs/Effect",
+          "description": "判定结果：allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。"
         },
         "rule_id": {
           "type": "string",
@@ -63,11 +63,6 @@
           "description": "verdict=ask 时携带的建议规则（D13）。"
         }
       }
-    },
-    "Verdict": {
-      "type": "string",
-      "enum": ["allow", "deny", "ask"],
-      "description": "判定结果（D13）。"
     }
   }
 }

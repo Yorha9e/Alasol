@@ -53,6 +53,10 @@ func main() {
 		os.Exit(1)
 	}
 	for _, r := range results {
+		if r.Removed {
+			fmt.Printf("%s: removed (no matching schema file)\n", r.Output)
+			continue
+		}
 		status := "generated"
 		if *check {
 			status = "up to date"

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://example.invalid/alasol/testdata/refsibling/a.json",
+  "description": "$ref sibling fixture: only the allow-listed keywords may sit next to a $ref.",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "x-id-kind": "framework",
+      "description": "框架 id。"
+    },
+    "Holder": {
+      "type": "object",
+      "required": ["id", "raw", "described", "titled", "deprecated"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/Ulid",
+          "description": "同级 description：允许（进文档注释）。"
+        },
+        "raw": {
+          "$ref": "#/$defs/Ulid",
+          "x-go-type": "json.RawMessage",
+          "description": "同级 x-go-type：按 x-go-type 走（RawMessage）。"
+        },
+        "described": {
+          "$ref": "#/$defs/Ulid",
+          "title": "标题",
+          "description": "同级 title：允许。"
+        },
+        "titled": {
+          "$ref": "#/$defs/Ulid",
+          "x-id-kind": "framework"
+        },
+        "deprecated": {
+          "$ref": "#/$defs/Ulid",
+          "x-deprecated": true,
+          "description": "同级 x-deprecated：允许（F7 演进铁律的弃用标记）。"
+        }
+      }
+    }
+  }
+}

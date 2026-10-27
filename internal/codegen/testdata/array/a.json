@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://example.invalid/alasol/testdata/array/a.json",
+  "title": "Items",
+  "description": "Array fixture: a top-level $defs array whose items are an inline object.",
+  "$defs": {
+    "Items": {
+      "type": "array",
+      "description": "顶层数组：元素是内联对象（必须生成 ItemsItem 类型）。",
+      "items": {
+        "type": "object",
+        "description": "一个元素。",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "nested": {
+            "type": "object",
+            "description": "元素里的内联对象（必须生成 ItemsItemNested 类型）。",
+            "properties": {
+              "deep": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

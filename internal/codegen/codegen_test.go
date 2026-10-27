@@ -20,10 +20,14 @@ import (
 // Fixture directories (relative to this package, so the tests run from any
 // working directory).
 const (
-	fixtureBasic = "testdata/basic"
-	fixtureCycle = "testdata/cycle"
-	fixtureSelf  = "testdata/selfcycle"
-	fixtureDup   = "testdata/dup"
+	fixtureBasic      = "testdata/basic"
+	fixtureCycle      = "testdata/cycle"
+	fixtureSelf       = "testdata/selfcycle"
+	fixtureDup        = "testdata/dup"
+	fixtureArray      = "testdata/array"
+	fixtureArrayDup   = "testdata/arraydup"
+	fixtureInlineEnum = "testdata/inlineenum"
+	fixtureRefSibling = "testdata/refsibling"
 )
 
 // fieldInfo is one struct field as it appears in the generated source.
@@ -33,9 +37,9 @@ type fieldInfo struct {
 	Tag  string
 }
 
-// generateFixture compiles a fixture directory into a fresh output directory and
-// returns the generated sources keyed by Go file name.
-func generateFixture(t *testing.T, dir string) map[string][]byte {
+// generateFixtureDir compiles a fixture directory into a fresh output
+// directory and returns the output directory.
+func generateFixtureDir(t *testing.T, dir string) string {
 	t.Helper()
 	out := t.TempDir()
 	results, err := Run(Options{SchemaDir: dir, OutDir: out})
@@ -45,13 +49,25 @@ func generateFixture(t *testing.T, dir string) map[string][]byte {
 	if len(results) == 0 {
 		t.Fatalf("Run(%s) produced no results", dir)
 	}
-	files := make(map[string][]byte, len(results))
-	for _, r := range results {
-		src, err := os.ReadFile(r.Output)
+	return out
+}
+
+// generateFixture compiles a fixture directory into a fresh output directory and
+// returns the generated sources keyed by Go file name.
+func generateFixture(t *testing.T, dir string) map[string][]byte {
+	t.Helper()
+	out := generateFixtureDir(t, dir)
+	entries, err := os.ReadDir(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte, len(entries))
+	for _, e := range entries {
+		src, err := os.ReadFile(filepath.Join(out, e.Name()))
 		if err != nil {
-			t.Fatalf("read generated %s: %v", r.Output, err)
+			t.Fatalf("read generated %s: %v", e.Name(), err)
 		}
-		files[filepath.Base(r.Output)] = src
+		files[e.Name()] = src
 	}
 	return files
 }
@@ -248,7 +264,8 @@ func TestGenerateBasicShapes(t *testing.T) {
 	assertFields(t, structFields(t, tr), "GraphEdge", []fieldInfo{
 		{Name: "Src", Type: "string", Tag: `json:"src"`},
 		{Name: "Dst", Type: "string", Tag: `json:"dst"`},
-		{Name: "Kind", Type: "string", Tag: `json:"kind"`},
+		// An inline enum is a named type + constants (D2), not a bare string.
+		{Name: "Kind", Type: "GraphEdgeKindEnum", Tag: `json:"kind"`},
 		{Name: "Weight", Type: "*float64", Tag: `json:"weight,omitempty"`},
 	})
 
@@ -263,6 +280,10 @@ func TestGenerateBasicShapes(t *testing.T) {
 		"EdgeKindCalls":         "calls",
 		"EdgeKindReadsFrom":     "reads-from",
 		"EdgeKindWritesTo":      "writes-to",
+		// The inline enum of GraphEdge.kind gets its own constants.
+		"GraphEdgeKindEnumCalls":     "calls",
+		"GraphEdgeKindEnumReadsFrom": "reads-from",
+		"GraphEdgeKindEnumWritesTo":  "writes-to",
 	}
 	gotConsts := constValues(t, tr)
 	for name, val := range wantConsts {
@@ -503,6 +524,308 @@ func TestDuplicateTypeAcrossFilesRejected(t *testing.T) {
 	}
 }
 
+// TestArrayOfInlineObjectEmitsItemType covers the top-level array branch: the
+// inline item type must be emitted (and declared), otherwise the generated
+// file references a type that does not exist and does not compile.
+func TestArrayOfInlineObjectEmitsItemType(t *testing.T) {
+	out := generateFixtureDir(t, fixtureArray)
+	src, err := os.ReadFile(filepath.Join(out, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(src)
+	for _, want := range []string{
+		"type Items []ItemsItem",
+		"type ItemsItem struct {",
+		"type ItemsItemNested struct {",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("generated file does not contain %q:\n%s", want, text)
+		}
+	}
+	// The whole point of the fix: the generated package must compile.
+	buildGeneratedPackage(t, out)
+}
+
+// TestInlineTypeNamesArePackageWide: the name of an inline type (the item
+// type of an array) is a declaration of the package, so the cross-file
+// duplicate guard must see it.
+func TestInlineTypeNamesArePackageWide(t *testing.T) {
+	_, err := Run(Options{SchemaDir: fixtureArrayDup, OutDir: t.TempDir()})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "both declare ItemsItem") {
+		t.Errorf("error %q does not mention the duplicate inline declaration", err)
+	}
+}
+
+// TestOrphanGeneratedFilesRejectedAndRemoved covers the -check blind spot: a
+// generated file whose schema file was renamed or deleted is an orphan. It
+// must fail the check and be removed by a normal run, while hand-written
+// files (contracts/doc.go) are never touched.
+func TestOrphanGeneratedFilesRejectedAndRemoved(t *testing.T) {
+	out := t.TempDir()
+	if _, err := Run(Options{SchemaDir: fixtureBasic, OutDir: out}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	orphan := filepath.Join(out, "orphan.go")
+	orphanSrc := "// Code generated by cmd/codegen from contracts/schema/gone.json; DO NOT EDIT.\n\npackage contracts\n\ntype Gone struct{}\n"
+	if err := os.WriteFile(orphan, []byte(orphanSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	handwritten := filepath.Join(out, "doc.go")
+	if err := os.WriteFile(handwritten, []byte("package contracts\n\n// hand written: must never be touched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check mode must fail and must not delete anything.
+	_, err := Run(Options{SchemaDir: fixtureBasic, OutDir: out, Check: true})
+	if err == nil {
+		t.Fatal("check must fail on an orphan generated file")
+	}
+	if !strings.Contains(err.Error(), "orphan") {
+		t.Errorf("error %q does not report the orphan", err)
+	}
+	if !strings.Contains(err.Error(), "orphan.go") {
+		t.Errorf("error %q does not name the orphan file", err)
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Errorf("check mode removed the orphan: %v", err)
+	}
+
+	// The orphan is reported even when the tree is broken in another way.
+	eventFile := filepath.Join(out, "event.go")
+	eventSrc, err := os.ReadFile(eventFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(eventFile); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Run(Options{SchemaDir: fixtureBasic, OutDir: out, Check: true})
+	if err == nil {
+		t.Fatal("check must fail")
+	}
+	if !strings.Contains(err.Error(), "orphan") {
+		t.Errorf("error %q does not report the orphan first", err)
+	}
+	if err := os.WriteFile(eventFile, eventSrc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write mode removes the orphan ...
+	results, err := Run(Options{SchemaDir: fixtureBasic, OutDir: out})
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("orphan was not removed: %v", err)
+	}
+	reported := false
+	for _, r := range results {
+		if r.Removed && filepath.Base(r.Output) == "orphan.go" {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Error("the removed orphan is not reported in the results")
+	}
+	// ... but never the hand-written file.
+	if _, err := os.Stat(handwritten); err != nil {
+		t.Errorf("hand-written file was removed: %v", err)
+	}
+	// And the tree is stable afterwards.
+	if _, err := Run(Options{SchemaDir: fixtureBasic, OutDir: out, Check: true}); err != nil {
+		t.Errorf("check after the cleanup must pass: %v", err)
+	}
+}
+
+// TestRenamedSchemaRemovesStaleGeneratedFile is the end-to-end version of the
+// orphan rule: renaming a schema file must not leave the old generated file
+// behind.
+func TestRenamedSchemaRemovesStaleGeneratedFile(t *testing.T) {
+	schemaDir := t.TempDir()
+	src, err := os.ReadFile(filepath.Join(fixtureBasic, "plain.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(schemaDir, "plain.json"), src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := t.TempDir()
+	if _, err := Run(Options{SchemaDir: schemaDir, OutDir: out}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "plain.go")); err != nil {
+		t.Fatalf("plain.go was not generated: %v", err)
+	}
+
+	if err := os.Rename(filepath.Join(schemaDir, "plain.json"), filepath.Join(schemaDir, "other.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(Options{SchemaDir: schemaDir, OutDir: out}); err != nil {
+		t.Fatalf("generate after the rename: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "plain.go")); !os.IsNotExist(err) {
+		t.Errorf("the stale plain.go was not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(out, "other.go")); err != nil {
+		t.Errorf("other.go was not generated: %v", err)
+	}
+	if _, err := Run(Options{SchemaDir: schemaDir, OutDir: out, Check: true}); err != nil {
+		t.Errorf("check after the rename must pass: %v", err)
+	}
+}
+
+// TestRefSiblingKeywords: next to a "$ref" only the allow-listed keywords and
+// the "x-" annotations are accepted; an assertion keyword is a hard error
+// instead of a silent drop.
+func TestRefSiblingKeywords(t *testing.T) {
+	files := generateFixture(t, fixtureRefSibling)
+	f := parseGenerated(t, "a.go", files["a.go"])
+	structs := structFields(t, f)
+	assertFields(t, structs, "Holder", []fieldInfo{
+		{Name: "ID", Type: "Ulid", Tag: `json:"id"`},
+		// x-go-type wins over $ref: the field keeps the raw JSON.
+		{Name: "Raw", Type: "json.RawMessage", Tag: `json:"raw"`},
+		{Name: "Described", Type: "Ulid", Tag: `json:"described"`},
+		{Name: "Titled", Type: "Ulid", Tag: `json:"titled"`},
+		// x-deprecated is a note (F7 evolution rule), not an assertion.
+		{Name: "Deprecated", Type: "Ulid", Tag: `json:"deprecated"`},
+	})
+
+	cases := []struct {
+		name string
+		src  string
+		want string
+	}{
+		{"allOf", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","allOf":[{"type":"string"}]}}}`, `"allOf"`},
+		{"anyOf", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","anyOf":[{"type":"string"}]}}}`, `"anyOf"`},
+		{"oneOf", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","oneOf":[{"type":"string"}]}}}`, `"oneOf"`},
+		{"not", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","not":{"type":"string"}}}}`, `"not"`},
+		{"type", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","type":"string"}}}`, `"type"`},
+		{"enum", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","enum":["a"]}}}`, `"enum"`},
+		{"const", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","const":"a"}}}`, `"const"`},
+		{"items", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","items":{"type":"string"}}}}`, `"items"`},
+		{"properties", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","properties":{"x":{"type":"string"}}}}}`, `"properties"`},
+		{"required", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","required":["x"]}}}`, `"required"`},
+		{"format", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","format":"date-time"}}}`, `"format"`},
+		{"pattern", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","pattern":"^x$"}}}`, `"pattern"`},
+		{"additionalProperties", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","additionalProperties":true}}}`, `"additionalProperties"`},
+		{"minLength", `{"$defs":{"A":{"type":"string"},"B":{"$ref":"#/$defs/A","minLength":1}}}`, `"minLength"`},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "s.json"), []byte(tc.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Run(Options{SchemaDir: dir, OutDir: t.TempDir()})
+		if err == nil {
+			t.Errorf("%s: expected an error, got none", tc.name)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %q does not mention %s", tc.name, err, tc.want)
+		}
+		if !strings.Contains(err.Error(), "$ref") {
+			t.Errorf("%s: error %q does not mention the $ref rule", tc.name, err)
+		}
+	}
+}
+
+// TestRefSiblingAnnotationsAllowed: the "x-" annotations (F7 evolution rule:
+// x-deprecated, machine-readable notes) may sit next to a "$ref" — they are
+// notes, not assertions, and the codegen ignores them.
+func TestRefSiblingAnnotationsAllowed(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"x-deprecated", `{"$defs":{"A":{"type":"string"},"B":{"type":"object","required":["p"],"properties":{"p":{"$ref":"#/$defs/A","x-deprecated":true}}}}}`},
+		{"x-deprecated with description", `{"$defs":{"A":{"type":"string"},"B":{"type":"object","required":["p"],"properties":{"p":{"$ref":"#/$defs/A","x-deprecated":true,"description":"弃用"}}}}}`},
+		{"x-invariants", `{"$defs":{"A":{"type":"string"},"B":{"type":"object","required":["p"],"properties":{"p":{"$ref":"#/$defs/A","x-invariants":["x"]}}}}}`},
+		{"x-id-kind", `{"$defs":{"A":{"type":"string"},"B":{"type":"object","required":["p"],"properties":{"p":{"$ref":"#/$defs/A","x-id-kind":"framework"}}}}}`},
+		{"x-unknown annotation", `{"$defs":{"A":{"type":"string"},"B":{"type":"object","required":["p"],"properties":{"p":{"$ref":"#/$defs/A","x-something-new":1}}}}}`},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "s.json"), []byte(tc.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out := t.TempDir()
+		if _, err := Run(Options{SchemaDir: dir, OutDir: out}); err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+			continue
+		}
+		// The reference is still followed: the field keeps the target type.
+		f := parseGenerated(t, "s.go", mustReadFile(t, filepath.Join(out, "s.go")))
+		structs := structFields(t, f)
+		fields, ok := structs["B"]
+		if !ok {
+			t.Errorf("%s: struct B was not generated", tc.name)
+			continue
+		}
+		if len(fields) != 1 || fields[0].Type != "A" {
+			t.Errorf("%s: B fields = %v, want one field of type A", tc.name, fields)
+		}
+	}
+}
+
+// mustReadFile reads a file or fails the test.
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}
+
+// TestInlineEnumBecomesNamedType: an enum declared on a property is a
+// first-class enum (named type + constants), not a bare string.
+func TestInlineEnumBecomesNamedType(t *testing.T) {
+	out := generateFixtureDir(t, fixtureInlineEnum)
+	src, err := os.ReadFile(filepath.Join(out, "a.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := parseGenerated(t, "a.go", src)
+	structs := structFields(t, f)
+	assertFields(t, structs, "Tool", []fieldInfo{
+		{Name: "Name", Type: "string", Tag: `json:"name"`},
+		{Name: "Mode", Type: "ToolModeEnum", Tag: `json:"mode"`},
+		{Name: "Priority", Type: "*ToolPriorityEnum", Tag: `json:"priority,omitempty"`},
+		{Name: "Settings", Type: "*ToolSettings", Tag: `json:"settings,omitempty"`},
+	})
+	assertFields(t, structs, "ToolSettings", []fieldInfo{
+		{Name: "Level", Type: "*ToolSettingsLevelEnum", Tag: `json:"level,omitempty"`},
+	})
+
+	if kinds := namedTypeKinds(t, f); kinds["ToolModeEnum"] != "string" {
+		t.Errorf("ToolModeEnum: got underlying %q, want string", kinds["ToolModeEnum"])
+	}
+	want := map[string]string{
+		"ToolModeEnumFast":          "fast",
+		"ToolModeEnumSafeMode":      "safe-mode",
+		"ToolPriorityEnumLow":       "low",
+		"ToolPriorityEnumHigh":      "high",
+		"ToolSettingsLevelEnumNone": "none",
+		"ToolSettingsLevelEnumSome": "some",
+	}
+	got := constValues(t, f)
+	for name, val := range want {
+		if got[name] != val {
+			t.Errorf("constant %s = %q, want %q", name, got[name], val)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("generated %d constants, want %d (%v)", len(got), len(want), got)
+	}
+	// The generated package must compile.
+	buildGeneratedPackage(t, out)
+}
+
 // TestEmptyAndMissingSchemaDir covers the "nothing to compile" cases.
 func TestEmptyAndMissingSchemaDir(t *testing.T) {
 	empty := t.TempDir()
@@ -612,21 +935,32 @@ func TestOrderedJSONPreservesMemberOrder(t *testing.T) {
 
 // TestGeneratedCodeCompiles builds the generated output as a real Go package.
 func TestGeneratedCodeCompiles(t *testing.T) {
-	goTool := findGoTool(t)
 	out := t.TempDir()
 	if _, err := Run(Options{SchemaDir: fixtureBasic, OutDir: out}); err != nil {
 		t.Fatalf("Run error: %v", err)
 	}
+	buildGeneratedPackage(t, out)
+}
+
+// buildGeneratedPackage compiles the generated files of dir as a real Go
+// package inside a throw-away module and fails the test when it does not
+// build.
+func buildGeneratedPackage(t *testing.T, dir string) {
+	t.Helper()
+	goTool := findGoTool(t)
 	modDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(modDir, "go.mod"), []byte("module generatedcontracts\n\ngo 1.26\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := os.ReadDir(out)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		src, err := os.ReadFile(filepath.Join(out, e.Name()))
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
   "title": "Event",
   "description": "Event fixture: covers required/optional, $ref, inline nested object, arrays, json.RawMessage and a cross-file $ref.",
   "$defs": {

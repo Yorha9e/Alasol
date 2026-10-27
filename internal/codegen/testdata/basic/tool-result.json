@@ -1,5 +1,5 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
   "title": "ToolResult",
   "description": "ToolResult fixture: enums (including a value containing '-'), a cross-file target and an inline enum property.",
   "$defs": {

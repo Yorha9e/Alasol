@@ -28,7 +28,7 @@ jobs:
         run: go build ./...
 
   no-cgo-lint:
-    name: lint: no cgo
+    name: "lint: no cgo"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,5 +57,11 @@ jobs:
       - name: TS minimal consumer (cross-language neutrality)
         working-directory: tools/ts-consumer
         run: |
-          npm install
+          npm ci
+          npx tsc --noEmit
           npx tsx reader.ts
+          # The broken sample must be rejected: its exit code has to be 1.
+          if npx tsx reader.ts broken-events.ndjson; then
+            echo "::error::broken-events.ndjson was accepted, but it must fail validation"
+            exit 1
+          fi

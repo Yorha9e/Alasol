@@ -1,0 +1,31 @@
+name: workflow-yaml-lint
+
+# 独立于 ci.yml 的最小门禁：ci.yml 自身语法坏掉时（如未加引号的冒号），
+# ci.yml 整份不会被加载、里面任何步骤都不会跑——只有另一份 workflow 才能报这个警。
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  yaml-lint:
+    name: "workflow files must parse as YAML"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse all workflow YAML
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'EOF'
+          import glob, sys, yaml
+          files = sorted(glob.glob(".github/workflows/*.yml"))
+          bad = 0
+          for f in files:
+              try:
+                  yaml.safe_load(open(f, encoding="utf-8"))
+                  print(f"OK    {f}")
+              except Exception as e:
+                  print(f"FAIL  {f}: {e}")
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          EOF

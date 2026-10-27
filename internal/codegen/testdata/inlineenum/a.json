@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://example.invalid/alasol/testdata/inlineenum/a.json",
+  "description": "Inline enum fixture: an enum declared on a property must become a named type plus constants.",
+  "$defs": {
+    "Tool": {
+      "type": "object",
+      "description": "工具描述。",
+      "required": ["name", "mode"],
+      "properties": {
+        "name": { "type": "string" },
+        "mode": {
+          "type": "string",
+          "description": "运行模式（内联枚举）。",
+          "enum": ["fast", "safe-mode"]
+        },
+        "priority": {
+          "type": "string",
+          "description": "可选优先级（内联枚举，可选字段 → 指针）。",
+          "enum": ["low", "high"]
+        },
+        "settings": {
+          "type": "object",
+          "description": "内联对象，里面的枚举也要命名。",
+          "properties": {
+            "level": {
+              "type": "string",
+              "enum": ["none", "some"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

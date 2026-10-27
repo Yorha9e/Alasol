@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://example.invalid/alasol/testdata/arraydup/a.json",
+  "description": "Array fixture: declares Items plus the inline ItemsItem type.",
+  "$defs": {
+    "Items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" }
+        }
+      }
+    }
+  }
+}

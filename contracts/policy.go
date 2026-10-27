@@ -40,20 +40,11 @@ const (
 )
 
 type Decision struct {
-	// allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。
-	Verdict Verdict `json:"verdict"`
+	// 判定结果：allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。
+	Verdict Effect `json:"verdict"`
 	// 命中的规则 id。
 	RuleID *string `json:"rule_id,omitempty"`
 	Reason *string `json:"reason,omitempty"`
 	// verdict=ask 时携带的建议规则（D13）。
 	SuggestedRules []PolicyRule `json:"suggested_rules,omitempty"`
 }
-
-// 判定结果（D13）。
-type Verdict string
-
-const (
-	VerdictAllow Verdict = "allow"
-	VerdictDeny  Verdict = "deny"
-	VerdictAsk   Verdict = "ask"
-)

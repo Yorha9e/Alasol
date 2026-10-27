@@ -60,7 +60,8 @@
 | 平台矩阵 | `windows-latest` / `macos-latest` / `ubuntu-latest`（**Windows 必须跑**） |
 | 检查步骤 | `go vet ./...` + `go test ./...` + `CGO_ENABLED=0 go build ./...`（全程 `CGO_ENABLED=0`） |
 | 禁 cgo lint | 独立步骤（三平台任一跑即可）：全仓 `*.go` 扫 `import "C"`，命中即 fail |
-| schema 校验 | 占位 job（阶段 1 codegen 落地后点亮：「再生成 diff 为空」） |
+| schema 校验 | **已点亮**（阶段 1）：`go run ./cmd/codegen -check`（再生成 diff 为空 + 孤儿生成物检测）+ TS 消费端（tsc / 样本 / 坏样本必拒） |
+| workflow YAML 门禁 | 独立 workflow `lint-workflows.yml`：解析全部 `.github/workflows/*.yml`（防 workflow 自身语法坏掉导致门禁静默失效） |
 | 酸测试矩阵 | **逐步点亮**：矩阵条目随阶段启用，阶段 0 只建骨架占位，**不追全绿**（可换实现要阶段 2–3 才存在） |
 
 纪律：本地开发不需要 CI 代理（goproxy.cn 直连可用）；GitHub runners 上 `proxy.golang.org` 默认可用，CI **不设** `GOPROXY`/`GOPRIVATE`（无内部依赖前无意义）。
@@ -71,7 +72,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0（地基）已完成**（2026-10-27）：git 仓库 · 目录按 `09` · `go.mod` · CI 骨架（三平台 + 禁 cgo lint）· `CGO_ENABLED=0 go build ./...` 通过；**阶段 1（contracts）未开始** |
+| **代码** | **阶段 0（地基）+ 阶段 1（contracts）已完成**（2026-10-27）：仓库/目录/go.mod/CI · 12 份契约 schema（2020-12）+ 自写受限 codegen + 生成 Go 类型入库 + TS 最小消费端 + CI schema/YAML 门禁；**阶段退出评审循环已走完（critic 判定无问题）**；下一步：阶段 2 core 骨架 |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -120,11 +121,11 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 - 唯一清单（D21）：Event / Command / Transport 消息 / Extension 元数据 / Tool.schema / **Tool 返回值** / Policy 规则 / Store 持久化格式 / Workflow 定义 / ContextSnapshot / Approval 消息
 - **三段事件契约在此定稿**（X1 前置）：`tool.call.intent` / `tool.call.completed` / `tool.call.failed` —— 这是**工具执行写路径的形状**，必须在契约层定死，否则阶段 4 起每条调用都要返工
 - 手写 JSON Schema → **自写受限子集 codegen** → 生成 Go 类型 → 导出
-- **验收**：
-  - [ ] 生成物入库，CI「再生成 diff 为空」通过
-  - [ ] 可选字段**一律指针 + `omitempty`**；枚举用命名类型 + 常量；union 用接口 + Marshal/Unmarshal 包装
-  - [ ] **TS 侧最小消费端**能读事件流（跨语言中立性验证）
-  - [ ] `Tool.schema` 的值本身是 JSON Schema（元嵌套）→ codegen 当原始 JSON 处理
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] 生成物入库，CI「再生成 diff 为空」通过
+  - [x] 可选字段**一律指针 + `omitempty`**；枚举用命名类型 + 常量；union 用接口 + Marshal/Unmarshal 包装
+  - [x] **TS 侧最小消费端**能读事件流（跨语言中立性验证）
+  - [x] `Tool.schema` 的值本身是 JSON Schema（元嵌套）→ codegen 当原始 JSON 处理
 
 ### 阶段 2 · core 骨架（无 IO）
 - 事件总线（`durable` 区分，F8）/ 扩展注册表 + 生命周期 + 能力裁决 / 策略链（fail-close，deny·ask 跨来源并集，H5）

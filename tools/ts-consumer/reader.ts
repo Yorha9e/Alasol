@@ -2,23 +2,24 @@
  * alasol 最小 TypeScript 消费端：逐行读取 NDJSON 事件流，按 contracts/schema 做跨语言契约校验。
  *
  * 运行方式：
- *   cd tools/ts-consumer && npm install && npx tsx reader.ts
+ *   cd tools/ts-consumer && npm ci && npx tsx reader.ts
  *   （坏样本：npx tsx reader.ts broken-events.ndjson；默认读 sample-events.ndjson）
  *
  * 退出码：所有行都通过校验 → 0；任一行解析/校验失败 → 1。
  *
  * 设计要点：
- * - 12 份 JSON Schema（2020-12，$defs）自带 $id：https://github.com/Yorha9e/alasol/contracts/schema/<file>.json。
- *   ajv（2020-12 类）注册后，跨文件相对 $ref（common.json#/$defs/Ulid 等）按各文件 $id 命名空间自解析，
+ * - contracts/schema 下的 JSON Schema（2020-12，$defs）各自带 $id（见各文件；命名空间前缀见
+ *   contracts/INVENTORY.md §3）。ajv（2020-12 类）注册后，跨文件相对 $ref 按各文件 $id 命名空间自解析，
  *   无需消费端注入 $id。schema 目录相对本文件定位（../../contracts/schema），只读不写。
- * - envelope 一律用 event.json#/$defs/Event 校验（v/id/kind/ts/session_id/agent_id/durable 必填，
- *   id/session_id/agent_id 走 common.json#/$defs/Ulid 的 26 字符 Crockford base32 正则）。
- * - 按 kind 分发 payload 校验（映射与 event.json 的 x-kind-payload 一致）：
- *     tool.call.intent     → event.json#/$defs/ToolCallIntentPayload
- *     tool.call.completed  → event.json#/$defs/ToolCallCompletedPayload（result 跨文件 ref tool-result.json）
- *     tool.call.failed     → event.json#/$defs/ToolCallFailedPayload
- *   其他 kind（如 model.delta、context.assembled）宽容跳过 payload 校验（D7：未知 kind 忽略但持久化），
- *   envelope 合法即算该行通过。
+ * - **契约只有一处定义**：消费端不硬编码任何 kind、payload 类型名或 $id 前缀 ——
+ *   - kind→payload 映射来自事件 schema 的 $defs.Event["x-kind-payload"]（x- 注记，机器可读约定）；
+ *     映射的值可以是**纯 $defs 名**（在全部已注册 schema 的 $defs 里查找，命中唯一才用，
+ *     命中多处或零命中 → 明确报错点名），也可以是**显式 ref**（如 "policy.json#/$defs/Effect"）；
+ *   - 命名空间 base 来自已注册 schema 的实际 $id（反推其目录部分）；
+ *   - envelope = 事件 schema 的 $defs/Event；payload = 映射指向的 $defs。
+ *   schema 改了（新增 kind / 换 $id / 换 payload 形状），消费端不用改。
+ * - envelope 必填字段与 ULID 正则由 schema 自己声明（消费端不重复写规则）。
+ * - 未知 kind 宽容跳过 payload 校验（D7：未知 kind 忽略但持久化），envelope 合法即算该行通过。
  * - tool_call_id 是 provider 不透明字符串（common.json#/$defs/ProviderId），与 Event.id（ULID）永不共字段。
  */
 import fs from "node:fs";
@@ -30,39 +31,161 @@ import addFormats from "ajv-formats";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_DIR = path.resolve(HERE, "..", "..", "contracts", "schema");
-const NS = "https://github.com/Yorha9e/alasol/contracts/schema/";
 
 // ---------------------------------------------------------------------------
-// 1. 注册全部 schema：$id 由 schema 自带（绝对命名空间），跨文件 $ref 自解析
+// 1. 读取并注册全部 schema：$id 由 schema 自带（绝对命名空间），跨文件 $ref 自解析
 // ---------------------------------------------------------------------------
+interface LoadedSchema {
+  /** 文件名（schema 目录内） */
+  file: string;
+  /** schema 自带的 $id（绝对命名空间） */
+  id: string;
+  /** 解析后的 schema 文档 */
+  doc: Record<string, unknown>;
+}
+
+function loadSchemas(dir: string): LoadedSchema[] {
+  const files = fs
+    .readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .sort();
+  if (files.length === 0) throw new Error(`no schema files found in ${dir}`);
+  return files.map((file) => {
+    const doc = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8")) as Record<string, unknown>;
+    const id = typeof doc.$id === "string" ? doc.$id : "";
+    if (id === "") throw new Error(`schema ${file} has no $id: the namespace cannot be derived`);
+    return { file, id, doc };
+  });
+}
+
+/**
+ * namespaceBase 从已注册 schema 的实际 $id 反推命名空间 base（$id 的目录部分）。
+ * 不硬编码任何 URL 前缀：schema 换域名时消费端不用改。
+ */
+function namespaceBase(schemas: LoadedSchema[]): string {
+  const bases = new Set<string>();
+  for (const s of schemas) {
+    const cut = s.id.lastIndexOf("/");
+    if (cut < 0) throw new Error(`schema ${s.file}: $id "${s.id}" has no namespace base`);
+    bases.add(s.id.slice(0, cut + 1));
+  }
+  if (bases.size !== 1) {
+    throw new Error(`the schemas do not share one namespace: ${[...bases].sort().join(", ")}`);
+  }
+  return [...bases][0];
+}
+
+const schemas = loadSchemas(SCHEMA_DIR);
+const BASE = namespaceBase(schemas);
+
 const ajv = new Ajv({ allErrors: true, strict: false }); // strict=false：容忍 x-go-type/x-id-kind 等自定义关键字
 addFormats(ajv); // 提供 format: "date-time"（ts 字段）
 
-const schemaFiles = fs
-  .readdirSync(SCHEMA_DIR)
-  .filter((name) => name.endsWith(".json"))
-  .sort();
-for (const name of schemaFiles) {
-  const schema = JSON.parse(fs.readFileSync(path.join(SCHEMA_DIR, name), "utf8")) as Record<string, unknown>;
-  ajv.addSchema(schema);
+for (const s of schemas) {
+  ajv.addSchema(s.doc);
 }
 
 // ---------------------------------------------------------------------------
-// 2. 校验器：envelope + 三种已知 tool.call payload
+// 2. 事件 schema：带 $defs.Event["x-kind-payload"] 的那一个（kind→payload 映射的唯一定义处）
+// ---------------------------------------------------------------------------
+interface EventSchema extends LoadedSchema {
+  /** kind → payload $defs 名 */
+  kindPayload: Record<string, string>;
+}
+
+/** 一个 $defs 条目的位置：它在哪个文件里。 */
+interface DefLocation {
+  /** 文件名（schema 目录内） */
+  file: string;
+  /** 绝对 ref（相对命名空间 base 解析） */
+  ref: string;
+}
+
+function loadEventSchema(candidates: LoadedSchema[]): EventSchema {
+  const found = candidates.filter((s) => {
+    const defs = (s.doc.$defs ?? {}) as Record<string, unknown>;
+    const event = defs.Event;
+    return typeof event === "object" && event !== null && "x-kind-payload" in event;
+  });
+  if (found.length !== 1) {
+    throw new Error(
+      `expected exactly one schema with $defs.Event["x-kind-payload"], found ${found.length}: ` +
+        found.map((s) => s.file).join(", "),
+    );
+  }
+  const schema = found[0];
+  const defs = (schema.doc.$defs ?? {}) as Record<string, unknown>;
+  const event = defs.Event as Record<string, unknown>;
+  const kindPayload = (event["x-kind-payload"] ?? {}) as Record<string, string>;
+  return { ...schema, kindPayload };
+}
+
+const eventSchema = loadEventSchema(schemas);
+
+/**
+ * 全部已注册 schema 的 $defs 名字索引：名字 → 位置（同名可能多处）。
+ *
+ * x-kind-payload 的值有两种写法：
+ *   - 纯名字（如 "ToolCallIntentPayload"）：在**所有**已注册 schema 的 $defs 里查找
+ *     （payload 的形状不一定定义在事件 schema 里）；
+ *   - 显式 ref（如 "policy.json#/$defs/Effect"）：直接按 ref 解析。
+ */
+function indexDefs(candidates: LoadedSchema[]): Map<string, DefLocation[]> {
+  const index = new Map<string, DefLocation[]>();
+  for (const s of candidates) {
+    const defs = (s.doc.$defs ?? {}) as Record<string, unknown>;
+    for (const name of Object.keys(defs)) {
+      const loc: DefLocation = { file: s.file, ref: `${s.file}#/$defs/${name}` };
+      const hits = index.get(name);
+      if (hits) hits.push(loc);
+      else index.set(name, [loc]);
+    }
+  }
+  return index;
+}
+
+/**
+ * payload 的 $defs 名 → 校验用的 ref。
+ *
+ * ① 带 "#" 或 "/" 的是显式 ref（如 "policy.json#/$defs/Effect"），直接用；
+ * ② 纯名字在所有已注册 schema 的 $defs 里查找：唯一命中就用它，
+ *    命中多处或零命中 → 明确报错（点名），不猜。
+ */
+function payloadRef(defName: string, defIndex: Map<string, DefLocation[]>): string {
+  if (defName.includes("/") || defName.includes("#")) return defName; // 显式 ref
+  const hits = defIndex.get(defName);
+  if (!hits || hits.length === 0) {
+    throw new Error(
+      `x-kind-payload points to "${defName}", which is not a $defs entry of any registered schema ` +
+        `(use an explicit ref like "policy.json#/$defs/${defName}" to point at another file)`,
+    );
+  }
+  if (hits.length > 1) {
+    throw new Error(
+      `x-kind-payload points to "${defName}", which is defined in several schemas: ` +
+        hits.map((h) => h.file).join(", ") +
+        ` (use an explicit ref to pick one)`,
+    );
+  }
+  return hits[0].ref;
+}
+
+// ---------------------------------------------------------------------------
+// 3. 校验器：envelope + 已知 kind 的 payload
 // ---------------------------------------------------------------------------
 function mustGet(ref: string): ValidateFunction {
-  const key = new URL(ref, NS).href; // "event.json#/$defs/Event" → 绝对 key
+  const key = new URL(ref, BASE).href; // "event.json#/$defs/Event" → 绝对 key
   const validate = ajv.getSchema(key);
   if (!validate) throw new Error(`schema not found (check $id registration): ${key}`);
   return validate;
 }
 
-const validateEnvelope = mustGet("event.json#/$defs/Event");
-const payloadValidators = new Map<string, ValidateFunction>([
-  ["tool.call.intent", mustGet("event.json#/$defs/ToolCallIntentPayload")],
-  ["tool.call.completed", mustGet("event.json#/$defs/ToolCallCompletedPayload")],
-  ["tool.call.failed", mustGet("event.json#/$defs/ToolCallFailedPayload")],
-]);
+const validateEnvelope = mustGet(`${eventSchema.file}#/$defs/Event`);
+const defIndex = indexDefs(schemas);
+const payloadValidators = new Map<string, ValidateFunction>();
+for (const [kind, defName] of Object.entries(eventSchema.kindPayload)) {
+  payloadValidators.set(kind, mustGet(payloadRef(defName, defIndex)));
+}
 
 function formatErrors(errors: ErrorObject[] | null | undefined): string {
   if (!errors || errors.length === 0) return "unknown validation error";
@@ -80,7 +203,7 @@ function kindOf(value: unknown): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// 3. 逐行处理
+// 4. 逐行处理
 // ---------------------------------------------------------------------------
 interface LineResult {
   line: number;
@@ -134,14 +257,20 @@ function processFile(file: string): LineResult[] {
 }
 
 // ---------------------------------------------------------------------------
-// 4. main：参数指定文件（默认 sample），打印逐行结果 + 汇总，按结果设置退出码
+// 5. main：参数指定文件（默认 sample），打印逐行结果 + 汇总，按结果设置退出码
 // ---------------------------------------------------------------------------
 function main(): number {
   const arg = process.argv[2];
   const file = arg !== undefined ? path.resolve(process.cwd(), arg) : path.join(HERE, "sample-events.ndjson");
 
   console.log("alasol ts-consumer — NDJSON event stream reader");
-  console.log(`schemas: ${SCHEMA_DIR} (${schemaFiles.length} registered, $id from schema)`);
+  console.log(`schemas: ${SCHEMA_DIR} (${schemas.length} registered, $id from schema)`);
+  console.log(`namespace: ${BASE} (derived from $id)`);
+  console.log(
+    `kind→payload: ${Object.entries(eventSchema.kindPayload)
+      .map(([kind, def]) => `${kind} → ${def}`)
+      .join(", ")}`,
+  );
   console.log(`file:    ${path.relative(process.cwd(), file) || file}`);
   console.log("");
 
