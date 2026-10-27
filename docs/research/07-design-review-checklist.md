@@ -1,0 +1,526 @@
+# 设计决策总表（逐条过审用）
+
+> 用途：把所有已设计项摊平成可逐条确认的清单。每条含：**决策项 / 我的主张 / 备选 / 状态**。
+> 状态图例：✅ 已拍板（用户确认）· ★ **需要你定**（会分岔）· · 我的主张（默认通过，可直接否决）
+
+---
+
+## A. 目标与范围
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| A1 | 终局形态 | 独立产品 / 独立 harness，不并入 omkc | ✅ |
+| A2 | omkc 资产复用 | 全部不复用（minidb / transcript / kosong / pi-tui 都不 fork） | ✅ |
+| A3 | pi 的使用方式 | 不引用其代码；只读 `pi-durable` / `pi-chord` 设计文档当规格参考 | · |
+| A4 | ACP | 不在 v0，后续按需再议 | ✅ |
+| A5 | v0 目标 | 骨架成立（酸测试通过）**且**能连真模型跑通一个真 session（真机验证） | · |
+
+## B. 技术栈
+
+| ID | 决策项 | 我的主张 | 备选 | 状态 |
+|---|---|---|---|---|
+| B1 | 核心语言 | Go | — | ✅（独立产品 + Windows 一等 → 翻转） |
+| B2 | TUI | Go + bubbletea / lipgloss | — | · |
+| B3 | GUI / IDE 插件 | 语言自由，通过协议接入 hub | — | · |
+| B4 | 解释型扩展运行时 | v1 再说；候选 Starlark / CEL / goja / WASM | — | ★ |
+| B5 | 依赖约束 | 避免 cgo（纯 Go SQLite）；go modules | — | · |
+
+## C. 架构分层与依赖
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| C1 | 中轴 | `contracts` 包，零依赖，纯数据契约 | · |
+| C2 | core 依赖 | 只依赖 contracts；**不 import runtime**（接口由消费方定义） | · |
+| C3 | runtime 职责 | 实现 core 定义的接口（store / process / sandbox / provider / transport） | · |
+| C4 | host 职责 | 唯一组合根（装配 core + runtime） | · |
+| C5 | ui 依赖 | **不 import core**，只消费 contracts（事件流 + 命令） | · |
+| C6 | 顶层包数量 | 6 个：contracts / core / runtime / extensions / host / ui | · |
+
+## D. 契约层
+
+| ID | 决策项 | 我的主张 | 备选 | 状态 |
+|---|---|---|---|---|
+| D1 | 契约中立方式 | ✅ **手写 JSON Schema 优先 + codegen**；**只对跨边界契约中立**，清单以 **D21 唯一清单源**为准（当前含 Event / Command / Transport 消息 / Extension 元数据 / Tool.schema / **Tool 返回值** / Policy 规则 / Store 持久化格式 / Workflow 定义 / ContextSnapshot / Approval 消息）；进程内接口用原生 Go 类型 | 全盘 schema 化 / Go 类型优先反射导出 | ✅ |
+| D2 | codegen 落地 | **自写受限子集生成器**（object/array/string/number/bool/enum/required/optional/nested/$ref 非循环；禁 $ref 循环与复杂组合）；**可选字段一律指针 + `json:",omitempty"`**；CI 做"再生成 diff 为空"校验 | 引入现成生成器 | ✅ |
+| D2b | schema 起草 | 允许"反射生成草稿 → 人工审 → 提交为手写版本"两步法，之后以手写版为准 | 全手写 | · |
+| D3 | 序列化格式 | JSON Schema + NDJSON | protobuf / MessagePack | · |
+| D4 | 大 payload | `Event.binary_ref` 外置 blob | — | · |
+| D5 | 事实源 | `Event` 唯一事实流 | — | · |
+| D6 | 事件 kind | 开放字符串 + 命名空间点分（`tool.call.started`）；core 定义核心子集 | 封闭枚举 | · |
+| D7 | 未知事件 | **必须宽容**：core 只对核心事件敏感，未知 kind 忽略但持久化 | — | · |
+| D8 | 事件分类 | 单一流 + `durable: bool` 区分流事件/事实事件 | 两套通道 | ★ |
+| D9 | Command | 意图；可从进程外提交 | — | · |
+| D10 | Context | provider 无关的中间表示 | — | · |
+| D11 | Model/Provider | 契约不含任何 SDK 类型 | — | · |
+| D12 | Tool | ✅ `schema`、`side_effect`（none/read/write/destructive）、`cancelable`、`approvable`、**`idempotent`**、**`replay`**、**返回值 `graph_edges`**、执行器 | ✅ |
+| D13 | Policy/Decision | `allow` / `deny` / `ask`；ask 携带 `suggested_rules` | — | · |
+| D14 | Approver | **无人应答必须 deny，不得挂起** | — | · |
+| D15 | Store/Projection | 接口在 core，实现在 runtime | — | · |
+| D16 | Session/Agent | 可插拔实体，稳定句柄 | — | · |
+| D17 | Extension 元数据 | `kind` / `schema` / `capabilities` / `priority` / `reloadable` / `health` | — | · |
+| D18 | Transport | 抽象统一：inproc / ws+ndjson / stdio | — | · |
+| D19 | Telemetry | sink 契约（OTLP / 文件 / noop） | — | · |
+| D20 | schema 产物 | 导出到 `contracts/schema/`，随契约版本发布 | — | · |
+| D21 | **跨边界契约唯一清单源** | ✅ `contracts/` 维护**唯一清单**（含 Workflow、ContextSnapshot、Tool 返回值、Approval 消息）；其他文档一律**引用不重抄**，**计数由清单生成**（消除 7/8/9 三个数并存） | ✅ |
+| D22 | **Tool 契约补齐 + 工具返回值契约** | ✅ D12 扩为 `schema / side_effect / cancelable / approvable / idempotent / replay / returns.graph_edges`；**工具返回值契约单独列入 contracts**（跨边界：MCP 与进程级扩展都要传） | ✅ |
+
+## E. 扩展机制
+
+| ID | 决策项 | 我的主张 | 备选 | 状态 |
+|---|---|---|---|---|
+| E1 | 扩展模型 | ✅ **A 接口实现为主 + B 进程级为边界**（C 解释型 = A 的特殊实现，不需独立机制）。A：Provider/Tool/Policy/Store/Projection/Compaction/ContextAssembler/Scheduler 等；B：MCP server / GUI 面板 / IDE 插件 / 第三方工具 / 不可信扩展 | 全 B / 全 A | ✅ |
+| E2 | 分配 | A：Provider/Tool/Policy/Store/Projection/Compaction/ContextAssembler/Scheduler 等 12 个<br>B：MCP server / GUI 面板 / IDE 插件 / 第三方工具 / 不可信扩展 | — | ★ |
+| E3 | 能力裁决 | 安装时申报能力，运行时由策略引擎裁决 | — | · |
+| E4 | UI 无关 | 扩展点不假设有 UI | — | · |
+| E5 | 失败隔离 | 扩展崩溃不得带崩 core | — | · |
+| E6 | 热重载 | 进程级可热插拔；接口实现需重启（换 Provider/Store 通常伴随重启） | — | · |
+| E7 | 官方扩展位置 | 顶层 `extensions/`，与第三方同一套注册机制，本身是示例 | — | · |
+| E8 | **通用组件区** | 与"扩展点"并列的另一类：**框架自带、可被任何工作流 / 宿主复用的能力组件**，不绑定协议、不绑定工作流。已有三个：`agentlink`（K18 发现与交流）、`gate`/`ci`（W8 门禁）、`retry`（M6 重试）。放在 `core/` 下还是独立包待定（P1） | — | ★ |
+
+## F. 事件与状态
+
+| ID | 决策项 | 我的主张 | 备选 | 状态 |
+|---|---|---|---|---|
+| F1 | 一切皆事件 | 模型输出/工具调用/策略判定/压缩/审批 全是事件 | — | · |
+| F2 | 因果关系 | 扁平事件 + `causation_id`，**不引入 span 模型** | 完整 span 树 | ★ |
+| F3 | 事件字段 | `kind` / `seq` / `ts` / `session_id` / `agent_id` / `causation_id` / `payload` | — | · |
+| F4 | loop 形态 | v0 控制流 + 完整事件记录；v1 事件化（契约不变，纯增量） | 直接事件驱动 | ★ |
+| F5 | 状态来源 | ✅ **唯一事实源**：一切状态由事件流 fold 得出，**不另设可变状态源**（含 ledger 与黑板，见 G23） | ✅ |
+| F6 | 历史不可重写 | 压缩/修复只追加事件 | — | · |
+| F7 | **契约演进铁律** | ✅ **只增不删、不改义**；弃用字段标 `x-deprecated`；事件 envelope 加版本字段 `v`。外部消费者据此判断兼容 | ✅ |
+| F8 | **非 durable 流事件语义** | ✅ `durable=false` 的流事件（`model.delta` 等）**不入库、不占 seq**（总线直发订阅者）；**回放对象只有事实事件** | ✅ |
+
+## G. 存储
+
+| ID | 决策项 | 我的主张 | 备选 | 状态 |
+|---|---|---|---|---|
+| G1 | Store 形态 | 事件日志（追加）+ 投影（读模型）；**不是一个引擎，是一组可组合的存储接口** | — | ★ |
+| G2 | 存储抽象层 | 按用途分若干接口，各自多个实现，可组合：事件日志 / 文档 / blob / 图 / 向量 | — | ★ |
+| G2b | 引擎路线 | ✅ **定案**：`github.com/ncruces/go-sqlite3` v0.35.6 + `_txlock=immediate` + `busy_timeout`（实测并发写 1000/1000 零失败、5852 tps、跨进程已验证）；`modernc.org/sqlite` v1.61.0 为备选（高并发写 3% SQLITE_BUSY 失败、274 tps）。**后续要上正经数据库** → 接口必须不泄漏 SQLite 特性 | ✅ |
+| G2c | 图引擎 | ✅ **SQLite 的 node/edge 表做持久化 + 自己写内存图做多跳**（规模会超万节点，长程工作必然碰到 → 现在就设计）。Kuzu（cgo + Windows 需 MSYS2/UCRT64 + 项目正在被归档）、Oxigraph（RDF/SPARQL 语义不对口）、Cozo（2023 停更）均排除。图是**可选投影**，换引擎不影响 core | — | ✅ |
+| G2d | 向量引擎 | 未来 RAG，**独立于指针解析**（概率性，可选） | — | ★ |
+| G2e | blob 引擎 | 大工具输出、原始条目（`Event.binary_ref` 外置）；v0 文件系统 → 后期对象存储 / DB 大字段 | — | ★ |
+| G2f | 图不是硬依赖 | 图作为**可选投影**，由工作流声明是否启用；**不进 core 必经路径**（否则每个 session 都要起图库） | — | ★ |
+| G8 | goal ledger 落地 | ✅ **事件化**：`ledger.updated` 作为 durable 事件追加，**当前态 = 索引器物化的投影**（不再 CAS 直写可变存储）；**在上下文之外** | ✅ |
+| G9 | 多写者 | ✅ **Kafka 模式：多写者 append + 单索引写者**。写者只管 append（幂等 `id` UNIQUE；`seq` 由 SQLite AUTOINCREMENT 原子分配 = 全局单调且无需应用层仲裁；事务保证一批 append 原子；`_txlock=immediate` + `busy_timeout` 处理冲突，实测跨进程 1000/1000）。**session 目录 / 图投影等派生索引由单独的索引器消费事件流维护**（最终一致，毫秒级延迟，UI 可接受） | — | ✅ |
+| G10 | seq 语义 | `seq` 全局单调（由 DB 分配）；per-session 单调自然成立；UI 取"本 session 第 N 轮"用 `(session_id, seq)` 索引 | — | ★ |
+| G11 | 事件幂等 | `Append` 以 `event.id` 去重 → 崩溃重试不产生重复事件 | — | ★ |
+| G12 | 上下文快照存储 | `ContextSnapshot` 作为 durable 事件 `context.assembled` 存进 EventLog；"当前"态由投影提供 | — | ★ |
+| G13 | 事务模式 | **必须 `_txlock=immediate`** —— 实测并发写失败率从 1 次降到 0 次（ncruces）；默认 deferred 模式下并发写更差 | — | ✅ |
+| G14 | 实测结论（2026-10-26） | 两驱动 WAL 均生效（网上"modernc 不支持 WAL"的说法在 v1.61.0 不成立）；`TIMESTAMP` 列往返均为 `time.Time`（跨驱动一致）；跨进程写均正常（ncruces 的纯 Go VFS 文件锁是对的）；`seq INTEGER PRIMARY KEY AUTOINCREMENT` + `id TEXT UNIQUE` 表结构在两驱动上均工作 | — | ✅ |
+| G15 | 单写者仍是主防线 | 并发测试是 50 goroutine 抢写的极端情况；正常只有一个 writer。busy_timeout + txlock 是兜底不是主策略 | — | ✅ |
+| G16 | 排除的候选 | `tursodatabase/limbo`（Go module 内 0 个 `.go` 文件，Go 侧无 API）；`surrealdb.go`（cgo + Rust 工具链，嵌入式不"轻"）；`embedded-postgres`（多一个 PG 进程，与"零外部进程"硬约束冲突）；`kuzudb/kuzu`（cgo + Windows 需 MSYS2/UCRT64 + 项目正在被归档）；`oxigraph`（RDF/SPARQL 语义不对口）；`cozodb/cozo`（2023 停更） | — | ✅ |
+| G17 | **索引器角色** | 独立角色：消费全局事件流，增量维护**持久投影**——`sessions` 目录、图投影、成本统计、ledger 当前态、上下文快照当前态。**唯一写持久派生表的人**（多写者场景下的单索引写者）。索引延迟毫秒级，最终一致 | — | ★ |
+| G17b | 持久 vs 活状态 | **持久投影**（落库）：session 目录、图、成本、ledger、快照当前态。**活状态**（只在 core 内存，进程结束自行消失）：presence / 在线状态 / gate 成员。**不需要租约、不需要心跳、不需要"离线 session 保留"**——session 生命周期 = 进程生命周期 | — | ✅ |
+| G18 | 图查询分层 | **一跳/两跳走 SQLite 索引**（`edges(src,kind)` / `edges(dst,kind)` 双向倒排）快查；**多跳走内存图 BFS/DFS**（邻接表 + visited set + 深度上限 + 结果上限 + context 取消）。传递闭包在内存图上是 O(V+E)，SQL 递归 CTE 在大图上不可用 | — | ★ |
+| G19 | 图内存预算 | node id 用**整数或 interned string**（不用原始长字符串）→ 10 万节点 / 100 万边的邻接表控制在 ~100–200MB 量级；邻接表常驻或 LRU，冷启动从 SQLite 流式加载 | — | ★ |
+| G20 | 闭包缓存 | 同一查询反复问很常见（"这次改动的下游影响面"）→ 按 `(起点, kind, 深度)` 缓存闭包结果 | — | ★ |
+| G21 | 图的用途链 | 图不是"未来可能用"，而是 **W16 `change_impact` 的底层实现**：依赖图可达性查询 → 改动影响面 → agent 判断"是否大范围架构改动"的客观依据 → escalate 闸门。**三者是一条链，不是三件事** | — | ★ |
+| G23 | **状态源收口** | ✅ **ledger 与黑板一律事件化**：`ledger.updated` / `board.written` 作为 durable 事件追加（**事件版本号 = 全局 seq，天然实现 CAS 语义**）；**当前态 = 索引器物化的投影**。消除 F5 / G8 / K22 / 06§7.1 的四方矛盾，保住「事件流是唯一事实源」 | ✅ |
+| G24 | **索引器恢复语义** | ① 持久化「已消费至 seq N」，崩溃后从 N 续跑；② 重建 = 清空派生表重放；③ **UI 必须显示水位**（「索引已追至 seq N」）——最终一致要**可见**，不能静默旧；④ 单例归属 = 随 hub 进程；**索引器本身不是多写者**（它是派生表的唯一写者） | ★ |
+| G25 | **session 亲和写** | 多写者跨进程时，**全局 seq = 提交序 ≠ 因果序** → 规定**一个 session 的事件只由其宿主进程 append**（session 亲和）。这样单 session 内「提交序 ≈ 因果序」，`causation_id` + seq 足够，**不需要 span 模型** | ★ |
+| G22 | 图的边从哪来 | ✅ **A. 工具产出**：工具返回里带 `graph_edges: [{src, dst, kind}]`，事件落盘时索引器据此建边。不用"按 tool kind 猜"（太脆），也不用"让 agent 自己维护图结构"（让模型出错） | — | ✅ |
+| G3 | 流划分 | ✅ **全局一条事件流 + session_id 区分**。理由：单一 seq 全局有序 → UI 订阅一条流按 session_id 过滤即可；跨 session 的统一时间轴（主 agent 与多个 subagent 事件按真实顺序交错）只有全局流才有；回放一个游标走完；全局成本/预算天然可聚合。代价是单 session 检索要靠 `(session_id, seq)` 索引（SQLite 一条索引即可） | — | ✅ |
+| G4 | 并发写 | ⚠️ **作废，被 G9 取代**（多写者 append + 单索引写者） | — | ✅ |
+| G5 | 长历史 | 分段 + 偏移索引 + 惰性加载 | 全文重放 | · |
+| G6 | 压缩产物 | 结构化摘要 **+ 原文区间指针**（可回捞） | 纯摘要（不可逆） | · |
+| G7 | 投影 | 只读，不参与写路径 | — | · |
+
+## H. 权限与沙箱
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| H1 | 三层模型 | 决策层（prompt）/ 策略层（规则+人审）/ 强制层（OS 沙箱） | · |
+| H2 | 求值链 | 有序链，首个命中即返回，顺序 deny→ask→allow | · |
+| H3 | deny 语义 | deny 优先且**不能写 allow 例外** | · |
+| H4 | 两种 deny | 裸工具名 deny = 移出模型可见集；参数化 deny = 拦截调用 | · |
+| H5 | 规则来源 | ✅ **deny / ask 跨所有来源取并集**（任一来源命中即 deny/ask，不看优先级）；**只有 allow 才按来源优先级解析**：managed > CLI > project > **workflow** > local > user > session。**workflow 规则只允许收窄、不允许放宽**（与 H11 同构）——workflow 是用户/agent 可写数据，若能放宽就是一条未审计的注入通道 | ✅ |
+| H6 | 权限模式 | read-only / workspace-write / danger-full-access 类预设 | · |
+| H7 | 无人值守 | 审批缺席即拒绝 **+ 注入拒绝话术**（照 omkc auto 模式） | · |
+| H8 | 缺席默认 | 审批服务不可用 → **deny**（不是 approve） | · |
+| H9 | 沙箱时机 | v0 不做；v1 起 seatbelt / bwrap / Win32 原生 / 容器 | · |
+| H10 | 网络 | 默认拒绝 + 域名白名单 | · |
+| H11 | 子 agent 权限 | 只能收窄，deny 强制继承（omkc 的"只继承不收窄"是反例）；**工作流声明的 scope 是"请求"，实际 = 请求 ∩ 策略上限 ∩ 父级授予** | · |
+| H12 | 凭据 | 按作用域注入 + 日志脱敏 | · |
+| H13 | 不可信输入 | 工具输出/网页标注来源，视为数据非指令 | · |
+| H14 | env 分层 | 四层分离：**凭据 env**（进 provider）/ **执行 env**（进工具进程）/ **上下文 env**（给模型看，默认不给）/ **作用域覆盖** | ★ |
+| H15 | 凭据来源 | 进程 env 读取 + 配置文件；**永不进 prompt / 事件 payload / 日志 / OTel** | ★ |
+| H16 | 执行 env 默认 | 工具默认继承**净化后**的父 env（凭据类剥离）；普通 env（PATH/HOME 等）保留 | ★ |
+| H17 | 凭据按需注入 | 工具显式声明 `required_env`，由策略引擎裁决后注入该次调用 | ★ |
+| H18 | 脱敏规则 | deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`）+ 值形态匹配（`sk-`/`ghp_`/JWT） | ★ |
+| H19 | 事件记录 | 只记录 env **键名**，不记值 | · |
+| H20 | 注入作用域 | global / session / agent / task / 单次调用 | ★ |
+| H21 | env 注入 v0 子集 | ✅ **v0 只做两级作用域（session + 单次调用）+ 不给模型看任何 env**。凭据来源：进程 env + 用户级配置文件，**永不进 prompt / 事件 / 日志**；执行 env 默认继承**净化后**的父 env（凭据类剥离），工具声明 `required_env` → 策略裁决后注入；上下文 env **v0 完全不给模型**（连 allow 名单都不做，最小化）；脱敏 deny 名单 `*_KEY` `*_TOKEN` `*_SECRET` `*_PASSWORD` `*_CREDENTIAL*` + 值形态 `sk-` `ghp_` `gho_` + JWT；事件只记 env **键名**。global / agent / task 级作用域与上下文 env 的 allow 名单留 v1 | ✅ |
+
+| H22 | 权限语义（工作流侧） | `permission_request` / `grants` 是**请求**；实际 = 请求 ∩ 策略上限 ∩ 父级授予 | ★ |
+| H23 | 命中即放行（工作流侧） | 落在已授予 scope 内的调用直接放行，不走逐次 ask；scope 外走完整策略链 | ★ |
+| H24 | **workflow 规则进权限链** | ✅ 见 H5：workflow 的 `gates[].kind:"policy"` 规则**只允许收窄**；deny/ask 跨来源取并集。**workflow 是用户/agent 可写数据，能放宽就是未审计的注入通道** | ✅ |
+
+## I. Provider 与模型
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| I1 | provider 契约 | 自研，不借 pi-ai（kosong 独立佐证可自研） | · |
+| I2 | Go SDK | anthropic/v2、openai/v3、genai（已实测活跃） | ✅ |
+| I3 | 统一事件 | 12 类（text/thinking/toolcall 各 start-delta-end）+ done/error | · |
+| I4 | 跨 provider 上下文交接 | **必做**：行业真空（kosong 静默丢弃、pi 不完整） | · |
+| I5 | 模型目录 | 内置静态快照 + 在线拉取（models.dev 形态）+ 周期刷新 | · |
+| I6 | 模型绑定 | per-agent 持久化，subagent/fork 继承 | · |
+| I7 | 路由 | 作为扩展点（RoutingPolicy） | · |
+| I8 | 成本 | token/成本核算内置 | · |
+
+## J. 上下文与压缩
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| J1 | 装配 | ContextAssembler 是扩展点，core 不内置具体来源 | · |
+| J2 | 项目规则 | 按需注入 + 运行中变更提醒（照 agentsMdReminder 形态） | · |
+| J3 | git 状态 | **不进 prompt**，工具按需查 | · |
+| J4 | 压缩策略 | CompactionStrategy 是扩展点 | · |
+| J5 | 压缩触发 | ✅ 与 J13 合并为**单一触发口径**（见 J20）：阈值 / 保留 / 后台三水位**统一为一套参数**，不再并存两套模型 | ✅ |
+| J6 | 可回溯 | 压缩后原文仍可按指针回捞 | · |
+| J7 | 溢出处理 | 自动压缩并重试一次 | · |
+| J8 | 上下文策略枚举 | `append`（默认）/ `stage_scoped`（阶段独立 + 交接摘要）/ `sliding_window`（热区滑动）/ **`tiered`**（分级压缩）；**用户可再写自己的** | ✅ |
+| J9 | 压缩等级定义 | **压缩等级 = 目标占用上下文窗口的百分比档位**（非离散编号）；最低档位如 0.1% → 500 个阶段占 50% | ★ |
+| J10 | 多阶段权衡 | 阶段数多时（500 个），每个阶段的摘要只能是"对当前阶段的简要概括"；深度压缩单阶段时才有更细摘要 | ★ |
+| J11 | tier 标签作用 | **给机械化流程的定位标记**：让框架识别出"LLM 要求压缩的范围"→ 取出该范围 → 交 LLM 压缩 → 取回摘要放回上下文 | ✅ |
+| J12 | v0 策略 | **只预留接口**，每阶段先做**最浅层压缩**；不做深度压缩、不做级联 | ✅ |
+| J13 | 触发点 | 占用到 **50%** 时压缩（实测：30~50% 区间 LLM 能力损失较小）；**数值用户可调** | ✅ |
+| J14 | 原文与 trace | 原文永远在持久存储；摘要记录覆盖范围 → **全过程可作完整 trace** | ✅ |
+| J15 | 检索扩展点 | **指针解析 = core 的确定性基础能力**（`Resolve(ref)`，不是扩展点）；**RAG = 独立的概率性扩展点**（`Retriever.retrieve(query)`），通过 `Assembler` 注入 | ✅ |
+| J16 | 解决的根因 | 长时程任务必超窗口；多次压缩破坏摘要 → **目标与约束偏移**（当前 goal 交付率偏低的根因） | ✅ |
+| J17 | **级联问题（未解）** | 深度压缩阶段 A 需"总体局势"+A 全文；若总体局势来自其他阶段摘要，压缩 A 又改变 A 摘要 → 级联失效 | ★ |
+| J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算 | ★ |
+| J19 | goal ledger 提案 | **目标、约束、已完成项、待解项**放在**上下文之外的独立持久存储**，由 agent 在关键点显式更新。压缩任一阶段只读账本 + 目标阶段全文 → 不需要级联；同时根治"目标偏移" | ★ |
+| J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」** | ★ |
+| J21 | **tiered% 锚定 + token 计量口径** | 压缩等级的百分比**锚定「装配时生效模型」的窗口**（200k/128k 下档位会漂移），换模型时重算并记事件。**token 计量**：provider usage 事件优先，**自算兜底**（各家 tokenizer 不同） | ★ |
+
+## K. 进程与多 session
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| K1 | session 隔离粒度 | ✅ **默认 hub 内 goroutine**（逻辑隔离：独立 context / 工具集 / 权限视图；panic 可在 goroutine 边界 recover；独立取消；成本近零）。**不默认独立进程**——subagent 是自 spawn 的自家代码；OS 级隔离是「运行任意第三方代码」的事，属于**工具 / ExecutionEnv**（K8）。**05 §4.2 的「进程默认」建议已被本条取代**（v0 无沙箱时进程隔离也拦不住写盘，「安全默认」名不副实） | ✅ |
+| K2 | 无全局单例 | core 不持有全局状态，状态显式传递 | · |
+| K3 | 外部命令 | Command 可从进程外提交 | · |
+| K4 | 远程订阅 | 事件流可远程订阅，按 session 过滤 | · |
+| K5 | hub 节奏 | v0 不做 hub，但契约按多进程设计 | · |
+| K6 | 崩溃域 | 单 session 崩溃不影响其他 session，也不拖垮 hub | · |
+| K7 | 并发控制 | 资源冲突调度（非裸并发）+ 配额 + provider 限流指数退避 | · |
+| K8 | **ExecutionEnv 抽象** | agent 的工具执行环境可插拔：`LocalExecutionEnv`（hub 进程内，v0）→ `SandboxedExecutionEnv`（子进程 + 沙箱，v1）→ `RemoteExecutionEnv`（远端 SSH，v2）。**升级到进程隔离只需换 env 实现，不动 agent 逻辑** | ★ |
+| K9 | goroutine 隔离的代价（必须对冲） | OS 级崩溃（OOM / 栈溢出 / cgo 崩溃）会带走整个 hub；死循环 goroutine 抢占其他；内存泄漏拖垮 hub。对冲：turn 超时 + 工具超时 + hub 级 CPU/内存监控告警 + 单 agent panic recover 后记事件并标记失败（不影响其他 agent） | ★ |
+| K10 | **发现表（Registry）** | core 的**内存活状态**组件，不是扩展点。属于**容器管理 + subagent 管理**的一部分，不是协议层。事件驱动更新（`agent.started` / `policy.asked` / `workflow.stage.changed` / `agent.finished` → 改内存） | ★ |
+| K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环 | ✅ |
+| K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效） | ★ |
+| K13 | **role = 部门标签** | role 近似"部门"（backend / frontend / infra）而非"角色扮演"，**由父 agent 在 spawn 时指定**。与 `agent_type` 正交：`agent_type` = 能力模板（能干什么），`role` = 部门（负责哪块）。role 自由文本、可重复 | ★ |
+| K14 | **暴露等级 = 注入长度** | 统一为"注入多少事件"：`summary`（0 条事件 + 1 条摘要）/ `n`（最近或最先 n 条事件）/ `full`（全部）。不是字段级过滤，是**窗口长度**。owner 通过 `set_exposure` 或 session 标记调控 | ★ |
+| K15 | **在线表注入** | 主 agent 上下文里**常驻一张在线表**（每个可见 session 一行 summary）。⚠️ **成本随 session 数线性增长** → 必须有上限与筛选（按 gate 过滤、最多 N 个、summary 限长） | ★ |
+| K16 | **深度限制 = 类型可达性（> 计数器）** | 主设计是**类型可达性**：`agent_type.can_spawn` 声明"我能派哪些类型"→ 第 4 层在类型层面就不可达。**数字计数器只是兜底**（`max_agent_depth` 可配置，默认两级委派）。每层成本线性叠加在三条链上：**summary 链**（深度 3 的 summary 是深度 2 的摘要 → 二次失真，同"多次压缩导致目标偏移"是同一个病）、**权限链**（每层 ∩ 父级 → 深度 3 时已很窄，再深一层纯开销）、**审计链**（责任追溯层数） | ★ |
+| K17 | **spawn 三道闸门** | 全部**运行时强制**（不靠提示词）：① **深度** `child.depth ≤ max_agent_depth` ② **类型** `child.type ∈ parent.can_spawn` ③ **权限** `child.permission ⊆ parent.permission ∩ policy_ceiling`。类型闸门让 `can_spawn` 有向无环，注册时校验 | ★ |
+| K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议** | ★ |
+| K19 | 跨机 | **不做分布式存储 / 分布式发现**。跨机时把 session 暴露成 **ACP agent 端点**，客户端用现成协议接入——不自己发明分布式协议 | ★ |
+| K20 | **层级 3 = 只读型** | **由 type 自行声明**（不硬编码"第 3 层必只读"——某些 workflow 需要可写的 scout）；但**内置的几个 type 默认只读**（`scout`：read/glob/grep）。理由：subagent 是**上下文隔离器**（把大量读取外包出去，避免主 agent 上下文被占满）；只读型的 `can_spawn` 为空 → **第 4 层在类型层面不可达** | ★ |
+| K21 | **orchestrator = 一个 type，不是硬编码层级** | "主 agent 下加一个 orchestrator"（它对整个项目 + 自己负责的模块做较完整探索，再分派 subagent）→ 表达为**一个 `coordinator` 类型的 agent_type**（`can_spawn` 指向 worker 类型，权限更高）。**层级数不硬编码**；"4 层"只是某种 type 组合的可达结果 | ★ |
+| K22 | **兄弟协作：A + B，不开 C** | 兄弟 subagent **互相不可见**（可见性要动态变就难审计，也违背「分支」哲学）。解法：**A 共享契约前置**（主 agent 在 spawn 时把表结构草案 / API 签名写进每个 subagent 的提示词 → 把运行时通信问题变成拆解时的设计问题）+ **B 共享黑板**（兄弟经黑板交换信息，不走可见性）。**黑板同样事件化**：`board.written` 作为 durable 事件追加，当前态 = 索引器投影（键级 last-write-wins 由事件顺序天然保证，见 G23）；语义可借鉴 moamcp 的 raw board（键级 LWW + 墓碑删除 + 分区） | ✅ |
+| K23 | **通信收敛机制** | ❌ **不做通信预算 / 配额**——靠**协调者居中**（`coordinator` type 承担协调行为）→ 树形沟通天然收敛，不存在"两两互聊"。**冲突防止靠 CI 门禁**（`gates` 里的 `ci.check` 部件）→ 冲突检测从**运行时移到集成时**。✅ **保留基础兜底**（这些是 agent 的基本属性，不是"预算"）：每 agent 的 turn 超时 / 工具超时 + **异常必须向上冒泡**（subagent 失败或卡住 → 直系父 agent 的 summary 必须报告它） | ✅ |
+| K24 | **subagent 完成 = function + 结构化 summary** | subagent 写 summary 后调 `complete(summary)` 工具 → 该 summary 作为**主 agent 调用 subagent 结束后的汇报**。summary 应**结构化**（做了什么 / 改了哪些文件 / 结论 / 下一步 / 问题），并带**可验证引用**（文件路径、事件 seq 区间）→ 主 agent 可用 `Inquiry` 拉原文核验。**summary 是 subagent 回到主 agent 上下文的唯一通道**（这正是"上下文隔离器"的关键机制） | ★ |
+| K25 | 单流多 agent 视图 | 主 agent 与 subagent **共用全局事件流**（G3），靠 `agent_id` 区分。上下文装配 = **按 `agent_id` 对全局流做投影**（主 agent 的视图 = 自身事件 + 子 agent 的 summary + 注入内容；subagent 的视图 = 自身事件 + 注入内容）。subagent 的 trace 因此天然持久、可回放 | ★ |
+| K27 | **垂直可见性口径定死** | ✅ 见 K11：**父 ↔ 直系子 可见 + Inquiry 沿父链逐级上查**（不是「全祖先/全后代自动可见」）。三处文档（06 §7.1 / K11 / handoff B#5）已统一 | ✅ |
+| K28 | **Durable 与恢复语义（承重墙）** | 见 X 区（单独成节） | ★ |
+| K29 | **fork/clone 复制语义** | fork 生成新 id + `parent_id`（S10）；**agent 树 / ledger / gate 成员 / worktree 怎么复制或不复制**必须写死（本条待细化：建议 fork 只复制 ledger 快照与 gate 成员，agent 树与 worktree **不复制**） | ★ |
+| K26 | agent 树的 id | `agent_id` = **ULID**（不是递增序列——递增序列在并发 spawn 下不安全，且跨树无意义）；`depth` = int；`parent_agent_id` = ULID 或 null；树内"第几个 subagent" = int64（仅供 UI 显示，非身份） | ★ |
+
+## L. 可观测性与评测
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| L1 | trace | 事件流即 trace | · |
+| L2 | telemetry | 独立管道，默认关 / 脱敏 / 单向 | · |
+| L3 | 调试 | 按需反射检视内部状态 | · |
+| L4 | 评测 | 事件流即数据集（回放 + 逐 turn 指标） | · |
+| L5 | v0 评测 | 不建独立评测框架 | · |
+
+## M. 错误与取消
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| M1 | 错误表达 | 错误是普通事件，不是特殊通道 | · |
+| M2 | 取消分层 | turn / step / task 三层 | · |
+| M3 | 取消识别 | `context.Canceled` 与普通错误区分 | · |
+| M4 | 重试 | 可重试 vs 致命有明确分类 | · |
+| M5 | 错误文案 | 必须让模型能理解并自我修正 | · |
+| M6 | **通用重试组件** | `core/retry`：`Do(ctx, policy, fn)` —— 多次重试无效后**直接返回聚合错误**（含各次尝试）。**主 agent 与 subagent 共用同一套**（工具调用 / 模型请求 / CI 检查都走它） | ★ |
+| M7 | **重试安全性** | ⚠️ 只有**声明为幂等**的操作才自动重试。工具契约加 `idempotent: bool`；**有副作用的工具重试会重复副作用**（照 pi-durable 的 `replay: "safe"` 概念）。模型 API 429/5xx 可重试；CI 检查幂等可重试；`bash` 默认**不可**重试 | ★ |
+| M9 | **长工具 TOCTOU 声明边界** | 策略在 T0 判定、副作用持续到 Tn → **「判定只约束发起时刻」是已知边界**（与 V8 同款诚实处理）。把判定快照记进调用事件，供事后审计 | ★ |
+| M8 | 抛出 ≠ 崩溃 | 重试耗尽后返回的 error 要**转成模型可见的工具结果**（让模型自我修正）+ 记一条 `error` 事件，**不是进程崩溃**。与 M1（错误是普通事件）一致 | ★ |
+
+## N. 协议与互操作
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| N1 | MCP 方向 | 先做 client 还是先做 server？ | ★ |
+| N2 | MCP 可选能力 | 不实现 sampling / elicitation / roots | · |
+| N3 | ACP | 不在 v0 | ✅ |
+| N4 | hub↔UI 协议 | ✅ **WebSocket + NDJSON**（与 D1/D2 已定契约一致，不引入 protobuf 工具链；浏览器/手机原生可用零额外组件；调试友好 `curl` 即可看流；HTTP/1.1 在移动网络重连比 HTTP/2 简单；量级不需要 gRPC 多路复用）。gRPC 排除原因：protobuf 与 JSON Schema 契约冲突 + gRPC-Web 需额外部署 Envoy proxy | — | ✅ |
+| N4b | 公网暴露 / 远程访问 | ⏸ **v0 不做，但架构上预留**。**密钥鉴权能做且应该做，但它是必要条件不是充分条件**——认证解决"谁能连"，不解决"连上的人能干什么"。启用远程访问的**必备条件**：① 凭证只走 header/query，**绝不走 cookie**（见 N5）；② 校验 `Origin`；③ token 可撤销 / 可轮换 / 按设备签发；④ **降权视图**（见 N5）；⑤ 全量审计进事件流；⑥ 公网必须 `wss://`（TLS）。默认 hub 只监听 loopback，远程走私有网络（Tailscale/WireGuard，自带设备身份与加密，比自签证书省事得多） | — | ★ |
+| N5 | 客户端鉴权与降权 | hub 客户端持 token（多设备多 token，可撤销）；**token 带 scope**（`read` / `prompt` / `approve` / `admin`），实际能力 = **token scope ∩ 策略上限 ∩ 降权视图**（同一套交集逻辑，与 H11 一致）。**降权视图**是给远端客户端的受限 UI：只读事件流 + 提交 prompt + 审批决策，且**高危操作的批准在降权视图里不可用**（或强制二次确认 + 设备绑定） | — | ★ |
+| N5b | ⚠️ loopback 的陷阱 | **WebSocket 不受同源策略约束** → hub 即使只监听 `127.0.0.1`，浏览器里的**任意恶意网页**都能发起 `ws://127.0.0.1:port` 连接。若凭证用 cookie，浏览器会自动携带 → 等于把 hub 暴露给任何网页。因此：**凭证只能放 `Authorization` 头或 query（恶意页读不到），且必须校验 `Origin`** | — | ★ |
+| N6 | NDJSON 惯例 | 与 ACP 传输保持一致 | — | · |
+
+## O. UI
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| O1 | UI 依赖 | TUI / GUI 都只依赖 contracts | · |
+| O2 | 权限 UI | 只渲染判定结果，不求值 | · |
+| O3 | 必须 UI 无关的 5 项 | 事件流格式 / transcript 契约 / 权限语义 / 会话句柄 / 长时程状态机 | · |
+| O4 | GUI | v0 不做 | · |
+| O5 | **v0 先做 Web UI** | ✅ **v0 优先 Web UI，TUI 后做**。理由：我们的差异化卖点就是**上下文可视化**（token 构成树 / 压缩痕迹 / 多 session 在线表）与**多 session 并行面板**——这两项在 Web 上表达力强一个量级；且传输已定 **WS + NDJSON** → Web UI 成本极低；迭代验证快 | ✅ |
+| O6 | **TUI 保留位** | ✅ core 只依赖 contracts → **TUI 随时可加**（独立包 + 独立进程）。TUI 的定位是**终端里的日常交互面**（对话 / 审批 / 流式），Web 是**深度视图**（可视化 / 多面板）。v0 **不承诺 TUI** | ✅ |
+| O7 | **Web UI 带来的安全代价** | ✅ Web 让「手机远程」变自然 → 强化 N4b/N5b：hub 只监听 loopback、凭证只在 header、校验 Origin、远端客户端用**降权视图**。另注意 Web UI 与「单二进制即用」的初衷有张力 → hub 是常驻进程，TUI/CLI/Web 都是它的客户端 | ✅ |
+
+## R. 工具与角色（工具集按角色分离）
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| R1 | 工具集关系 | **主 agent 与 subagent 各有自己的工具集，两者有交集**（不是包含关系） | ✅（用户已明确） |
+| R2 | 主 agent 专属工具 | 只给主 agent，**subagent 禁止调用**（如 `advance`/`milestone`、`escalate`、`spawn`——否则 subagent 可自己标记里程碑跳过阶段） | ✅ |
+| R3 | subagent 专属工具 | agent_type 专精工具**不注入主 agent 上下文**（防上下文污染，也省 token） | ✅ |
+| R4 | 共享工具 | 两者都可用（read / glob / grep …） | ✅ |
+| R5 | 可见性机制 | **不暴露即不存在**：工具能否被调用 = 该 agent_type 的 `tools[]` 是否包含它；模型看不见就不会调。**不需要 `allowed_callers` 元数据** | ✅ |
+| R6 | 注入时机 | 工具 schema **只注入用得到它的 agent 的上下文** | ★ |
+| R9 | 角色统一 | **主 agent 与 subagent 共用同一套 agent_type 体系，main 只是一个 type**（如 coordinator）。"主/子"是**能力差异**而非角色差异 | ✅ |
+| R10 | 编排能力 | `spawn` 只是 orchestrator type 的一个工具，worker type 没有 → 多 agent 模型自然涌现，不需要框架内置"主 agent"概念 | ★ |
+| R11 | 可见 vs 权限分离 | 可见性管"能不能看见"，权限管"能不能做"（agent_type 的 `permission_request`）；需要"可见但禁止"时走策略层 deny | ★ |
+| R7 | 权限绑定 | 权限跟着 **agent_type** 走，不跟着工作流叠加走（"review 只读"通过选只读 agent_type 实现） | ✅ |
+| R8 | 能力池叠加 | 追加 loop 时 system prompt 的哲学**并列追加**，能力池**并集**，权限仍受策略上限约束 | ★ |
+
+## W. 工作流（能力包 / 设计哲学 / 主 agent 自编排）
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| W1 | 工作流本质 | **能力包的提供与批准**：一套工作哲学 + 子代理类型 + 上下文管理方式 + 关键阶段部件 + 预批准。**不是流程** | ★（方向已由用户明确） |
+| W2 | 阶段含义 | 阶段 = **设计哲学**（如 plan-coder-critic-review），不是强制序列，不规定"这个阶段必须派哪些 subagent" | ★ |
+| W3 | 触发方式 | slash 命令 / 显式触发 → **哲学文本进 system prompt 供主 agent 选择** | ★ |
+| W4 | 追加 loop | 有问题时**在后续追加一个 loop**（如 review-critic）继续解决 → 工作流可组合 | ★ |
+| W5 | 子代理类型 | `agent_types[]`：每项声明 `prompt` / `tools[]` / `permission_request` / `model`——**用户可自定义工具列表、提示词、权限范围** | ★ |
+| W6 | 上下文策略 | `context_strategy` 是工作流的一部分（可区别于默认追加式）；内置枚举 + 参数，复杂的才做成扩展 | ★ |
+| W7 | 验收目标与部件 | 工作流可自带**验收目标**（自写 CI、写屏障、合并前检查……）；里程碑只是其中一例。分两类：**同步门禁类**（写屏障/权限门）→ **数据驱动的策略规则**，进程内同步生效；**异步任务类**（CI/验收/构建）→ **进程级组件**，可热插拔、可替换。**冲突检测放在这里（CI 门禁），不在通信层解决** | ★ |
+| W8 | **门禁正确形态** | ✅（依据 tower 回函）**不透明命令 + 一次性快照 + 事后按 receipt 校验**。三层切分保留：① 通用组件（执行/判定，不绑工作流）② 默认工作流片段（检测到 git 仓库自动叠加，可关）③ 工作流可引用/覆盖。**门禁只认事实（exitCode / commit），不认意图**（筛选、baseline 都是后话） | ✅ |
+| W9 | **命令靠注入，不靠探测** | ✅（tower 已用同样做法：`.tower/ci.json` 手工维护，**仓库级唯一**，无探测无默认无分层）。引擎把命令当**不透明 shell 字符串**执行，不区分 typecheck/lint/测试。**命令对引擎是黑盒，准确性的责任在写命令的人** | ✅ |
+| W9b | **门禁是轻量的** | 不是 GitHub Actions 那种重 CI —— 耗时短，因此**所有工作流默认启用**、每次合并前都跑，耗时不是问题。且它本质是**长时程行为**（时长影响不大） | ★ |
+| W10 | **冲突由协调人协商** | ✅ 文本冲突**不自动解**，交回 worker（rebase → 解冲突 → push → 重新 review）。前提：协调人有全局观感（可见所有分支 summary、可 `Inquiry` 拉原文核验）。⚠️ **必须先 `git merge --abort`**（tower 的最大坑：主 checkout 卡在 MERGE_HEAD 状态最难人工收拾）→ 我们的形态是 abort + escalate + checkpoint 挂起 | ✅ |
+| W9c | **CI baseline** | ✅ **优先级高**（tower 回函：这是他们的真空地带；**红仓是长时程自主的常态**，没有 baseline 门禁就永远卡死）。要「**已知失败指纹 + 豁免**」的口子；baseline 作用域建议**仓库级**（分支级会碎片化） | ✅ |
+| W10b | **CI 失败 → 自动 escalate** | ✅ 门禁失败自动 escalate（checkpoint + 挂起）。**不阻塞其它 agent**——只阻塞本分支的 merge，依赖它的 mission 由 deps 检查挡住。failed 是**终态**（无自动重试）；重跑 = 重新发起一次 run | ✅ |
+| W7b | 插件可行性 | **Go plugin 在 Windows 不可用**（仅 linux/darwin/freebsd）→ 组件一律走进程级或解释型。写屏障**不能**做成进程外插件（TOCTOU + 可绕过），必须是进程内策略规则 | ✅（技术结论） |
+| W21 | 编排主体 | 主 agent 自行决定：开几个 subagent、用哪个 agent_type、并行与否；框架不校验 | ★ |
+| W11 | 动态性 | 偏离（跳过里程碑、自造流程、多开）**记入事件流**；工作流文档变更走事件追加 | ★ |
+| W12 | 归属 | 绑定在 session 上的一份配置，不是 core 全局状态 | ★ |
+| W13 | 契约形态 | `Workflow` 是跨边界 JSON Schema 契约（纯数据，可被任何语言写/组合/追加） | ★ |
+| W14 | 代码扩展点 | 只有两处是代码：**里程碑部件**（`MilestoneHandler`）与**自定义上下文策略** | ★ |
+| W15 | **预算策略** | **默认不设上限**（长时程自主是卖点，预算不可控）；改为**风险闸门**：主 agent 判断涉及**大范围架构改动/既有内容**时主动停下告知用户 | ★ |
+| W16 | 闸门实现 | 框架提供**变更影响面**客观依据（diff 规模、触及的核心接口）供 agent 判断，而非纯靠模型感觉 | ✅（做） |
+| W17 | escalate 语义 | **checkpoint + 挂起**（不 deny、不丢进度）；恢复后由用户决定继续 / 改方向 / 放弃。无人值守同样挂起而非失败 | ✅ |
+| W17b | escalate vs ask | 两者都走 Approver 但**触发源不同**：ask=策略链拦截，escalate=agent 主动升级。日志必须可区分触发源 | ★ |
+| W20 | 升级 vs 审批 | `ask`（策略拦截）无人应答 → deny + 拒绝话术；`escalate`（agent 主动）→ checkpoint 挂起 | ✅ |
+| W18 | 哲学分类 | 构建类（plan-coder-critic-review）与探索/资产探查类各有不同哲学 → 工作流是可分发的包 | ★ |
+| W19 | 现成验证用例 | **tower 就是一个工作流实例**（worktree 生成 + 合并前仿 CI 检查作为里程碑部件）→ 可作首个实现验证 | ★ |
+## V. CI 门禁实现细节（依据 tower 回函 `ho_d0df74d42709`）
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| V1 | **快照隔离** | CI 跑在**一次性快照 worktree**（把分支 tip 检出到独立 detached worktree），**不是 live worktree** → 未提交改动、写了一半的文件**结构性不参与**。比 dirty 检查干净。并行跑 N 个 CI = N 个独立快照 | ★ |
+| V2 | **receipt 校验** | 门禁只认四件事：① `exitCode === 0` ② `receipt.commit === 分支当前 tip` ③ `observedCommit === commit` ④ `command === 当前配置`。**防止"跑的是旧 commit"或"配置已改"被误判为通过** | ★ |
+| V3 | **外部资源隔离 = 留白 + 约定注入** | 快照只隔离**文件系统**；端口 / 临时目录 / 全局缓存（pnpm store、go mod cache、venv）/ 构建产物**不在问题域内** → 给命令注入约定环境变量（`$CI_WORKTREE`、`$CI_PORT_BASE` 等）让命令自隔离。**tower 明确说这是留白、他们没解** | ★ |
+| V4 | 依赖缓存策略 | tower 选**每快照独立**（干净但每次全量安装，慢）。我们可做**内容寻址的共享只读缓存**（快 + 无锁竞争 + 无污染）——但这是他们重做清单的第 1 条，说明有真实收益 | ★ |
+| V5 | **日志截断 + 耗时埋点** | CI 日志文件**必须设上限**（tower 现在无限增长，是他们重做清单第 1 条）。run 记录加 `elapsedMs`（tower 没埋，复盘全靠猜） | ★ |
+| V6 | **review-tip 失效检测** | 「review 后又推了一行」是 tower 最常见的 merge block。我们的事件流天然能检测：分支 tip 变了 → 已有 review 结论失效 → 要求重审 | ★ |
+| V7 | **合并后冲突预测** | tower 在合并**成功后**做「本次改动 vs 未合并 mission 的三点 diff 求交集」提前预警撞车。**我们能用依赖图做得更准**（G 区 change_impact 的可达性查询） | ★ |
+| V8 | **write guard 的诚实边界** | ✅（已定，方案 a）tower 的 guard 是 **fail-open** 且**只拦 Write/Edit 工具**——Bash 重定向 / `rm` / `git checkout --` 都不拦。他们的教训：要做就 **fail-close + 覆盖 shell 写入**。我们 V0 做不到覆盖 shell 写 → **UI 上明确声明边界**（写保护覆盖文件工具；Bash 写入受策略链但非 OS 强制），**不假装覆盖了**。真正的解法是 V1 的 OS 沙箱（Windows 上原生沙箱极少：AppContainer 形状不对、MIC 不适用、Windows Sandbox 需 Hyper-V 且无法访问真实工作区） | ✅ |
+| V9 | 可搬运资产（**语义参照，产物重写**） | **不搬代码**（与 omkc 的 mission / roster / agentId 强耦合），但**可搬 schema 与机制**：CI run 记录 schema、**receipt 四要素校验**、merge gate **步骤骨架**、gitOps 的 junction-safe rmTree 与 worktree registry、guard 的「声明 accesses + 子路径判定」形态。**但要挑着搬**——tower 的链是 mission→deps→survey→review→tip→scope→CI→base→merge，我们**没有 mission / deps / 独立 reviewer**，对应物是 agent 树 + 协调人 → **只搬 CI 那几段与步骤骨架，其余不要**；「合并后冲突预测」也不能照搬（三点 diff 交集 → 我们用依赖图可达性，更准） | ★ |
+| V10 | Windows 具体坑 | git 走**绝对路径 execFile `git.exe`**（不走 shell，防 cwd 劫持）；`windowsHide:true`；kill 用 `taskkill /T /F /PID`；**WER 弹窗压制**（否则桌面炸弹窗）；**junction 防御**（rmTree 先解 junction 再删）；路径身份比较要 **realpath + 小写**；worktree 被 CI 子进程锁住**无自动解锁**（只能人杀进程） | ★ |
+
+
+## S. 身份与 ID（详见 `08-identity-model.md`）
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| S1 | 框架 id 格式 | **ULID**（26 字符 Crockford base32）：全局唯一、同秒不撞、字典序=时间序、自带创建时间、文件名/URL 安全、大小写不敏感 | ✅ |
+| S2 | 序号 vs id | `turn_id` / `step_id` 用 **session 内 int64 序号**（天然可比较可排序），不用 ULID | ✅ |
+| S3 | 哈希的用途 | **只做路径分组**（`project_id` = hash(canonical_cwd)、`repo_id` = hash(canonical_git_root)），**不作身份** | ✅ |
+| S4 | provider id | **黑盒**：原样存、原样回传；不解析 / 不改写 / 不折叠大小写 / 不做规范化 | ✅ |
+| S5 | 字段隔离 | `Event.id`（框架 ULID）与 `payload.tool_call_id`（provider 不透明串）**永远不同字段**；MCP 的 `sessionId` / `requestId` / `progressToken` **不进我们的命名空间** | ✅ |
+| S6 | JSON 类型 | 所有 id 在 JSON 里**一律 string**（int64/ULID 转 number 会丢精度） | ✅ |
+| S7 | 事件去重 | **只看 `Event.id`**，绝不看 payload 里的任何 id | ✅ |
+| S8 | 字符集纪律 | 框架 id 限 `[0-9A-HJKMNP-TV-Z]`；禁标准 base64；禁只靠大小写区分；禁 id 做文件名（provider id 可能含 `/` `:`） | ✅ |
+| S9 | 失效即拒 | 字符集/长度不合则**拒绝并记事件**，不截断、不转义、不补零 | ✅ |
+| S10 | 变更规则 | resume 保持同 id；fork/clone 生成**新 id + `parent_id`**；归档不改 id | ✅ |
+| S11 | 并发唯一性 | ULID 实现线程安全（时间戳单调 + 随机源加锁 / atomic 计数器） | ★ |
+| S12 | 校验与契约 | id 入 JSON 前统一校验（字符集/长度/非空/来源标记）；schema 里给每个 id 字段标 `pattern` + `x-id-kind` | ★ |
+| S13 | 路径规范化 | `hash(cwd)` 前必须：解析符号链接 → Windows 转小写 → 统一分隔符 → 去尾斜杠。否则同一项目会裂成多个 id | ★ |
+| S14 | repo_id 独立 | worktree 隔离下同一仓库有多个 cwd → `project_id` 分目录、`repo_id` 聚合（资产图按 repo 级） | ★ |
+| S16 | **命名空间补全** | ✅ 08 的命名空间表补入：`causation_id`（F3）、`gate_id`（K12）、`workflow:<run_id>`、`sum:` 引用（ContextSnapshot）、`parent_agent_id`（K26） | ✅ |
+| S15 | 展示前缀 | 日志/UI 用 `session_id[:8]`，**比较一律用完整值** | · |
+
+## Q. Prompt 组装与注入源
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| Q1 | 编排时机 | **最后做**——先确定"所有需要注入的内容"及其**稳定性分级**，再定 prompt 顺序 | ★ |
+| Q2 | 注入源清单 | system/基础提示 · 工具 schema · agent_type 与权限声明 · 项目规则（AGENTS.md）· goal ledger · 历史事件 · **在线表/在线状态** · 当前阶段与 role | ★ |
+| Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾** | ★ |
+| Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效 | ★ |
+| Q5 | 暴露等级收敛 | `full` **不建议常用**（事件全量注入，token 成本高且信息噪声大）；默认 `summary`，按需升到 `n`，`full` 需显式 | ★ |
+| Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻 | ★ |
+| Q7 | **summary 污点继承** | ✅ subagent 的 summary 是回主 agent 的**唯一通道** → 若 subagent 读到被注入的内容，summary 就是攻击载荷出口。**summary 强制带 `taint`**（继承来源事件的最高污点级），主 agent 对 tainted summary **按不可信数据处理**（与 H13 同源） | ✅ |
+
+## X. Durable 与恢复语义（承重墙，2026-10-27 补）
+
+> 长时程自主是产品存在理由，而"进程半夜挂掉后从哪续"此前**整块缺席**。本区补齐。参照 pi-durable 的设计（`03` 已预警这是最难自己长出来的一块）。
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| X1 | **副作用提交顺序** | ① **意图事件 durable 落盘**（`tool.call.intent`：tool_call_id / 参数 / idempotent / replay 标记 / 外部可核验锚点如 commit sha）→ ② 执行 → ③ **结果事件 durable 落盘**（`tool.call.completed` / `.failed`）。崩溃后「有意图无结果」= **未知结果**，**不盲目重跑** | ★ |
+| X2 | **工具重放语义** | 两个字段合一套体系：`idempotent: bool`（能否自动重试：429/5xx 类抖动）+ `replay: "safe" \| "verify" \| "unsafe"`（崩溃续跑时能否重放）。**safe**=重复执行无副作用；**verify**=可重放但须先核验外部状态（git push → 先看远端有没有该 commit）；**unsafe**=不可重放（发邮件、删除）→ 未知结果必须由 agent 或人工判定 | ★ |
+| X3 | **checkpoint 内容** | 四项：① 事件流 **seq 水位** ② **ledger 快照版本**（ledger 事件 seq）③ **in-flight 清单**（intent 已落 / result 未落的操作 id）④ **会话与 agent 树的状态投影版本**。checkpoint 本身也是一条 durable 事件（`checkpoint.created`），内容是上述四项的引用 | ★ |
+| X4 | **resume 流程** | ① 读最后一个 checkpoint ② **fold 事件到水位**重建状态 ③ **处置 in-flight**：按 X2 的 replay 语义分三类（safe 自动重放 / verify 先核验 / unsafe 转人工或 agent 判定）④ **恢复 agent 树**：已完成的 agent 不重启，未完成的从其最后一个 turn 继续 ⑤ 写入 `session.resumed` 事件后继续跑 | ★ |
+| X5 | **ownership / 幂等键** | 每次 spawn 产生一条 ownership 记录 `{parent_agent_id, spawn_request_id, child_agent_id}`；**续跑时按 `(parent_agent_id, spawn_request_id)` 找回同一个 child，不新建**。需要新增 id 命名空间 `spawn_request_id`（ULID） | ★ |
+| X6 | **ledger 写放大控制** | **关键字段立即落盘**（目标 / 约束变更 → 崩溃不丢）；**过程性字段 turn 末合并**（已完成项 / 待解项 → 同一 turn 内多次更新合并为一条 `ledger.updated`） | ★ |
+
+
+## P. 工程与交付
+
+| ID | 决策项 | 我的主张 | 状态 |
+|---|---|---|---|
+| P1 | 仓库结构 | ✅ **monorepo 单仓多包**：主模块（contracts / core / runtime / host / ui）+ **extensions 各自独立 go.mod**（可独立发版）。通用组件（agentlink / gate / retry）放 `core/` 子包**且对外可导出**（不能放 internal）；`workflows/` 独立目录放数据 | 多仓 | ✅ |
+| P2 | 版本演进 | 契约版本与实现版本独立演进 | · |
+| P3 | 开源 | ✅ **先私有开发、契约冻结后再公开**（API 稳定前开源会让 module path / 目录 / 契约的改动成本立刻升高）。最终是否公开取决于商业意图 | 内部闭源 | ✅ |
+| P4 | 模块路径 / 仓库名 / 命令名 | ✅ **产品名 `alasol`**（拉丁 ala「翼」+ solum「地基」半段拼接；2026-10-27 经 gh 仓库名/用户名双查定案）；**module path = `github.com/Yorha9e/alasol`**，仓库名 `alasol`；**命令名 `alasol`**（原建议 `hx` 作废：与 Helix 编辑器二进制同名、PATH 冲突；「harness」作为品类词保留在文档里） | — | ✅ |
+| P5 | 许可证 | ✅ **Apache-2.0**（有明确的专利授权与不主张条款——我们要集成大量第三方模型 SDK 与协议实现，MIT 无此条款；兼容性等同 MIT）。依赖许可核对：pi=MIT、MCP/ACP=Apache-2.0 → 全部兼容。**不选 BUSL**（带商业限制，与要生态的定位冲突） | MIT | ✅ |
+| P6 | CI | schema 校验 + 酸测试矩阵（每种扩展点换实现） | · |
+
+---
+
+## 需要你定的条目汇总（★）
+
+> **本表由各区自动汇总**（D21 纪律：数字与清单只在源头定义一次）。改各区的状态后请重跑汇总脚本。
+
+| ID | 决策项 | 状态 |
+|---|---|---|
+| B4 | 解释型扩展运行时 | ★ |
+| D8 | 事件分类 | ★ |
+| E2 | 分配 | ★ |
+| E8 | 通用组件区 | ★ |
+| F2 | 因果关系 | ★ |
+| F4 | loop 形态 | ★ |
+| G1 | Store 形态 | ★ |
+| G2 | 存储抽象层 | ★ |
+| G2d | 向量引擎 | ★ |
+| G2e | blob 引擎 | ★ |
+| G2f | 图不是硬依赖 | ★ |
+| G10 | seq 语义 | ★ |
+| G11 | 事件幂等 | ★ |
+| G12 | 上下文快照存储 | ★ |
+| G17 | 索引器角色 | ★ |
+| G18 | 图查询分层 | ★ |
+| G19 | 图内存预算 | ★ |
+| G20 | 闭包缓存 | ★ |
+| G21 | 图的用途链 | ★ |
+| G24 | 索引器恢复语义 | ★ |
+| G25 | session 亲和写 | ★ |
+| H14 | env 分层 | ★ |
+| H15 | 凭据来源 | ★ |
+| H16 | 执行 env 默认 | ★ |
+| H17 | 凭据按需注入 | ★ |
+| H18 | 脱敏规则 | ★ |
+| H20 | 注入作用域 | ★ |
+| H22 | 权限语义（工作流侧） | ★ |
+| H23 | 命中即放行（工作流侧） | ★ |
+| J9 | 压缩等级定义 | ★ |
+| J10 | 多阶段权衡 | ★ |
+| J17 | 级联问题（未解） | ★ |
+| J18 | 级联候选解 | ★ |
+| J19 | goal ledger 提案 | ★ |
+| J20 | 压缩触发计入 prompt cache 成本 | ★ |
+| J21 | tiered% 锚定 + token 计量口径 | ★ |
+| K8 | ExecutionEnv 抽象 | ★ |
+| K9 | goroutine 隔离的代价（必须对冲） | ★ |
+| K10 | 发现表（Registry） | ★ |
+| K12 | 自动 / 显式 Gate | ★ |
+| K13 | role = 部门标签 | ★ |
+| K14 | 暴露等级 = 注入长度 | ★ |
+| K15 | 在线表注入 | ★ |
+| K16 | 深度限制 = 类型可达性（> 计数器） | ★ |
+| K17 | spawn 三道闸门 | ★ |
+| K18 | 交流能力做成可复用组件 | ★ |
+| K19 | 跨机 | ★ |
+| K20 | 层级 3 = 只读型 | ★ |
+| K21 | orchestrator = 一个 type，不是硬编码层级 | ★ |
+| K24 | subagent 完成 = function + 结构化 summary | ★ |
+| K25 | 单流多 agent 视图 | ★ |
+| K26 | agent 树的 id | ★ |
+| K28 | Durable 与恢复语义（承重墙） | ★ |
+| K29 | fork/clone 复制语义 | ★ |
+| M6 | 通用重试组件 | ★ |
+| M7 | 重试安全性 | ★ |
+| M8 | 抛出 ≠ 崩溃 | ★ |
+| M9 | 长工具 TOCTOU 声明边界 | ★ |
+| N1 | MCP 方向 | ★ |
+| N4b | 公网暴露 / 远程访问 | ★ |
+| N5 | 客户端鉴权与降权 | ★ |
+| N5b | ⚠️ loopback 的陷阱 | ★ |
+| Q1 | 编排时机 | ★ |
+| Q2 | 注入源清单 | ★ |
+| Q3 | 稳定 → 变动排序 | ★ |
+| Q4 | 缓存友好 | ★ |
+| Q5 | 暴露等级收敛 | ★ |
+| Q6 | Inquiry 返回 | ★ |
+| R6 | 注入时机 | ★ |
+| R8 | 能力池叠加 | ★ |
+| R10 | 编排能力 | ★ |
+| R11 | 可见 vs 权限分离 | ★ |
+| S11 | 并发唯一性 | ★ |
+| S12 | 校验与契约 | ★ |
+| S13 | 路径规范化 | ★ |
+| S14 | repo_id 独立 | ★ |
+| V1 | 快照隔离 | ★ |
+| V2 | receipt 校验 | ★ |
+| V3 | 外部资源隔离 = 留白 + 约定注入 | ★ |
+| V4 | 依赖缓存策略 | ★ |
+| V5 | 日志截断 + 耗时埋点 | ★ |
+| V6 | review-tip 失效检测 | ★ |
+| V7 | 合并后冲突预测 | ★ |
+| V9 | 可搬运资产（语义参照，产物重写） | ★ |
+| V10 | Windows 具体坑 | ★ |
+| W1 | 工作流本质 | ★（方向已由用户明确） |
+| W2 | 阶段含义 | ★ |
+| W3 | 触发方式 | ★ |
+| W4 | 追加 loop | ★ |
+| W5 | 子代理类型 | ★ |
+| W6 | 上下文策略 | ★ |
+| W7 | 验收目标与部件 | ★ |
+| W9b | 门禁是轻量的 | ★ |
+| W11 | 动态性 | ★ |
+| W12 | 归属 | ★ |
+| W13 | 契约形态 | ★ |
+| W14 | 代码扩展点 | ★ |
+| W15 | 预算策略 | ★ |
+| W17b | escalate vs ask | ★ |
+| W18 | 哲学分类 | ★ |
+| W19 | 现成验证用例 | ★ |
+| W21 | 编排主体 | ★ |
+| X1 | 副作用提交顺序 | ★ |
+| X2 | 工具重放语义 | ★ |
+| X3 | checkpoint 内容 | ★ |
+| X4 | resume 流程 | ★ |
+| X5 | ownership / 幂等键 | ★ |
+| X6 | ledger 写放大控制 | ★ |
+
+**合计**：✅ 已定 **81** 条 · ★ 待议 **108** 条 · · 默认通过（我的主张，未逐条确认）**90** 条 · 共 **279** 条
+
+---
+
+## 相关文档
+
+- `00-overview.md`（横切面缺口）· `01-permissions-and-sandbox.md`（权限三层）· `05-architecture-pivot.md`（语言定案）
+- `06-skeleton-design.md`（骨架规格）· `08-identity-model.md`（ID 设计）· `09-package-boundaries.md`（包边界）
+- `10-design-review-report.md`（外部审阅）· `11-construction-plan.md`（施工计划）
