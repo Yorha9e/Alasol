@@ -28,7 +28,7 @@
 
 > **本项目已全量交接**：设计侧工作收尾，后续施工全部在另一 session 进行。
 > 施工入口 → [`docs/research/11-construction-plan.md`](docs/research/11-construction-plan.md)（含**环境与工具链事实**、阶段划分、硬验收、20 条施工期陷阱清单）。
-> 阶段 0–5 **已完成**（2026-10-27，各自通过退出评审循环 critic clean）：仓库/CI/契约 + core（bus/policy/registry/loop/**agents 多 agent**）+ runtime（SQLite/索引器/回放/provider/read·write·bash/终端审批）。下一步：阶段 6 最小门禁。命名已定：`alasol` · `github.com/Yorha9e/alasol`。
+> 阶段 0–6 **已完成**（2026-10-27，各自通过退出评审循环 critic clean）：仓库/CI/契约 + core（bus/policy/registry/loop/agents/**gate 判定**）+ runtime（SQLite/索引器/回放/provider/工具/审批/**gate 执行**）。下一步：阶段 7 客户端（CLI+Web）。命名已定：`alasol` · `github.com/Yorha9e/alasol`。
 
 - 目标已收敛：**搭一套可自定义、可拓展的骨架**（ACP 等具体特性后置），在骨架之上向任意方向扩展
 - **骨架验收标准（酸测试）**：把任意一个扩展点的实现整个换掉，core 代码一行不改

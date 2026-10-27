@@ -144,3 +144,23 @@ type AgentFailedPayload struct {
 	// 失败原因（复用 ToolCallError：模型可读 message + 分类 code）。
 	Error ToolCallError `json:"error"`
 }
+
+// gate.checked —— 最小门禁一次校验的事实记录（W8：门禁只认事实；V2 四要素；W9c baseline；W10b escalate）。durable=true：门禁结论进事件流（唯一事实源，D5/F5）。receipt_commit/observed_commit 供 V2②③ 事后审计；passed = 未拦截（passed/recorded 均算通过），recorded = 首建/record 模式只记录不阻断，blocked 时 new_failures 列出新增失败。
+type GateCheckedPayload struct {
+	// receipt 声称在其上跑门禁的 commit（快照创建时的 HEAD，V2②）。
+	ReceiptCommit string `json:"receipt_commit"`
+	// 命令跑完后再次 rev-parse HEAD 的观测值（V2③：跑期间 HEAD 移动会被抓到）。
+	ObservedCommit string `json:"observed_commit"`
+	// 实际跑的不透明 shell 命令（W9：引擎不解析，与当前配置比对见 V2④）。
+	Command string `json:"command"`
+	// 门禁命令退出码（事实，非 error；V2①）。
+	ExitCode int64 `json:"exit_code"`
+	// 门禁是否放行：passed/recorded 均为 true，blocked 为 false。
+	Passed bool `json:"passed"`
+	// 是否为首建 / -record 模式（只记录不阻断，W9c）。
+	Recorded bool `json:"recorded"`
+	// blocked 时的新增失败条目（规范化失败行，W9c：只拦 baseline 里没有的失败）；passed/recorded 时缺省。
+	NewFailures []string `json:"new_failures,omitempty"`
+	// 门禁命令耗时毫秒（V5：必记，复盘不靠猜）。
+	ElapsedMs int64 `json:"elapsed_ms"`
+}
