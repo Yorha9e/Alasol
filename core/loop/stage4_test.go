@@ -42,7 +42,7 @@ func TestInjectedSecretIsRedactedFromOutputAndEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 
@@ -52,8 +52,8 @@ func TestInjectedSecretIsRedactedFromOutputAndEvents(t *testing.T) {
 	}
 
 	// ② completed 事件的载荷里不得有凭据值，只能有 "***"。
-	evs := h.events()
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
+	evs := writePath(h.events())
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
 	blob, err := json.Marshal(evs[1])
@@ -109,7 +109,7 @@ func TestRedactionDoesNotTouchInheritedEnv(t *testing.T) {
 	if _, err := h.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	done := decodeCompleted(t, h.events()[1])
+	done := decodeCompleted(t, writePath(h.events())[1])
 	got := *done.Result.Content[0].Text
 	if !strings.Contains(got, "/opt/bin") {
 		t.Fatalf("继承来的普通 env 值不应被脱敏（误伤）: %q", got)
@@ -131,7 +131,7 @@ func TestOrdinarySessionValueIsNotRedacted(t *testing.T) {
 	if _, err := h.loop(func(c *loop.Config) { c.SessionEnv = sessionEnv }).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	done := decodeCompleted(t, h.events()[1])
+	done := decodeCompleted(t, writePath(h.events())[1])
 	got := *done.Result.Content[0].Text
 	if got != "build ok debug 1" {
 		t.Fatalf("普通 session 值不应被脱敏（误伤）: %q", got)
@@ -165,7 +165,7 @@ func TestCredentialShapedSessionValueIsRedacted(t *testing.T) {
 			if _, err := h.loop(func(c *loop.Config) { c.SessionEnv = tc.env }).Run(context.Background(), "p"); err != nil {
 				t.Fatalf("Run: %v", err)
 			}
-			done := decodeCompleted(t, h.events()[1])
+			done := decodeCompleted(t, writePath(h.events())[1])
 			got := *done.Result.Content[0].Text
 			for _, v := range tc.env {
 				if strings.Contains(got, v) {
@@ -208,17 +208,17 @@ func TestBadArgumentsFailsNormallyWithoutAbortingRun(t *testing.T) {
 			if err != nil {
 				t.Fatalf("参数不合约不该中止 Run: %v", err)
 			}
-			if res.ToolCalls != 1 || res.Events != 2 || res.Turns != 2 {
+			if res.ToolCalls != 1 || res.Events != 4 || res.Turns != 2 {
 				t.Fatalf("Result 不符: %+v", res)
 			}
 
-			evs := h.events()
-			if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
+			evs := writePath(h.events())
+			if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 				if !tc.wantBad {
 					t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 				}
 				// 坏参数：intent + failed（不执行）。
-				if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+				if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 					t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 				}
 				if n := exec.callN(); n != 0 {

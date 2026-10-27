@@ -214,7 +214,7 @@ func TestPolicySnapshotShape(t *testing.T) {
 	if _, err := h.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	raw := decodeIntent(t, h.events()[0]).PolicySnapshot
+	raw := decodeIntent(t, writePath(h.events())[0]).PolicySnapshot
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatalf("快照不是对象: %v", err)
@@ -244,13 +244,13 @@ func TestNilPolicyEngineFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "fail-close") {
 		t.Fatalf("空引擎应按 fail-close 拒绝: %q", fp.Error.Message)
 	}

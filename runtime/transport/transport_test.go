@@ -1,0 +1,556 @@
+package transport_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/bus"
+	"github.com/Yorha9e/alasol/runtime/store/sqlite"
+	"github.com/Yorha9e/alasol/runtime/transport"
+	"github.com/coder/websocket"
+)
+
+// ---------------------------------------------------------------------------
+// 测试辅助
+// ---------------------------------------------------------------------------
+
+// newHub 建一条真的事件流（真 SQLite 文件库 + bus），返回 bus 与关闭函数。
+//
+// 用临时**文件**库而不是 :memory:：内存库 + 连接池在并发写下会各自看到空 schema
+// （实测 "no such table: events"），文件库与真实部署一致。
+func newHub(t *testing.T) (*bus.Bus, func()) {
+	t.Helper()
+	st, err := sqlite.Open(filepath.Join(t.TempDir(), "events.db"), sqlite.Options{})
+	if err != nil {
+		t.Fatalf("打开事件库: %v", err)
+	}
+	return bus.New(st), func() { _ = st.Close() }
+}
+
+// newWSServer 起一个只挂 /ws 的 httptest 服务端。
+func newWSServer(t *testing.T, s *transport.Server) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", s.ServeWS)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func wsURL(srv *httptest.Server) string {
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
+}
+
+// mustDial 连上去（失败即中止当前测试 goroutine）。
+func mustDial(t *testing.T, srv *httptest.Server) *transport.Client {
+	t.Helper()
+	c, err := dial(srv)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// dial 连上去（返回 error，供并发 goroutine 用）。
+func dial(srv *httptest.Server) (*transport.Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return transport.Dial(ctx, wsURL(srv))
+}
+
+// recvTimeout 带超时地收一条消息（避免测试挂死；失败即中止当前 goroutine）。
+func recvTimeout(t *testing.T, c *transport.Client, d time.Duration) contracts.TransportMessage {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	m, err := c.RecvContext(ctx)
+	if err != nil {
+		t.Fatalf("recv: %v", err)
+	}
+	return m
+}
+
+// recvErr 带超时地收一条消息（返回 error，供并发 goroutine 用）。
+func recvErr(c *transport.Client, d time.Duration) (contracts.TransportMessage, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	return c.RecvContext(ctx)
+}
+
+// publish 发一批事件（durable=true，走真 store → 带 seq）。
+func publish(t *testing.T, b *bus.Bus, sid contracts.Ulid, kinds ...string) error {
+	t.Helper()
+	evs := make([]contracts.Event, 0, len(kinds))
+	for _, k := range kinds {
+		evs = append(evs, contracts.Event{
+			V: 1, ID: core.NewUlid(), Kind: k, TS: "2026-01-01T00:00:00Z",
+			SessionID: sid, AgentID: core.NewUlid(), Durable: true,
+			Payload: json.RawMessage(`{"k":"` + k + `"}`),
+		})
+	}
+	if err := b.Publish(context.Background(), evs...); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeEvent(t *testing.T, m contracts.TransportMessage) contracts.Event {
+	t.Helper()
+	if m.Kind != transport.KindEvent {
+		t.Fatalf("kind = %q，want %q", m.Kind, transport.KindEvent)
+	}
+	var ev contracts.Event
+	if err := json.Unmarshal(m.Payload, &ev); err != nil {
+		t.Fatalf("event payload 解不开: %v", err)
+	}
+	return ev
+}
+
+// ---------------------------------------------------------------------------
+// ping/pong + NDJSON 行式 framing
+// ---------------------------------------------------------------------------
+
+func TestPingPongRoundTrip(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ping, err := transport.NewMessage(transport.KindPing, nil)
+	if err != nil {
+		t.Fatalf("NewMessage: %v", err)
+	}
+	if err := c.SendContext(ctx, ping); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+
+	pong := recvTimeout(t, c, 5*time.Second)
+	if pong.Kind != transport.KindPong {
+		t.Fatalf("kind = %q，want pong", pong.Kind)
+	}
+	if pong.ReplyTo == nil || *pong.ReplyTo != ping.ID {
+		t.Fatalf("pong.reply_to = %v，want ping.id %s", pong.ReplyTo, ping.ID)
+	}
+	if pong.V != transport.ContractVersion {
+		t.Fatalf("pong.v = %d，want %d", pong.V, transport.ContractVersion)
+	}
+}
+
+// TestNDJSONLineFraming：出站消息是"一行一个 TransportMessage"——结尾换行、无内嵌换行。
+// 用裸 WS 客户端读原始字节验证 framing（我们的 Client 会解析 JSON，看不出 framing）。
+func TestNDJSONLineFraming(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, wsURL(srv), nil)
+	if err != nil {
+		t.Fatalf("raw dial: %v", err)
+	}
+	defer conn.CloseNow()
+
+	// 订阅（同一连接上先 subscribe，再触发一条事件）。
+	line, err := json.Marshal(contracts.TransportMessage{
+		V: transport.ContractVersion, ID: core.NewUlid(), Kind: transport.KindSubscribe,
+	})
+	if err != nil {
+		t.Fatalf("marshal subscribe: %v", err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, append(line, '\n')); err != nil {
+		t.Fatalf("write subscribe: %v", err)
+	}
+	if err := publish(t, b, core.NewUlid(), "context.assembled"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	_, data, err := conn.Read(ctx)
+	if err != nil {
+		t.Fatalf("raw read: %v", err)
+	}
+	if n := strings.Count(string(data), "\n"); n != 1 {
+		t.Fatalf("一行应只含一个换行（行尾），得到 %d 个: %q", n, data)
+	}
+	if !strings.HasSuffix(string(data), "\n") {
+		t.Fatalf("行尾应是换行符（NDJSON）: %q", data)
+	}
+	var m contracts.TransportMessage
+	if err := json.Unmarshal(bytes.TrimSpace(data), &m); err != nil {
+		t.Fatalf("一行解不成 TransportMessage: %v", err)
+	}
+	if m.Kind != transport.KindEvent {
+		t.Fatalf("kind = %q，want event", m.Kind)
+	}
+}
+
+// TestSubscribeKindPrefixes：按 kind 前缀过滤推送（K4）。
+func TestSubscribeKindPrefixes(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	c := mustDial(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{
+		KindPrefixes: []string{"tool.call."},
+	})
+	if err := c.SendContext(ctx, sub); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	sid := core.NewUlid()
+	if err := publish(t, b, sid, "context.assembled", "tool.call.intent", "loop.error", "tool.call.completed"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	var got []string
+	for i := 0; i < 2; i++ {
+		got = append(got, decodeEvent(t, recvTimeout(t, c, 5*time.Second)).Kind)
+	}
+	if len(got) != 2 || got[0] != "tool.call.intent" || got[1] != "tool.call.completed" {
+		t.Fatalf("推送 kind = %v，want [tool.call.intent tool.call.completed]", got)
+	}
+
+	// 再多发一条不该收到的：确认过滤器持续生效（不会"收到一次就全放"）。
+	if err := publish(t, b, sid, "context.assembled"); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	if _, err := recvErr(c, 300*time.Millisecond); err == nil {
+		t.Fatal("不该再收到任何推送（前缀过滤应持续生效）")
+	}
+}
+
+// TestSubscribeSessionFilter：session 过滤（K4）。
+func TestSubscribeSessionFilter(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	want := core.NewUlid()
+	other := core.NewUlid()
+	c := mustDial(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sub, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{SessionID: &want})
+	if err := c.SendContext(ctx, sub); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err := publish(t, b, other, "tool.call.intent"); err != nil {
+		t.Fatalf("publish other: %v", err)
+	}
+	if err := publish(t, b, want, "tool.call.intent", "tool.call.failed"); err != nil {
+		t.Fatalf("publish want: %v", err)
+	}
+
+	ev := decodeEvent(t, recvTimeout(t, c, 5*time.Second))
+	if ev.SessionID != want {
+		t.Fatalf("session_id = %q，want %q（别的 session 不该收到）", ev.SessionID, want)
+	}
+	if got := decodeEvent(t, recvTimeout(t, c, 5*time.Second)).Kind; got != "tool.call.failed" {
+		t.Fatalf("第二条 = %q，want tool.call.failed", got)
+	}
+}
+
+// TestSubscribeDurableOnly：durable_only=true 时流事件（durable=false）不推送（F8）。
+func TestSubscribeDurableOnly(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	c := mustDial(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	yes := true
+	sub, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{DurableOnly: &yes})
+	if err := c.SendContext(ctx, sub); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	// 流事件（durable=false）不入库也不该推给 durable_only 订阅者。
+	if err := b.Publish(context.Background(), contracts.Event{
+		V: 1, ID: core.NewUlid(), Kind: "model.delta", TS: "2026-01-01T00:00:00Z",
+		SessionID: core.NewUlid(), AgentID: core.NewUlid(), Durable: false,
+	}); err != nil {
+		t.Fatalf("publish stream: %v", err)
+	}
+	if _, err := recvErr(c, 300*time.Millisecond); err == nil {
+		t.Fatal("durable_only 订阅者不该收到流事件")
+	}
+
+	// 事实事件照常推送。
+	if err := publish(t, b, core.NewUlid(), "tool.call.intent"); err != nil {
+		t.Fatalf("publish durable: %v", err)
+	}
+	if got := decodeEvent(t, recvTimeout(t, c, 5*time.Second)).Kind; got != "tool.call.intent" {
+		t.Fatalf("kind = %q，want tool.call.intent", got)
+	}
+}
+
+// TestOriginRejected：跨源 Origin 一律 403（N5b）。
+func TestOriginRejected(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL(srv), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://evil.example.com"}},
+	})
+	if err == nil {
+		conn.CloseNow()
+		t.Fatal("跨源 Origin 应该被拒绝")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("状态码 = %v，want 403（err=%v）", resp, err)
+	}
+	var te contracts.TransportError
+	if jerr := json.NewDecoder(resp.Body).Decode(&te); jerr != nil {
+		t.Fatalf("错误体不是 JSON: %v", jerr)
+	}
+	defer resp.Body.Close()
+	if te.Code != transport.CodeOriginRejected {
+		t.Fatalf("错误码 = %q，want %q", te.Code, transport.CodeOriginRejected)
+	}
+}
+
+// TestSameOriginAccepted：同源 Origin（hub 自己的 Web UI）放行。
+func TestSameOriginAccepted(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL(srv), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://" + host}},
+	})
+	if err != nil {
+		t.Fatalf("同源 Origin 应放行: %v（status=%v）", err, resp)
+	}
+	defer conn.CloseNow()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("状态码 = %d，want 101", resp.StatusCode)
+	}
+}
+
+// TestNoOriginAccepted：无 Origin 头的非浏览器客户端（CLI / curl）放行。
+func TestNoOriginAccepted(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ping, _ := transport.NewMessage(transport.KindPing, nil)
+	if err := c.SendContext(ctx, ping); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+	if got := recvTimeout(t, c, 5*time.Second).Kind; got != transport.KindPong {
+		t.Fatalf("kind = %q，want pong", got)
+	}
+}
+
+// TestUnknownKindGetsErrorReply：协议违规 → kind=error 且 reply_to 指向原消息。
+func TestUnknownKindGetsErrorReply(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	bad, _ := transport.NewMessage("bogus.kind", nil)
+	if err := c.SendContext(ctx, bad); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	m := recvTimeout(t, c, 5*time.Second)
+	if m.Kind != transport.KindError {
+		t.Fatalf("kind = %q，want error", m.Kind)
+	}
+	if m.ReplyTo == nil || *m.ReplyTo != bad.ID {
+		t.Fatalf("reply_to = %v，want %s", m.ReplyTo, bad.ID)
+	}
+	var te contracts.TransportError
+	if err := json.Unmarshal(m.Payload, &te); err != nil {
+		t.Fatalf("error payload: %v", err)
+	}
+	if te.Code != transport.CodeUnknownKind {
+		t.Fatalf("code = %q，want %q", te.Code, transport.CodeUnknownKind)
+	}
+}
+
+// TestClientSendingEventIsRejected：客户端擅自发 kind=event → forbidden_kind。
+func TestClientSendingEventIsRejected(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ev := contracts.Event{V: 1, ID: core.NewUlid(), Kind: "tool.call.intent", TS: "2026-01-01T00:00:00Z",
+		SessionID: core.NewUlid(), AgentID: core.NewUlid(), Durable: true}
+	m, _ := transport.NewMessage(transport.KindEvent, ev)
+	if err := c.SendContext(ctx, m); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	got := recvTimeout(t, c, 5*time.Second)
+	if got.Kind != transport.KindError {
+		t.Fatalf("kind = %q，want error", got.Kind)
+	}
+	var te contracts.TransportError
+	_ = json.Unmarshal(got.Payload, &te)
+	if te.Code != transport.CodeForbiddenKind {
+		t.Fatalf("code = %q，want %q", te.Code, transport.CodeForbiddenKind)
+	}
+}
+
+// TestConcurrentSubscribersEachGetsOwnFilter：并发订阅互不串扰（每个连接独立过滤）。
+func TestConcurrentSubscribersEachGetsOwnFilter(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	const n = 8
+	var wg sync.WaitGroup
+	errs := make(chan string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c, err := dial(srv)
+			if err != nil {
+				errs <- "dial: " + err.Error()
+				return
+			}
+			defer c.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			// 第 i 个客户端只订阅自己的前缀（互相不重叠）。
+			prefix := "kind" + string(rune('a'+i)) + "."
+			sub, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{
+				KindPrefixes: []string{prefix},
+			})
+			if err := c.SendContext(ctx, sub); err != nil {
+				errs <- "subscribe: " + err.Error()
+				return
+			}
+
+			// 让所有订阅都就位后再统一发事件。
+			time.Sleep(300 * time.Millisecond)
+			if err := publish(t, b, core.NewUlid(), prefix+"x"); err != nil {
+				errs <- "publish: " + err.Error()
+				return
+			}
+			ev, err := recvErr(c, 10*time.Second)
+			if err != nil {
+				errs <- "recv: " + err.Error()
+				return
+			}
+			if !strings.HasPrefix(decodeEvent(t, ev).Kind, prefix) {
+				errs <- "收到不该收到的: " + decodeEvent(t, ev).Kind
+				return
+			}
+			// 再发一条别人的：不该收到（无串扰）。
+			if err := publish(t, b, core.NewUlid(), "other.y"); err != nil {
+				errs <- "publish other: " + err.Error()
+				return
+			}
+			if _, err := recvErr(c, 300*time.Millisecond); err == nil {
+				errs <- "串扰：收到了别人的事件"
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for msg := range errs {
+		t.Fatal(msg)
+	}
+}
+
+// TestReplaceSubscriptionOnResubscribe：同连接重复 subscribe = 替换（新过滤生效）。
+func TestReplaceSubscriptionOnResubscribe(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	first, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{KindPrefixes: []string{"a."}})
+	if err := c.SendContext(ctx, first); err != nil {
+		t.Fatalf("subscribe1: %v", err)
+	}
+	second, _ := transport.NewMessage(transport.KindSubscribe, contracts.SubscribeRequest{KindPrefixes: []string{"b."}})
+	if err := c.SendContext(ctx, second); err != nil {
+		t.Fatalf("subscribe2: %v", err)
+	}
+
+	if err := publish(t, b, core.NewUlid(), "a.x"); err != nil {
+		t.Fatalf("publish a: %v", err)
+	}
+	if _, err := recvErr(c, 300*time.Millisecond); err == nil {
+		t.Fatal("换订阅后不该再收到旧前缀的事件")
+	}
+
+	if err := publish(t, b, core.NewUlid(), "b.y"); err != nil {
+		t.Fatalf("publish b: %v", err)
+	}
+	if got := decodeEvent(t, recvTimeout(t, c, 5*time.Second)).Kind; got != "b.y" {
+		t.Fatalf("新订阅应生效，得到 %q", got)
+	}
+}
+
+// TestBadLineDoesNotKillConnection：一条缺 kind 的消息 → error 回复，连接继续可用。
+func TestBadLineDoesNotKillConnection(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	c := mustDial(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// 合法 JSON 但缺 kind → 服务端回 bad_json，连接不死。
+	bad, _ := transport.NewMessage("", nil)
+	if err := c.SendContext(ctx, bad); err != nil {
+		t.Fatalf("send bad: %v", err)
+	}
+	ping, _ := transport.NewMessage(transport.KindPing, nil)
+	if err := c.SendContext(ctx, ping); err != nil {
+		t.Fatalf("send ping: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m := recvTimeout(t, c, 5*time.Second)
+		if m.Kind == transport.KindError {
+			continue
+		}
+		if m.Kind == transport.KindPong {
+			return // 连接在坏行之后仍然可用
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("坏行之后连接不可用（收到 kind=%q）", m.Kind)
+		}
+	}
+}

@@ -68,7 +68,9 @@ func (s *fileStore) Append(_ context.Context, evs []contracts.Event) ([]contract
 		s.byID[ev.ID] = ev
 		s.events = append(s.events, ev)
 		if s.log != nil {
-			s.log.add(storeLabel(ev))
+			if label := storeLabel(ev); label != "" {
+				s.log.add(label)
+			}
 		}
 		out[i] = ev
 	}
@@ -173,7 +175,7 @@ func newHarnessWithStore(t *testing.T, store core.Store, all func() []contracts.
 func TestReopenPreservesEventsAndContinuesSeq(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.jsonl")
 
-	// --- 第一次运行：落 2 条事件（intent + completed）---
+	// --- 第一次运行：落 4 条事件（两轮各一条 context.assembled + intent + completed）---
 	fs := newFileStore(t, path)
 	h := newHarnessWithStore(t, fs, fs.all)
 	h.addTool("echo", func(tool *contracts.Tool) {
@@ -185,22 +187,22 @@ func TestReopenPreservesEventsAndContinuesSeq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Events != 2 || res.ToolCalls != 1 {
+	if res.Events != 4 || res.ToolCalls != 1 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 	fs.close(t) // 模拟进程退出
 
 	// --- 重新打开：事件必须一条不少、seq 保序、payload 完好 ---
 	fs2 := reopenFileStore(t, path)
-	evs := fs2.all()
+	evs := writePath(fs2.all())
 	if len(evs) != 2 {
-		t.Fatalf("重启后应有 2 条事件，得到 %d", len(evs))
+		t.Fatalf("重启后应有 2 条写路径事件，得到 %d", len(evs))
 	}
 	if got, want := []string{evs[0].Kind, evs[1].Kind}, []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 		t.Fatalf("重启后事件序 = %v，want %v", got, want)
 	}
-	if evs[0].Seq == nil || *evs[0].Seq != 1 || evs[1].Seq == nil || *evs[1].Seq != 2 {
-		t.Fatalf("重启后 seq 应保序: %v %v", evs[0].Seq, evs[1].Seq)
+	if evs[0].Seq == nil || *evs[0].Seq != 2 || evs[1].Seq == nil || *evs[1].Seq != 3 {
+		t.Fatalf("重启后 seq 应保序（每轮先落 context.assembled，故 intent/completed 占 seq 2/3）: %v %v", *evs[0].Seq, *evs[1].Seq)
 	}
 	in := decodeIntent(t, evs[0])
 	if string(in.ToolCallID) != "c1" || string(in.Arguments) != `{"text":"before"}` {
@@ -221,20 +223,20 @@ func TestReopenPreservesEventsAndContinuesSeq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重启后 Run: %v", err)
 	}
-	if res2.Events != 2 {
+	if res2.Events != 4 {
 		t.Fatalf("重启后 Result 不符: %+v", res2)
 	}
 	evs = fs2.all()
-	if len(evs) != 4 {
-		t.Fatalf("重启后总事件数 = %d，want 4", len(evs))
+	if len(evs) != 8 {
+		t.Fatalf("重启后总事件数 = %d，want 8", len(evs))
 	}
-	for i, want := range []int64{1, 2, 3, 4} {
+	for i, want := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
 		if evs[i].Seq == nil || *evs[i].Seq != want {
 			t.Fatalf("第 %d 条事件 seq = %v，want %d（不得重用）", i, evs[i].Seq, want)
 		}
 	}
-	// 第二次的 intent/completed 仍是一对，id 原样。
-	last := evs[2:]
+	// 第二次的 intent/completed 仍是一对，id 原样（seq 6/7：每轮先落 context.assembled）。
+	last := writePath(evs)[2:]
 	if got := string(decodeIntent(t, last[0]).ToolCallID); got != "c2" {
 		t.Fatalf("重启后 intent id = %q", got)
 	}
@@ -297,8 +299,8 @@ func TestConcurrentLoopsNoOversellOrLoss(t *testing.T) {
 					fail("Run: %v", err)
 					return
 				}
-				if res.Events != 2 || res.ToolCalls != 1 || res.Turns != 2 {
-					fail("Result = %+v，want 2 events / 1 toolcall / 2 turns", res)
+				if res.Events != 4 || res.ToolCalls != 1 || res.Turns != 2 {
+					fail("Result = %+v，want 4 events / 1 toolcall / 2 turns", res)
 					return
 				}
 			}
@@ -312,7 +314,7 @@ func TestConcurrentLoopsNoOversellOrLoss(t *testing.T) {
 		t.Fatalf("并发 Run 出错: %v", errs[0])
 	}
 
-	want := goroutines * perLoop * 2
+	want := goroutines * perLoop * 4 // 每次 Run 两轮各一条 context.assembled + intent + completed
 	evs := h.events()
 	if len(evs) != want {
 		t.Fatalf("事件数 = %d，want %d（无丢失）", len(evs), want)
@@ -377,7 +379,7 @@ func TestConcurrentExecutorsShareRegistry(t *testing.T) {
 	if n := exec.callN(); n != 6 {
 		t.Fatalf("执行器应被调用 6 次，得到 %d", n)
 	}
-	if len(h.events()) != 12 {
-		t.Fatalf("应有 12 条事件，得到 %d", len(h.events()))
+	if n := len(h.events()); n != 24 {
+		t.Fatalf("应有 24 条事件（6 个 loop × 两轮各一条 context.assembled + intent + completed），得到 %d", n)
 	}
 }

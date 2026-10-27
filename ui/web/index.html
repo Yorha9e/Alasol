@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>alasol hub — 上下文可见性</title>
+<!--
+  alasol Web UI（v0，O5：v0 优先 Web UI）。
+
+  零构建工具链、零框架、零 CDN —— 单文件 HTML+JS+CSS，离线可用。
+  数据来源全部是 host 的 HTTP/WS 端点（N4：WS + NDJSON）：
+    GET  /api/sessions          在线表（session / 事件数 / 最后 kind / 更新时间 / 水位）
+    GET  /api/context/{sid}     该 session 最新一条 context.assembled 快照
+    GET  /api/health            {ok, watermark}
+    WS   /ws                    NDJSON 行式事件流（kind=event 推送）
+
+  三块面板（K15 成本意识：只显示前 N 行，不全量倾倒）：
+    #panel-sessions  在线表面板：10s 轮询 + WS 到达时刷新，最多 50 行
+    #panel-context   上下文构成面板：选中 session 后按 parts 渲染 token 占比横条
+    #panel-events    事件流面板：WS 滚动显示，可按 kind 前缀过滤
+
+  安全边界（N5b）：hub 只监听 loopback 且不使用 cookie，WS 连接由服务端校验 Origin
+  （同源或非浏览器客户端才放行）。本页面不携带任何凭证。
+-->
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --line: #262b36;
+    --fg: #e6e9ef;
+    --muted: #8b93a7;
+    --accent: #4f8cff;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .5px; }
+  header .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; }
+  .dot.on { background: var(--ok); }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  input[type=text] {
+    background: #0d0f14; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 8px; min-width: 180px;
+  }
+  main {
+    display: grid; gap: 12px; padding: 12px 16px 40px;
+    grid-template-columns: minmax(320px, 1fr) minmax(380px, 1.2fr);
+  }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px;
+  }
+  section h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+  #panel-events { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1d2230; }
+  tbody tr.sel { background: #22304a; }
+  td.num { text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
+  .pill.verbatim { color: var(--ok); border-color: #1f4438; }
+  .pill.compacted { color: var(--warn); border-color: #4a3a12; background: #2a2410; }
+  .pill.dropped, .pill.deferred { color: var(--bad); border-color: #4a1f1f; }
+
+  /* 上下文构成：横向堆叠条 */
+  #ctx-bar { display: flex; width: 100%; height: 26px; border-radius: 6px; overflow: hidden; border: 1px solid var(--line); }
+  #ctx-bar .seg { height: 100%; min-width: 2px; transition: width .2s; }
+  #ctx-bar .seg span { display: none; }
+  #ctx-legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 4px; font-size: 12px; }
+  #ctx-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+  .bar-wrap { position: relative; }
+  .bar-track { background: #0d0f14; border-radius: 4px; height: 8px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--accent); }
+  .budget { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  #events { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; }
+  #events li { padding: 4px 6px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; }
+  #events li .k { color: var(--accent); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #events li .s { color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+  #events li .p { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .empty { color: var(--muted); padding: 10px 2px; }
+  .note { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .err { color: var(--bad); }
+  .hl { background: #3a2f10; }
+</style>
+</head>
+<body>
+<header>
+  <h1>alasol</h1>
+  <span id="conn" class="dot" title="WS 连接状态"></span>
+  <span class="muted mono" id="health">connecting…</span>
+  <span class="spacer"></span>
+  <label class="muted">kind 前缀 <input id="kindPrefix" type="text" placeholder="如 tool.call.（空=全部）"></label>
+  <button id="clearEvents" type="button">清空事件流</button>
+</header>
+
+<main>
+  <!-- 在线表面板（K15：在线表成本随 session 数线性增长 → 只显示前 N 行） -->
+  <section id="panel-sessions">
+    <h2>在线表 · sessions</h2>
+    <table>
+      <thead>
+        <tr><th>session</th><th>事件数</th><th>最后 kind</th><th>更新时间</th><th>水位</th></tr>
+      </thead>
+      <tbody id="sessionsBody"></tbody>
+    </table>
+    <p class="note" id="sessionsNote">加载中…</p>
+  </section>
+
+  <!-- 上下文构成面板（谁贡献了多少 token + 被压过的 part 高亮） -->
+  <section id="panel-context">
+    <h2>上下文构成 · context</h2>
+    <div id="ctxHead" class="muted">点上面在线表里的一行选 session。</div>
+    <div class="bar-wrap">
+      <div id="ctxBar"></div>
+      <div class="budget"><span id="ctxUsed"></span><span id="ctxBudget"></span></div>
+    </div>
+    <div id="ctxLegend"></div>
+    <table>
+      <thead>
+        <tr><th>source</th><th>kind</th><th>条目</th><th>token</th><th>占比</th><th>state</th></tr>
+      </thead>
+      <tbody id="ctxBody"></tbody>
+    </table>
+    <p class="note">
+      排序口径 Q3/Q4：极稳定 → 半稳定 → 变动 → 极变动；在线表 / 注入载荷永远排在 prompt
+      末尾（秒级变动，放前面会让整个前缀的 prompt cache 失效）。state=compacted 的行高亮，
+      并显示 origins（可回捞的事件区间）与 summary_ref（摘要指针，J6/J15）。
+    </p>
+  </section>
+
+  <!-- 事件流面板（WS + NDJSON） -->
+  <section id="panel-events">
+    <h2>事件流 · events（WS / NDJSON）</h2>
+    <ol id="events"></ol>
+    <p class="note" id="eventsNote">等待事件…</p>
+  </section>
+</main>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- 常量（K15 成本意识：面板不全量倾倒） ----
+  var MAX_SESSION_ROWS = 50;   // 在线表最多显示 50 行
+  var MAX_EVENT_ROWS = 300;    // 事件流最多保留 300 条
+  var POLL_MS = 10000;         // 在线表轮询间隔
+  var WS_THROTTLE_MS = 400;    // WS 到达时刷在线表的最小间隔
+
+  // parts[].source 调色板（同一 source 永远同一颜色）。
+  var COLORS = {
+    base: "#6b7280", ledger: "#7c3aed", rules: "#a855f7", tools: "#2563eb",
+    history: "#059669", injected: "#d97706", online: "#dc2626"
+  };
+  function colorFor(source) {
+    if (COLORS[source]) return COLORS[source];
+    var head = String(source).split(":")[0];
+    return COLORS[head] || "#94a3b8";
+  }
+
+  // ---- DOM ----
+  var $ = function (id) { return document.getElementById(id); };
+  var connDot = $("conn"), healthEl = $("health");
+  var sessionsBody = $("sessionsBody"), sessionsNote = $("sessionsNote");
+  var ctxHead = $("ctxHead"), ctxBar = $("ctxBar"), ctxLegend = $("ctxLegend");
+  var ctxUsed = $("ctxUsed"), ctxBudget = $("ctxBudget"), ctxBody = $("ctxBody");
+  var eventsOl = $("events"), eventsNote = $("eventsNote"), kindPrefix = $("kindPrefix");
+
+  var selectedSession = null;
+  var lastWSRefresh = 0;
+  var events = [];
+
+  // ---- 工具 ----
+  function short(id) { return id ? String(id).slice(0, 8) : "—"; }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function fmtInt(n) { return (n == null ? 0 : n).toLocaleString("en-US"); }
+
+  // ---- 在线表 ----
+  function refreshSessions(force) {
+    var now = Date.now();
+    if (!force && now - lastWSRefresh < WS_THROTTLE_MS) return;
+    lastWSRefresh = now;
+    fetch("api/sessions", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)); })
+      .then(function (rows) { renderSessions(rows || []); })
+      .catch(function (e) { sessionsNote.textContent = "拉在线表失败：" + e.message; sessionsNote.className = "note err"; });
+  }
+
+  function renderSessions(rows) {
+    if (!rows.length) {
+      sessionsBody.innerHTML = "";
+      sessionsNote.textContent = "还没有任何 session（跑一轮对话就会出现）。";
+      return;
+    }
+    var shown = rows.slice(0, MAX_SESSION_ROWS);
+    var html = "";
+    shown.forEach(function (row) {
+      var sid = row.session_id || "";
+      html += '<tr data-sid="' + esc(sid) + '"' + (sid === selectedSession ? ' class="sel"' : "") + ">"
+        + "<td class='mono' title='" + esc(sid) + "'>" + esc(short(sid)) + "</td>"
+        + "<td class='num'>" + fmtInt(row.event_count) + "</td>"
+        + "<td class='mono'>" + esc(row.last_kind || "—") + "</td>"
+        + "<td class='mono'>" + esc(row.updated_at || "—") + "</td>"
+        + "<td class='num'>" + fmtInt(row.watermark) + "</td>"
+        + "</tr>";
+    });
+    sessionsBody.innerHTML = html;
+    sessionsNote.textContent = "显示 " + shown.length + " / " + rows.length +
+      " 行（最多 " + MAX_SESSION_ROWS + " 行：在线表成本随 session 数线性增长，K15）";
+    Array.prototype.forEach.call(sessionsBody.querySelectorAll("tr"), function (tr) {
+      tr.addEventListener("click", function () { selectSession(tr.getAttribute("data-sid")); });
+    });
+  }
+
+  function selectSession(sid) {
+    if (!sid) return;
+    selectedSession = sid;
+    Array.prototype.forEach.call(sessionsBody.querySelectorAll("tr"), function (tr) {
+      tr.classList.toggle("sel", tr.getAttribute("data-sid") === sid);
+    });
+    refreshContext(sid);
+  }
+
+  // ---- 上下文构成 ----
+  function refreshContext(sid) {
+    ctxHead.textContent = "session " + sid + "：加载中…";
+    fetch("api/context/" + encodeURIComponent(sid), { cache: "no-store" })
+      .then(function (r) {
+        if (r.status === 404) return null;
+        return r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status));
+      })
+      .then(function (snap) { snap ? renderContext(snap) : renderContextEmpty(sid); })
+      .catch(function (e) { ctxHead.textContent = "拉上下文失败：" + e.message; ctxHead.className = "err"; });
+  }
+
+  function renderContextEmpty(sid) {
+    ctxHead.textContent = "session " + sid + "：还没有 context.assembled 快照。";
+    ctxBar.innerHTML = ""; ctxLegend.innerHTML = ""; ctxBody.innerHTML = "";
+    ctxUsed.textContent = ""; ctxBudget.textContent = "";
+  }
+
+  function renderContext(snap) {
+    var parts = snap.parts || [];
+    var total = 0;
+    parts.forEach(function (p) { total += (p.tokens || 0); });
+    var budget = snap.tokens_budget || 0;
+    var used = snap.tokens_used != null ? snap.tokens_used : total;
+
+    ctxHead.innerHTML = "session <span class='mono'>" + esc(short(snap.session_id)) + "</span>"
+      + " · turn <b>" + esc(snap.turn) + "</b> · " + parts.length + " 个 part";
+    ctxUsed.textContent = "已用 ≈ " + fmtInt(used) + " token（估算）";
+    ctxBudget.textContent = budget ? "预算 " + fmtInt(budget) + "（" + (100 * used / budget).toFixed(1) + "%）" : "";
+
+    // 横向堆叠条：谁贡献多少 token。
+    var barHtml = "", legendHtml = "";
+    parts.forEach(function (p) {
+      var pct = total > 0 ? (100 * (p.tokens || 0) / total) : 0;
+      var c = colorFor(p.source);
+      barHtml += "<div class='seg' style='width:" + pct.toFixed(2) + "%;background:" + c +
+        "' title='" + esc(p.source) + " " + pct.toFixed(1) + "%'></div>";
+      legendHtml += "<span><i style='background:" + c + "'></i>" + esc(p.source) +
+        " " + pct.toFixed(1) + "%</span>";
+    });
+    ctxBar.innerHTML = barHtml || "<div class='empty'>没有 part</div>";
+    ctxLegend.innerHTML = legendHtml;
+
+    // 明细表：被压过的 part 高亮 + origins / summary_ref。
+    var html = "";
+    parts.forEach(function (p) {
+      var pct = total > 0 ? (100 * (p.tokens || 0) / total) : 0;
+      var state = p.state || "verbatim";
+      var rowCls = state === "compacted" ? " class='hl'" : "";
+      var origins = (p.origins && p.origins.length) ? p.origins.join(", ") : "";
+      var summary = p.summary_ref || "";
+      var target = p.target_tokens != null ? " → " + fmtInt(p.target_tokens) : "";
+      html += "<tr" + rowCls + ">"
+        + "<td class='mono'>" + esc(p.source) + "</td>"
+        + "<td>" + esc(p.kind || "") + "</td>"
+        + "<td class='num'>" + fmtInt(p.entries) + "</td>"
+        + "<td class='num'>" + fmtInt(p.tokens) + target + "</td>"
+        + "<td class='num'>" + pct.toFixed(1) + "%</td>"
+        + "<td><span class='pill " + esc(state) + "'>" + esc(state) + "</span>"
+        + (origins ? "<div class='muted mono' style='font-size:11px'>origins: " + esc(origins) + "</div>" : "")
+        + (summary ? "<div class='muted mono' style='font-size:11px'>summary: " + esc(summary) + "</div>" : "")
+        + "</td></tr>";
+    });
+    ctxBody.innerHTML = html;
+  }
+
+  // ---- 事件流 ----
+  function pushEvent(m) {
+    var ev = m.payload || {};
+    events.unshift({
+      seq: ev.seq != null ? ev.seq : "·",
+      kind: ev.kind || m.kind,
+      sid: ev.session_id || m.session_id || "",
+      durable: ev.durable,
+      summary: summarize(ev)
+    });
+    if (events.length > MAX_EVENT_ROWS) events.length = MAX_EVENT_ROWS;
+    renderEvents();
+    // context.assembled 到达 → 选中 session 的构成面板要跟着更新。
+    if (ev.kind === "context.assembled" && selectedSession &&
+        String(ev.session_id) === String(selectedSession)) {
+      refreshContext(selectedSession);
+    }
+    refreshSessions(false);
+  }
+
+  function summarize(ev) {
+    var p = ev.payload;
+    if (!p) return "";
+    try {
+      if (ev.kind === "context.assembled") {
+        var parts = p.parts || [];
+        return "turn=" + p.turn + " parts=" + parts.length + " ≈" + (p.tokens_used || 0) + "tok";
+      }
+      if (ev.kind === "tool.call.intent") return p.tool_name + " " + (p.tool_call_id || "");
+      if (ev.kind === "tool.call.completed" || ev.kind === "tool.call.failed") return p.tool_call_id || "";
+      if (ev.kind === "loop.error") return (p.phase || "") + " " + (p.message || "").slice(0, 80);
+      if (ev.kind === "ledger.updated") return "goals=" + (p.goals || []).length;
+      if (ev.kind === "board.written") return "key=" + p.key;
+      if (ev.kind === "agent.spawned") return p.agent_type + " depth=" + p.depth;
+      var s = JSON.stringify(p);
+      return s.length > 90 ? s.slice(0, 90) + "…" : s;
+    } catch (e) { return ""; }
+  }
+
+  function renderEvents() {
+    var prefix = kindPrefix.value.trim();
+    var shown = prefix ? events.filter(function (e) { return e.kind.indexOf(prefix) === 0; }) : events;
+    eventsNote.textContent = shown.length + " / " + events.length +
+      " 条（本地最多保留 " + MAX_EVENT_ROWS + " 条）";
+    if (!shown.length) {
+      eventsOl.innerHTML = "<li class='empty'>" + (prefix ? "没有匹配 " + esc(prefix) + " 的事件" : "等待事件…") + "</li>";
+      return;
+    }
+    eventsOl.innerHTML = shown.slice(0, MAX_EVENT_ROWS).map(function (e) {
+      return "<li><span class='s'>" + esc(e.seq) + "</span>"
+        + "<span class='k'>" + esc(e.kind) + "</span>"
+        + "<span class='s'>" + esc(short(e.sid)) + "</span>"
+        + "<span class='p' title='" + esc(e.summary) + "'>" + esc(e.summary) + "</span></li>";
+    }).join("");
+  }
+
+  // ---- WS（N4：WS + NDJSON 行式） ----
+  function connect() {
+    var proto = location.protocol === "https:" ? "wss://" : "ws://";
+    var ws = new WebSocket(proto + location.host + "/ws");
+    ws.onopen = function () {
+      connDot.classList.add("on");
+      subscribe(ws);
+      refreshSessions(true);
+      if (selectedSession) refreshContext(selectedSession);
+    };
+    ws.onclose = function () {
+      connDot.classList.remove("on");
+      healthEl.textContent = "WS 断开，1s 后重连";
+      setTimeout(connect, 1000);
+    };
+    ws.onerror = function () { ws.close(); };
+    ws.onmessage = function (msg) {
+      var line = String(msg.data || "").trim();
+      if (!line) return;
+      var m;
+      try { m = JSON.parse(line); } catch (e) { return; }
+      if (m.kind === "event") { pushEvent(m); return; }
+      if (m.kind === "pong") { return; }
+      if (m.kind === "error") {
+        var p = m.payload || {};
+        eventsNote.textContent = "服务端: " + (p.code || "error") + " " + (p.message || "");
+      }
+    };
+    return ws;
+  }
+
+  // 客户端侧生成一个 26 字符 Crockford base32 id（契约 TransportMessage.id 是框架 ULID；
+  // 浏览器里没有 core.NewUlid，这里用同字符集同长度的随机串，服务端不解析它）。
+  var CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  function newId() {
+    var s = "";
+    for (var i = 0; i < 26; i++) s += CROCKFORD[Math.floor(Math.random() * CROCKFORD.length)];
+    return s;
+  }
+
+  function subscribe(ws) {
+    var payload = {};
+    var prefix = kindPrefix.value.trim();
+    if (prefix) payload.kind_prefixes = [prefix];
+    if (selectedSession) payload.session_id = selectedSession;
+    ws.send(JSON.stringify({ v: 1, id: newId(), kind: "subscribe", payload: payload }));
+  }
+
+  // ---- 启动 ----
+  kindPrefix.addEventListener("change", function () { renderEvents(); resubscribe(); });
+  $("clearEvents").addEventListener("click", function () { events = []; renderEvents(); });
+  var wsConn = connect();
+
+  function resubscribe() {
+    if (wsConn && wsConn.readyState === 1) subscribe(wsConn);
+  }
+
+  refreshSessions(true);
+  fetch("api/health", { cache: "no-store" })
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)); })
+    .then(function (h) {
+      healthEl.textContent = "索引水位 seq " + (h.watermark != null ? h.watermark : "?") + (h.ok ? "" : " · 不健康");
+    })
+    .catch(function (e) { healthEl.textContent = "health: " + e.message; });
+
+  setInterval(function () { refreshSessions(true); }, POLL_MS);
+})();
+</script>
+</body>
+</html>

@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–6 已完成**（2026-10-27）：core（bus/policy/registry/loop/agents/**gate**）+ runtime 全链（SQLite/索引器/provider/工具/**gate 快照+receipt+baseline**）+ `cmd/alasol`；阶段 6 评审循环 2 轮（1 p1 静默失败绕过 + 1 p2 空基线退化）clean；真模型 API 调用待凭据。下一步：阶段 7 客户端 |
+| **代码** | **阶段 0–7 已完成**（2026-10-27）：core 全链 + runtime 全链 + **host/transport/客户端**（WS+NDJSON、Web 三面板、CLI chat/serve/run、loop 每轮 context.assembled）；阶段 7 评审循环 2 轮（1 p1 loopback 域名绕过）clean；真模型 API 调用待凭据。下一步：阶段 8 durable（最后阶段） |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -173,7 +173,9 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 
 ### 阶段 7 · 客户端
 - 极简 CLI（终端原生：对话 / 审批 / 在线表）+ Web UI（深度视图：上下文可视化 / 多 session 面板），走 WS+NDJSON
-- **验收**：Web 能看到在线表与上下文构成（谁贡献了多少 token、什么被压过）；CLI 能对话与审批
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] Web 能看到在线表与上下文构成（谁贡献了多少 token、什么被压过——三面板：在线表/上下文构成/事件流）
+  - [x] CLI 能对话与审批（`alasol chat` REPL + `/table` + `/ctx` + terminal 审批）
 
 ### 阶段 8 · durable（X 区）—— **只做"机器"，写路径形状已在阶段 1/4 定**
 - checkpoint（seq 水位 + ledger 版本 + in-flight + 树投影版本）/ resume / ownership（`spawn_request_id` 防重复 spawn）

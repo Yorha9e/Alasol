@@ -86,6 +86,10 @@ type Config struct {
 	SessionEnv core.EnvScope
 	// MaxTurns 单次 Run 的最大轮数（0 = DefaultMaxTurns；防模型失控）。
 	MaxTurns int
+	// ContextBudget 上下文窗口预算 token（0 = DefaultContextBudget）。只用于
+	// context.assembled 事件里 ContextSnapshot.tokens_budget 的占比分母（J21），
+	// v0 不据此做任何装配/压缩决策。
+	ContextBudget int64
 	// Agents 多 agent 环境（阶段 5）。nil = 单 agent 模式（默认，向后兼容）：
 	// 不注入 spawn/complete、不用 agent 树、不过滤工具。
 	Agents *Agents
@@ -112,6 +116,9 @@ type Loop struct {
 	sessionEnv core.EnvScope
 	maxTurns   int
 	agents     *Agents
+
+	// contextBudget 是 ContextSnapshot.tokens_budget 的取值来源（占比分母，J21）。
+	contextBudget int64
 }
 
 // Result 是一次 Run 的产出。
@@ -123,8 +130,9 @@ type Result struct {
 	Turns int
 	// ToolCalls 本 Run 执行的工具调用次数（含被 deny / 失败的：模型发起了就算一次）。
 	ToolCalls int
-	// Events 本 Run 成功落库的 durable 事件数（intent + completed/failed + loop.error +
-	// agent.spawned/completed/failed；子 loop 的事件计入父的 spawn 调用）。
+	// Events 本 Run 成功落库的 durable 事件数（每轮一条 context.assembled + intent +
+	// completed/failed + loop.error + agent.spawned/completed/failed；
+	// 子 loop 的事件计入父的 spawn 调用）。
 	Events int
 	// Summary 子 agent 经 complete 收敛时的结构化汇报（根 agent / 未收敛为 nil）。
 	Summary *contracts.AgentSummary
@@ -140,6 +148,8 @@ type Result struct {
 //     Approver=nil → DenyAll；MaxTurns=0 → DefaultMaxTurns；
 //   - **编程错误**（返回 error）：Provider / Bus / Registry / Model / SessionID /
 //     AgentID 缺失或非法——没有它们连一次安全的模型调用都发不起来。
+//
+// ContextBudget<0 同样按编程错误拒绝（预算不能为负；0 = 用 DefaultContextBudget）。
 func New(cfg Config) (*Loop, error) {
 	if cfg.Provider == nil {
 		return nil, errors.New("loop: Config.Provider 必填（模型提供方）")
@@ -162,23 +172,31 @@ func New(cfg Config) (*Loop, error) {
 	if cfg.MaxTurns < 0 {
 		return nil, fmt.Errorf("loop: Config.MaxTurns 不能为负（得到 %d；0 = 用默认 %d）", cfg.MaxTurns, DefaultMaxTurns)
 	}
+	if cfg.ContextBudget < 0 {
+		return nil, fmt.Errorf("loop: Config.ContextBudget 不能为负（得到 %d；0 = 用默认 %d）", cfg.ContextBudget, DefaultContextBudget)
+	}
 	maxTurns := cfg.MaxTurns
 	if maxTurns == 0 {
 		maxTurns = DefaultMaxTurns
 	}
+	budget := cfg.ContextBudget
+	if budget == 0 {
+		budget = DefaultContextBudget
+	}
 	return &Loop{
-		provider:   cfg.Provider,
-		bus:        cfg.Bus,
-		registry:   cfg.Registry,
-		policy:     cfg.Policy,
-		approver:   cfg.Approver,
-		sessionID:  cfg.SessionID,
-		agentID:    cfg.AgentID,
-		model:      cfg.Model,
-		system:     cfg.System,
-		sessionEnv: cfg.SessionEnv,
-		maxTurns:   maxTurns,
-		agents:     cfg.Agents,
+		provider:      cfg.Provider,
+		bus:           cfg.Bus,
+		registry:      cfg.Registry,
+		policy:        cfg.Policy,
+		approver:      cfg.Approver,
+		sessionID:     cfg.SessionID,
+		agentID:       cfg.AgentID,
+		model:         cfg.Model,
+		system:        cfg.System,
+		sessionEnv:    cfg.SessionEnv,
+		maxTurns:      maxTurns,
+		agents:        cfg.Agents,
+		contextBudget: budget,
 	}, nil
 }
 
@@ -203,6 +221,10 @@ func validateUlid(field string, id contracts.Ulid) error {
 //   - intent 事件落盘失败 → 返回 error 且**不执行**该工具调用（X1：没有意图记录就不许有副作用）；
 //   - 工具被 deny / 执行失败 / 工具缺失 → **不是** Run 的错误：它们已按三段写路径落
 //     failed 事件，错误文案回填给模型让它自我修正（M5），loop 继续。
+//
+// 每轮模型调用前还会落一条 context.assembled durable 事件（载荷 = contracts.ContextSnapshot，
+// 见 core/loop/context.go）：上下文可见性的数据源（06 §4.2）。它是观测性事实，落库失败
+// **不中止** loop（只补 loop.error 留痕）——与 X1 的 intent 写路径刻意区分。
 func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 	if l == nil {
 		return Result{}, errors.New("loop: Loop 为 nil")
@@ -231,7 +253,15 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 		}
 		res.Turns = turn
 
-		mr, err := l.provider.Run(ctx, l.request(history), l.emit)
+		// 组这一轮的请求（可见工具过滤后的结果，R5/H4）。
+		req := l.request(history)
+
+		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
+		// 此刻装配已定型（req 就是模型将看到的全部），记录"这一轮给模型看了什么"；
+		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
+		res.Events += l.publishContextAssembled(ctx, turn, req)
+
+		mr, err := l.provider.Run(ctx, req, l.emit)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// 取消导致的失败按取消处理（不要把"被取消"包装成模型错误）。

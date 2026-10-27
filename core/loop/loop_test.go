@@ -45,6 +45,10 @@ func (o *orderLog) all() []string {
 }
 
 // storeLabel 把一条入库事件压成时间线上的一格（kind + provider 黑盒 id）。
+//
+// context.assembled 是每轮模型调用前落的一条**观测事件**（core/loop/context.go），
+// 不在写路径时间线上占格——时间线断言的是 X1 的"意图 → 执行 → 结果"顺序，
+// 它的形状由 TestContextAssembledEmittedEveryTurn 单独断言。返回空串 = 不占格。
 func storeLabel(ev contracts.Event) string {
 	switch ev.Kind {
 	case loop.KindToolCallIntent:
@@ -60,6 +64,9 @@ func storeLabel(ev contracts.Event) string {
 		_ = json.Unmarshal(ev.Payload, &p)
 		return "failed:" + string(p.ToolCallID)
 	default:
+		if ev.Kind == loop.KindContextAssembled {
+			return "" // 观测事件不占写路径时间线
+		}
 		return ev.Kind
 	}
 }
@@ -92,7 +99,9 @@ func (m *memStore) Append(_ context.Context, evs []contracts.Event) ([]contracts
 		m.byID[ev.ID] = ev
 		m.events = append(m.events, ev)
 		if m.log != nil {
-			m.log.add(storeLabel(ev))
+			if label := storeLabel(ev); label != "" {
+				m.log.add(label)
+			}
 		}
 		out[i] = ev
 	}
@@ -402,6 +411,44 @@ func (h *harness) kinds() []string {
 	return out
 }
 
+// writePathKinds 是 kinds() 的"只看写路径"版：过滤掉每轮一条的 context.assembled
+// 观测事件（core/loop/context.go），让三段写路径的顺序断言保持原有口径。
+func (h *harness) writePathKinds() []string {
+	var out []string
+	for _, ev := range h.events() {
+		if ev.Kind == loop.KindContextAssembled {
+			continue
+		}
+		out = append(out, ev.Kind)
+	}
+	return out
+}
+
+// writePath 过滤掉每轮一条的 context.assembled 观测事件，只留三段写路径 /
+// loop.error / agent 生命周期事件（context.assembled 的形状由
+// TestContextAssembledEmittedEveryTurn 单独断言）。
+func writePath(evs []contracts.Event) []contracts.Event {
+	out := make([]contracts.Event, 0, len(evs))
+	for _, ev := range evs {
+		if ev.Kind == loop.KindContextAssembled {
+			continue
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// contextEvents 只取 context.assembled 事件（上下文可见性的数据源）。
+func contextEvents(evs []contracts.Event) []contracts.Event {
+	var out []contracts.Event
+	for _, ev := range evs {
+		if ev.Kind == loop.KindContextAssembled {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
 // decode 系列：把事件 payload 解成契约类型（测试自己解，不依赖 loop 的内部表示）。
 func decodeIntent(t *testing.T, ev contracts.Event) contracts.ToolCallIntentPayload {
 	t.Helper()
@@ -559,14 +606,15 @@ func TestThreeStageWritePathOrderAndPayloads(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 
-	// Result：两轮模型调用、一次工具调用、两条 durable 事件。
-	if res.Turns != 2 || res.ToolCalls != 1 || res.Events != 2 || res.Text != "完成" {
+	// Result：两轮模型调用、一次工具调用、四条 durable 事件
+	// （两轮各一条 context.assembled + intent + completed）。
+	if res.Turns != 2 || res.ToolCalls != 1 || res.Events != 4 || res.Text != "完成" {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 
-	// 事件序：恰好 intent + completed 一对，且 intent 在前（seq 单调）。
-	evs := h.events()
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
+	// 事件序：只看写路径，恰好 intent + completed 一对，且 intent 在前（seq 单调）。
+	evs := writePath(h.events())
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
 	intentEv, doneEv := evs[0], evs[1]
@@ -675,9 +723,9 @@ func TestProviderBlackBoxIDRoundTripUnchanged(t *testing.T) {
 	if _, err := h.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	evs := h.events()
+	evs := writePath(h.events())
 	if len(evs) != 2 {
-		t.Fatalf("应有 2 条事件，得到 %d", len(evs))
+		t.Fatalf("应有 2 条写路径事件，得到 %d", len(evs))
 	}
 	if got := string(decodeIntent(t, evs[0]).ToolCallID); got != weird {
 		t.Fatalf("intent.tool_call_id = %q，want %q", got, weird)
@@ -707,7 +755,7 @@ func TestIntentArgumentsPassedThroughVerbatim(t *testing.T) {
 	}
 	// 事件里是语义同一的 JSON：encoding/json 序列化 RawMessage 时会压缩空白
 	// （JSON 编码器的行为，不是 loop 改写语义），故按值比较。
-	got := decodeIntent(t, h.events()[0]).Arguments
+	got := decodeIntent(t, writePath(h.events())[0]).Arguments
 	if !sameJSON(t, got, json.RawMessage(raw)) {
 		t.Fatalf("事件 arguments 与模型给的参数不是同一 JSON:\n got %s\nwant %s", got, raw)
 	}
@@ -720,7 +768,7 @@ func TestIntentArgumentsPassedThroughVerbatim(t *testing.T) {
 	if _, err := h2.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := string(decodeIntent(t, h2.events()[0]).Arguments); got != compact {
+	if got := string(decodeIntent(t, writePath(h2.events())[0]).Arguments); got != compact {
 		t.Fatalf("紧凑参数应逐字节保留: got %s want %s", got, compact)
 	}
 }
@@ -747,7 +795,7 @@ func TestIntentDefaultsWhenToolDescriptionOmitsThem(t *testing.T) {
 	if _, err := h.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	in := decodeIntent(t, h.events()[0])
+	in := decodeIntent(t, writePath(h.events())[0])
 	if in.Idempotent {
 		t.Fatal("缺省 idempotent 应为 false")
 	}
@@ -764,7 +812,7 @@ func TestEmptyArgumentsNormalizedToObject(t *testing.T) {
 	if _, err := h.loop(nil).Run(context.Background(), "p"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := string(decodeIntent(t, h.events()[0]).Arguments); got != "{}" {
+	if got := string(decodeIntent(t, writePath(h.events())[0]).Arguments); got != "{}" {
 		t.Fatalf("空参数应补成 {}，得到 %s", got)
 	}
 }
@@ -821,12 +869,12 @@ func TestDenyPathWritesIntentPlusFailedAndNeverExecutes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("deny 不应让 Run 失败（失败是普通事件，M1）: %v", err)
 			}
-			if res.ToolCalls != 1 || res.Events != 2 || res.Turns != 2 {
+			if res.ToolCalls != 1 || res.Events != 4 || res.Turns != 2 {
 				t.Fatalf("Result 不符: %+v", res)
 			}
 
-			evs := h.events()
-			if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+			evs := writePath(h.events())
+			if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 				t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 			}
 			// X1：intent 落盘了，但没有 completed，也**没有执行**。
@@ -870,10 +918,10 @@ func TestAskWithAlwaysAllowApproverExecutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
 	if n := exec.callN(); n != 1 {
@@ -884,7 +932,7 @@ func TestAskWithAlwaysAllowApproverExecutes(t *testing.T) {
 		Verdict string `json:"verdict"`
 		Reason  string `json:"reason"`
 	}
-	if err := json.Unmarshal(decodeIntent(t, h.events()[0]).PolicySnapshot, &snap); err != nil {
+	if err := json.Unmarshal(decodeIntent(t, writePath(h.events())[0]).PolicySnapshot, &snap); err != nil {
 		t.Fatalf("快照解不开: %v", err)
 	}
 	if snap.Verdict != "allow" || !strings.Contains(snap.Reason, "人审放行") {
@@ -908,13 +956,13 @@ func TestAskWithApproverErrorFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("审批失败应落 failed 事件而不是让 Run 失败: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 	if n := exec.callN(); n != 0 {
 		t.Fatalf("审批失败时不得执行（调用 %d 次）", n)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "审批服务不可用") || !strings.Contains(fp.Error.Message, "fail-close") {
 		t.Fatalf("失败说明应点名审批故障并按 deny 处理: %q", fp.Error.Message)
 	}
@@ -937,7 +985,7 @@ func TestMultipleToolCallsInOneTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ToolCalls != 2 || res.Events != 4 || res.Turns != 2 {
+	if res.ToolCalls != 2 || res.Events != 6 || res.Turns != 2 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 	// 每个调用各自成对，且严格串行：intent1 → exec1 → completed1 → intent2 → exec2 → completed2。
@@ -977,16 +1025,16 @@ func TestUnknownToolNameWritesFailedAndNeverExecutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("未知工具应落 failed 而不是让 Run 失败: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
 	if exec.callN() != 0 || h.log.all()[len(h.log.all())-1] != "failed:c1" {
 		t.Fatalf("未知工具不得执行: %v", h.log.all())
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "未在注册表注册") {
 		t.Fatalf("失败说明应点名未注册: %q", fp.Error.Message)
 	}
@@ -1007,10 +1055,10 @@ func TestRegisteredButNotAToolExtensionWritesFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Events != 2 || res.ToolCalls != 1 {
+	if res.Events != 4 || res.ToolCalls != 1 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "没有工具描述") {
 		t.Fatalf("失败说明应说明缺工具描述: %q", fp.Error.Message)
 	}
@@ -1026,16 +1074,16 @@ func TestEmptyToolNameFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
 	if n := exec.callN(); n != 0 {
 		t.Fatalf("空工具名不得执行（%d 次）", n)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "fail-close") {
 		t.Fatalf("应按 fail-close 拒绝: %q", fp.Error.Message)
 	}
@@ -1051,10 +1099,10 @@ func TestExecutorPanicIsIsolatedAsFailedEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("执行器 panic 应被隔离成普通失败，而不是带崩 loop: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 || res.Text != "崩溃后继续" {
+	if res.ToolCalls != 1 || res.Events != 4 || res.Text != "崩溃后继续" {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "panic") {
 		t.Fatalf("失败说明应说明 panic: %q", fp.Error.Message)
 	}
@@ -1079,10 +1127,10 @@ func TestExecutorErrorIsFailedEventAndLoopContinues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("工具失败不应让 Run 失败: %v", err)
 	}
-	if res.ToolCalls != 1 || res.Events != 2 {
+	if res.ToolCalls != 1 || res.Events != 4 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "磁盘满了") {
 		t.Fatalf("执行器错误文案应模型可读: %q", fp.Error.Message)
 	}
@@ -1107,7 +1155,7 @@ func TestMaxTurnsTruncatesRunawayToolLoop(t *testing.T) {
 	if res.Turns != 3 {
 		t.Fatalf("Turns = %d，want 3（MaxTurns 截断）", res.Turns)
 	}
-	if res.ToolCalls != 3 || res.Events != 6 {
+	if res.ToolCalls != 3 || res.Events != 9 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
 	if n := h.provider.callCount(); n != 3 {
@@ -1180,13 +1228,14 @@ func TestContextCanceledDuringToolExecution(t *testing.T) {
 		t.Fatalf("err = %v，want context.Canceled", err)
 	}
 	// X1：有 intent 就要有结果——尽力补一条 failed，然后才返回取消语义。
-	if got, want := h.kinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
+	if got, want := h.writePathKinds(), []string{loop.KindToolCallIntent, loop.KindToolCallFailed}; !equalStrings(got, want) {
 		t.Fatalf("事件 kind 序 = %v，want %v", got, want)
 	}
-	if res.Events != 2 || res.ToolCalls != 1 {
+	// 本轮 3 条：context.assembled + intent + failed（取消发生在第一轮内，没有第二轮）。
+	if res.Events != 3 || res.ToolCalls != 1 {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	fp := decodeFailed(t, h.events()[1])
+	fp := decodeFailed(t, writePath(h.events())[1])
 	if !strings.Contains(fp.Error.Message, "取消") {
 		t.Fatalf("失败说明应说明被取消: %q", fp.Error.Message)
 	}
@@ -1216,12 +1265,12 @@ func TestProviderErrorPublishesLoopErrorEvent(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("err = %v，want 包装后的 %v", err, boom)
 	}
-	if res.Turns != 1 || res.Events != 1 || res.Text != "" {
+	if res.Turns != 1 || res.Events != 2 || res.Text != "" {
 		t.Fatalf("Result 不符: %+v", res)
 	}
-	evs := h.events()
+	evs := writePath(h.events())
 	if len(evs) != 1 || evs[0].Kind != loop.KindLoopError {
-		t.Fatalf("应落一条 loop.error 事件，得到 %v", h.kinds())
+		t.Fatalf("应落一条 loop.error 事件，得到 %v", h.writePathKinds())
 	}
 	if !evs[0].Durable {
 		t.Fatal("loop.error 必须是 durable 事实事件")
@@ -1296,13 +1345,13 @@ func TestRepeatedRunsDoNotCollide(t *testing.T) {
 		if err != nil {
 			t.Fatalf("第 %d 次 Run: %v", i, err)
 		}
-		if res.Events != 2 || res.ToolCalls != 1 {
+		if res.Events != 4 || res.ToolCalls != 1 {
 			t.Fatalf("第 %d 次 Result 不符: %+v", i, res)
 		}
 	}
 	evs := h.events()
-	if len(evs) != 6 {
-		t.Fatalf("三次 Run 应有 6 条事件，得到 %d", len(evs))
+	if len(evs) != 12 {
+		t.Fatalf("三次 Run 应有 12 条事件（每次两轮各一条 context.assembled + intent + completed），得到 %d", len(evs))
 	}
 	seenID := map[contracts.Ulid]bool{}
 	seenSeq := map[int64]bool{}

@@ -22,6 +22,11 @@
 //	│ 5. 模型无 ToolCalls → 结束，返回 Result.Text                    │
 //	└──────────────────────────────────────────────────────────────┘
 //
+// 在 2 之前还有一步 1.5：**落一条 context.assembled durable 事件**（载荷 =
+// contracts.ContextSnapshot，见 context.go）。此刻装配已定型，记录"这一轮给模型看了
+// 什么"——上下文可见性的数据源（06 §4.2）。它是观测性事实，落库失败不中止 loop
+// （与 X1 的 intent 写路径刻意区分）。
+//
 // Provider 出错不是工具调用失败（M1：失败是普通事件）：Run 返回 error 由调用方处理，
 // 同时尽力补一条 durable 的 loop.error 事件供事后审计。ctx 取消立即返回 ctx.Err()。
 //

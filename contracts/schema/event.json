@@ -20,7 +20,8 @@
         "agent.spawned": "AgentSpawnedPayload",
         "agent.completed": "AgentCompletedPayload",
         "agent.failed": "AgentFailedPayload",
-        "gate.checked": "GateCheckedPayload"
+        "gate.checked": "GateCheckedPayload",
+        "context.assembled": "ContextSnapshot"
       },
       "required": ["v", "id", "kind", "ts", "session_id", "agent_id", "durable"],
       "properties": {
