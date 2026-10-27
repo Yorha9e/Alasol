@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–2 已完成**（2026-10-27）：仓库/CI/契约（12 schema + codegen + Go 类型 + TS 消费端）+ **core 骨架**（bus / policy / registry / 根接口，69 测 + race 干净）；阶段 2 退出评审循环 critic clean；下一步：阶段 3 runtime + 索引器 |
+| **代码** | **阶段 0–3 已完成**（2026-10-27）：仓库/CI/契约 + core 骨架（69 测）+ runtime（SQLite 事件日志 + 索引器 + 回放，含并发/乱序/崩溃续跑测试）；阶段 3 退出评审循环 critic clean（3 p1 + 9 p2 闭环）；下一步：阶段 4 loop + 真机回路 |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -140,10 +140,10 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 ### 阶段 3 · runtime + 索引器
 - SQLite（`ncruces/go-sqlite3` v0.35.6，`_txlock=immediate` + `busy_timeout`）/ 事件日志（`seq` 由 AUTOINCREMENT 分配）/ **索引器**
 - **ledger 与黑板全部事件化**（G23）：`ledger.updated` / `board.written` → 当前态 = 索引器投影
-- **验收**：
-  - [ ] 事件流能**完整回放**一场 session
-  - [ ] 索引器崩溃后从 seq 水位续跑；支持重建；**UI 显示水位**
-  - [ ] ledger **不是**独立可变存储（消灭状态源三分）
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] 事件流能**完整回放**一场 session
+  - [x] 索引器崩溃后从 seq 水位续跑；支持重建；**UI 显示水位**（`Watermark()` 可查）
+  - [x] ledger **不是**独立可变存储（消灭状态源三分）
 
 ### 阶段 4 · loop + 真机回路
 - agent loop 状态机 / 一个真 provider / read·write·bash 工具 / **env 注入 v0 子集**（H21：session + 单次调用两级作用域，**不给模型看任何 env**）

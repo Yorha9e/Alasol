@@ -28,7 +28,7 @@
 
 > **本项目已全量交接**：设计侧工作收尾，后续施工全部在另一 session 进行。
 > 施工入口 → [`docs/research/11-construction-plan.md`](docs/research/11-construction-plan.md)（含**环境与工具链事实**、阶段划分、硬验收、20 条施工期陷阱清单）。
-> 阶段 0–2 **已完成**（2026-10-27，各自通过退出评审循环 critic clean）：仓库/CI/契约 schema（2020-12）+ codegen + Go 类型 + TS 消费端 + **core 骨架**（bus 事件总线 F8 分流 / policy 策略链 fail-close / registry 能力裁决 / Store·Approver·ToolExecutor·能力接口）。下一步：阶段 3 runtime+索引器。命名已定：`alasol` · `github.com/Yorha9e/alasol`。
+> 阶段 0–3 **已完成**（2026-10-27，各自通过退出评审循环 critic clean）：仓库/CI/契约 + **core 骨架**（bus/policy/registry）+ **runtime**（SQLite 事件日志 + 索引器（水位/重建/投影）+ 回放，ledger/board 事件化 G23）。下一步：阶段 4 loop+真机回路。命名已定：`alasol` · `github.com/Yorha9e/alasol`。
 
 - 目标已收敛：**搭一套可自定义、可拓展的骨架**（ACP 等具体特性后置），在骨架之上向任意方向扩展
 - **骨架验收标准（酸测试）**：把任意一个扩展点的实现整个换掉，core 代码一行不改

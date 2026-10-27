@@ -24,17 +24,19 @@
 
 ## 2. 事件 core kind 子集（随 Event 契约定稿）
 
-kind 是开放字符串（D6），core 定义核心子集。**本阶段必须定稿 payload 形状的**：
+kind 是开放字符串（D6），core 定义核心子集。**已定稿 payload 形状的**：
 
 | kind | durable | 说明 |
 |---|---|---|
 | `tool.call.intent` | true | **三段事件之①**（X1）：tool_call_id / 参数 / idempotent / replay 标记 / 外部可核验锚点（如 commit sha） |
 | `tool.call.completed` | true | **三段事件之③a**（X1）：结果（Tool 返回值契约） |
 | `tool.call.failed` | true | **三段事件之③b**（X1）：失败（错误为普通事件，M1/M8） |
+| `ledger.updated` | true | **goal ledger 全量快照**（`LedgerUpdatedPayload`，G8/G23）：goals / constraints / completed / pending 四张清单**全文**；整帧 LWW（seq 大者胜），当前态 = 索引器投影（ledger 不是独立可变存储，事件流是唯一事实源） |
+| `board.written` | true | **共享黑板键写入**（`BoardWrittenPayload`，K22/G23）：键 + 原始 JSON 值 + 作者；`tombstone=true` = 删除该键（**墓碑行**语义：保留行、值为 NULL、读取时视为不存在；旧墓碑盖不掉新值、旧值复活不了已删键） |
 
 写路径铁律（X1）：`intent` **durable 落盘** → 执行 → `result` durable 落盘。**有意图无结果 = 未知结果，不盲目重跑**。
 
-其余 core kind（`context.assembled` / `policy.decided` / `ledger.updated` / `board.written` / `checkpoint.created` / `session.resumed` 等）随对应阶段补 payload schema，envelope 复用 `event.json`。
+其余 core kind（`context.assembled` / `policy.decided` / `checkpoint.created` / `session.resumed` 等）随对应阶段补 payload schema，envelope 复用 `event.json`。
 
 ## 3. 生成与编码约定（schema 与 codegen 共同遵守）
 

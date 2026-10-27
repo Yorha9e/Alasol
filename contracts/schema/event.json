@@ -14,7 +14,9 @@
       "x-kind-payload": {
         "tool.call.intent": "ToolCallIntentPayload",
         "tool.call.completed": "ToolCallCompletedPayload",
-        "tool.call.failed": "ToolCallFailedPayload"
+        "tool.call.failed": "ToolCallFailedPayload",
+        "ledger.updated": "LedgerUpdatedPayload",
+        "board.written": "BoardWrittenPayload"
       },
       "required": ["v", "id", "kind", "ts", "session_id", "agent_id", "durable"],
       "properties": {
@@ -144,6 +146,60 @@
           "description": "锚点类型（开放字符串，如 commit / url / hash）。"
         },
         "value": { "type": "string" }
+      }
+    },
+    "LedgerUpdatedPayload": {
+      "type": "object",
+      "description": "ledger.updated —— goal ledger 全量快照（G8/G23）：每条事件是当前账本全文，LWW 覆盖；当前态 = 索引器物化的投影（ledger 不是独立可变存储，事件流是唯一事实源）。X6：关键字段（目标/约束）立即落盘，过程字段（已完成/待解）turn 末合并为一条。",
+      "required": ["goals", "constraints", "completed", "pending"],
+      "properties": {
+        "goals": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "目标清单（全量快照，X6 关键字段立即落盘）。"
+        },
+        "constraints": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "约束清单（全量快照，X6 关键字段立即落盘）。"
+        },
+        "completed": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "已完成项（全量快照，X6 过程字段 turn 末合并）。"
+        },
+        "pending": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "待解项（全量快照，X6 过程字段 turn 末合并）。"
+        },
+        "note": {
+          "type": "string",
+          "description": "本次更新的说明（可选，供事后审计）。"
+        }
+      }
+    },
+    "BoardWrittenPayload": {
+      "type": "object",
+      "description": "board.written —— 共享黑板键写入（K22/G23）：作为 durable 事件追加，当前态 = 索引器投影；键级 last-write-wins 由事件顺序（全局 seq）天然保证，tombstone=true 删除该键（墓碑语义，借鉴 moamcp raw board 的键级 LWW + 墓碑 + 分区）。",
+      "required": ["key"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "黑板键（分区键，会话内唯一）。"
+        },
+        "value": {
+          "x-go-type": "json.RawMessage",
+          "description": "键值（原始 JSON，原样保存）；tombstone=true 时可缺省。"
+        },
+        "tombstone": {
+          "type": "boolean",
+          "description": "true = 删除该键（墓碑语义，K22）。"
+        },
+        "author": {
+          "type": "string",
+          "description": "写入者标识（可选，如 agent_id）。"
+        }
       }
     }
   }

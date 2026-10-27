@@ -74,3 +74,29 @@ type Anchor struct {
 	Kind  string `json:"kind"`
 	Value string `json:"value"`
 }
+
+// ledger.updated —— goal ledger 全量快照（G8/G23）：每条事件是当前账本全文，LWW 覆盖；当前态 = 索引器物化的投影（ledger 不是独立可变存储，事件流是唯一事实源）。X6：关键字段（目标/约束）立即落盘，过程字段（已完成/待解）turn 末合并为一条。
+type LedgerUpdatedPayload struct {
+	// 目标清单（全量快照，X6 关键字段立即落盘）。
+	Goals []string `json:"goals"`
+	// 约束清单（全量快照，X6 关键字段立即落盘）。
+	Constraints []string `json:"constraints"`
+	// 已完成项（全量快照，X6 过程字段 turn 末合并）。
+	Completed []string `json:"completed"`
+	// 待解项（全量快照，X6 过程字段 turn 末合并）。
+	Pending []string `json:"pending"`
+	// 本次更新的说明（可选，供事后审计）。
+	Note *string `json:"note,omitempty"`
+}
+
+// board.written —— 共享黑板键写入（K22/G23）：作为 durable 事件追加，当前态 = 索引器投影；键级 last-write-wins 由事件顺序（全局 seq）天然保证，tombstone=true 删除该键（墓碑语义，借鉴 moamcp raw board 的键级 LWW + 墓碑 + 分区）。
+type BoardWrittenPayload struct {
+	// 黑板键（分区键，会话内唯一）。
+	Key string `json:"key"`
+	// 键值（原始 JSON，原样保存）；tombstone=true 时可缺省。
+	Value json.RawMessage `json:"value,omitempty"`
+	// true = 删除该键（墓碑语义，K22）。
+	Tombstone *bool `json:"tombstone,omitempty"`
+	// 写入者标识（可选，如 agent_id）。
+	Author *string `json:"author,omitempty"`
+}
