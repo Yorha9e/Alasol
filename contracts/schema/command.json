@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/command.json",
+  "title": "Command",
+  "description": "Command = 意图（D9）；可从进程外提交（K3），经 core 处理后产生 Event。命令不是事实——只有事件流是事实（F5）。",
+  "$defs": {
+    "Command": {
+      "type": "object",
+      "required": ["v", "id", "kind", "ts"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "契约版本（F7）。"
+        },
+        "id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "命令 id（框架 ULID）。"
+        },
+        "kind": {
+          "type": "string",
+          "description": "命令种类（开放字符串 + 点分命名空间，如 prompt.submit / agent.spawn / session.create）。"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "目标 session；创建类命令可缺省。"
+        },
+        "agent_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "目标 agent；缺省 = session 主 agent。"
+        },
+        "payload": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "命令载荷（原始 JSON，按 kind 解释）。"
+        }
+      }
+    }
+  }
+}

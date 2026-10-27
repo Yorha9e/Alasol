@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/approval.json",
+  "title": "Approval",
+  "description": "审批请求/答复消息（跨进程：TUI / GUI / 远端客户端，D21）。fail-close：审批缺席/无人应答 = deny，不得挂起（D14/H7/H8）。",
+  "$defs": {
+    "ApprovalRequest": {
+      "type": "object",
+      "required": ["v", "id", "ts", "session_id", "agent_id", "trigger", "summary"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "契约版本（F7）。"
+        },
+        "id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "审批请求 id。"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "agent_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "trigger": {
+          "$ref": "#/$defs/ApprovalTrigger",
+          "description": "触发源必须可区分（W17b）：ask=策略链拦截（无人应答→deny+拒绝话术）；escalate=agent 主动升级（→checkpoint 挂起，W17/W20）。"
+        },
+        "tool_call_id": {
+          "$ref": "common.json#/$defs/ProviderId",
+          "description": "关联的工具调用（策略 ask 时有值）。"
+        },
+        "side_effect": {
+          "$ref": "common.json#/$defs/SideEffect",
+          "description": "待批操作的副作用等级（供审批 UI 渲染）。"
+        },
+        "summary": {
+          "type": "string",
+          "description": "给审批人看的一句话说明。"
+        },
+        "detail": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "附加细节（原始 JSON，如参数、suggested_rules）。"
+        }
+      }
+    },
+    "ApprovalResponse": {
+      "type": "object",
+      "required": ["v", "request_id", "ts", "decision"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "契约版本（F7）。"
+        },
+        "request_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "对应 ApprovalRequest.id。"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision",
+          "description": "allow / deny。"
+        },
+        "note": {
+          "type": "string",
+          "description": "审批人备注 / 拒绝话术（H7）。"
+        },
+        "decided_by": {
+          "type": "string",
+          "description": "决策者标识（如 user / auto:<policy>）。"
+        }
+      }
+    },
+    "ApprovalTrigger": {
+      "type": "string",
+      "enum": ["policy_ask", "escalate"],
+      "description": "策略拦截 ask / agent 主动升级 escalate（W17b/W20）。"
+    },
+    "ApprovalDecision": {
+      "type": "string",
+      "enum": ["allow", "deny"],
+      "description": "审批结论（escalate 的恢复决策——继续/改方向/放弃——走 Command，不在本契约）。"
+    }
+  }
+}

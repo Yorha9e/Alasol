@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ToolResult",
+  "description": "ToolResult fixture: enums (including a value containing '-'), a cross-file target and an inline enum property.",
+  "$defs": {
+    "ToolResult": {
+      "type": "object",
+      "description": "工具返回值（fixture）。",
+      "required": ["ok"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "output": { "type": "object", "x-go-type": "json.RawMessage" },
+        "taint": { "$ref": "#/$defs/Taint" },
+        "side_effect": { "$ref": "#/$defs/SideEffect" },
+        "graph_edges": { "type": "array", "items": { "$ref": "#/$defs/GraphEdge" } },
+        "replayable": { "type": "boolean" }
+      }
+    },
+    "SideEffect": {
+      "type": "string",
+      "description": "副作用等级。",
+      "enum": ["none", "read", "write", "destructive"]
+    },
+    "Taint": {
+      "type": "string",
+      "enum": ["clean", "tainted", "unknown"]
+    },
+    "GraphEdge": {
+      "type": "object",
+      "description": "依赖图中的一条边。",
+      "required": ["src", "dst", "kind"],
+      "properties": {
+        "src": { "type": "string" },
+        "dst": { "type": "string" },
+        "kind": { "type": "string", "enum": ["calls", "reads-from", "writes-to"] },
+        "weight": { "type": "number" }
+      }
+    },
+    "EdgeKind": {
+      "type": "string",
+      "enum": ["calls", "reads-from", "writes-to"]
+    }
+  }
+}

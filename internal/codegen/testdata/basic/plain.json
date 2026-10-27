@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$defs": {
+    "PlainThing": {
+      "type": "object",
+      "description": "No json.RawMessage anywhere: the generated file must not import encoding/json.",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "count": { "type": "integer" },
+        "ratio": { "type": "number" },
+        "enabled": { "type": "boolean" },
+        "kind": { "$ref": "#/$defs/PlainKind" },
+        "labels": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "PlainKind": {
+      "type": "string",
+      "description": "枚举值含连字符。",
+      "enum": ["alpha", "beta-gamma", "delta"]
+    }
+  }
+}

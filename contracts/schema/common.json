@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/common.json",
+  "title": "common",
+  "description": "跨契约共享原语（ID 与执行语义的基础类型）。一个类型只在此定义一次，其余 schema 以 $ref 引用（D21）。",
+  "$defs": {
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "x-id-kind": "framework",
+      "description": "框架 id：ULID，26 字符 Crockford base32（S1）。JSON 里一律 string（S6）。字符集/长度不合则拒绝并记事件，不修复（S9）。"
+    },
+    "ProviderId": {
+      "type": "string",
+      "x-id-kind": "provider",
+      "description": "provider 不透明 id（如 tool_call_id）：原样存、原样回传，不解析、不折叠大小写、不做规范化（S4）。永不与框架 id 共字段（S5）。"
+    },
+    "ReplayKind": {
+      "type": "string",
+      "enum": ["safe", "verify", "unsafe"],
+      "description": "崩溃续跑时的重放语义（X2）：safe=重复执行无副作用；verify=可重放但须先核验外部状态；unsafe=不可重放，未知结果转人工/agent 判定。"
+    },
+    "SideEffect": {
+      "type": "string",
+      "enum": ["none", "read", "write", "destructive"],
+      "description": "工具副作用等级（D12），供策略链与审批 UI 使用。"
+    }
+  }
+}

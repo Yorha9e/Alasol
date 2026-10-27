@@ -1,0 +1,9 @@
+# dependencies
+node_modules/
+
+# machine-local npm proxy (do not commit — breaks CI runners)
+tools/ts-consumer/.npmrc
+
+# build output
+dist/
+*.exe

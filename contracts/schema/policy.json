@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/policy.json",
+  "title": "Policy",
+  "description": "策略规则表达式（配置文件形态）与判定结果 Decision（D13/H5）。求值链 deny→ask→allow，首个命中即返回（H2）；deny 优先且不能写 allow 例外（H3）。",
+  "$defs": {
+    "PolicyRule": {
+      "type": "object",
+      "required": ["effect", "tool", "source"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "规则 id（配置内稳定标识，供 Decision.rule_id 引用；非 ULID）。"
+        },
+        "effect": {
+          "$ref": "#/$defs/Effect",
+          "description": "deny / ask / allow（H2）。"
+        },
+        "tool": {
+          "type": "string",
+          "description": "工具名；裸工具名 deny = 移出模型可见集（H4）。"
+        },
+        "args_pattern": {
+          "type": "string",
+          "description": "参数化匹配（H4：参数化 deny = 拦截调用）。"
+        },
+        "source": {
+          "$ref": "#/$defs/RuleSource",
+          "description": "规则来源（H5）：deny/ask 跨来源取并集；只有 allow 按来源优先级解析。workflow 来源的规则只可收窄、不可放宽（H5/H24）。"
+        },
+        "reason": {
+          "type": "string",
+          "description": "给人看的理由。"
+        }
+      }
+    },
+    "Effect": {
+      "type": "string",
+      "enum": ["allow", "deny", "ask"],
+      "description": "规则效果（H2/H3）。"
+    },
+    "RuleSource": {
+      "type": "string",
+      "enum": ["managed", "cli", "project", "workflow", "local", "user", "session"],
+      "description": "规则来源；allow 的解析优先级即此顺序（H5）。"
+    },
+    "Decision": {
+      "type": "object",
+      "required": ["verdict"],
+      "properties": {
+        "verdict": {
+          "$ref": "#/$defs/Verdict",
+          "description": "allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。"
+        },
+        "rule_id": {
+          "type": "string",
+          "description": "命中的规则 id。"
+        },
+        "reason": { "type": "string" },
+        "suggested_rules": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PolicyRule" },
+          "description": "verdict=ask 时携带的建议规则（D13）。"
+        }
+      }
+    },
+    "Verdict": {
+      "type": "string",
+      "enum": ["allow", "deny", "ask"],
+      "description": "判定结果（D13）。"
+    }
+  }
+}

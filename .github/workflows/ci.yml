@@ -42,9 +42,20 @@ jobs:
           echo "ok: no cgo"
 
   schema:
-    name: schema regen diff (placeholder)
+    name: schema regen diff + ts consumer
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: placeholder
-        run: echo "placeholder — lit up in stage 1 (codegen: regen diff must be empty)"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: regenerate Go types from schema (check only)
+        run: go run ./cmd/codegen -check
+      - name: TS minimal consumer (cross-language neutrality)
+        working-directory: tools/ts-consumer
+        run: |
+          npm install
+          npx tsx reader.ts

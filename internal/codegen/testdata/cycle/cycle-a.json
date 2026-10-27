@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "CycleA",
+  "$defs": {
+    "CycleA": {
+      "type": "object",
+      "properties": {
+        "b": { "$ref": "cycle-b.json#/$defs/CycleB" }
+      }
+    }
+  }
+}

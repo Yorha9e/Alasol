@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/extension.json",
+  "title": "Extension",
+  "description": "扩展注册元数据（D17/E3）：安装时申报能力，运行时由策略引擎裁决。官方扩展与第三方同一套注册机制（E7）。",
+  "$defs": {
+    "ExtensionMeta": {
+      "type": "object",
+      "required": ["name", "kind", "capabilities", "reloadable"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "扩展稳定标识（如 builtin.tools），配置与注册表键。"
+        },
+        "kind": {
+          "type": "string",
+          "description": "扩展点种类（开放字符串：tool / provider / policy / store / projection / compaction / assembler / scheduler / panel / endpoint / transport / telemetry / approver / sandbox）。"
+        },
+        "description": {
+          "type": "string"
+        },
+        "schema": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "扩展配置的 JSON Schema（元嵌套，原始 JSON）。"
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "申报的能力/权限需求（E3）；可为空数组。实际授予由策略引擎裁决。"
+        },
+        "priority": {
+          "type": "integer",
+          "description": "同扩展点内的解析优先级；缺省 0。"
+        },
+        "reloadable": {
+          "type": "boolean",
+          "description": "是否支持热重载（E6：进程级可热插拔；接口实现通常需重启）。"
+        },
+        "health": {
+          "$ref": "#/$defs/ExtensionHealth",
+          "description": "健康状态（运行时回填）。"
+        }
+      }
+    },
+    "ExtensionHealth": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/HealthStatus"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "HealthStatus": {
+      "type": "string",
+      "enum": ["up", "degraded", "down"],
+      "description": "扩展健康度。"
+    }
+  }
+}

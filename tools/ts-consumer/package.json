@@ -1,0 +1,21 @@
+{
+  "name": "alasol-ts-consumer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal TypeScript consumer of the alasol NDJSON event stream (cross-language schema check)",
+  "scripts": {
+    "read": "tsx reader.ts",
+    "read:broken": "tsx reader.ts broken-events.ndjson",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}

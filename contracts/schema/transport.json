@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/transport.json",
+  "title": "Transport",
+  "description": "客户端/服务端通信消息 envelope（D18/N4/N6）：ws+ndjson / stdio / inproc 同一契约。NDJSON 行式传输，一行一个 TransportMessage。",
+  "$defs": {
+    "TransportMessage": {
+      "type": "object",
+      "required": ["v", "id", "kind"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "契约版本（F7）。"
+        },
+        "id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "消息 id（框架 ULID）。"
+        },
+        "kind": {
+          "type": "string",
+          "description": "消息种类（开放字符串，如 subscribe / event / command.submit / approval.request / approval.respond / error / ping）。"
+        },
+        "reply_to": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "应答关联：指向被应答消息的 id。"
+        },
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "会话过滤上下文（订阅过滤 / 会话定向消息用）。"
+        },
+        "payload": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "消息载荷（原始 JSON，按 kind 解释；kind=event 时为 Event 契约对象）。"
+        }
+      }
+    },
+    "SubscribeRequest": {
+      "type": "object",
+      "description": "kind=subscribe 的载荷：订阅事件流，按过滤条件推送（K4 远程订阅）。",
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "只订阅某 session；缺省 = 全部。"
+        },
+        "kinds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "只订阅这些 kind（前缀匹配由实现定义）；缺省 = 全部。"
+        },
+        "durable_only": {
+          "type": "boolean",
+          "description": "true = 只收事实事件（不含流事件）。"
+        }
+      }
+    },
+    "TransportError": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "错误码（开放字符串）。"
+        },
+        "message": {
+          "type": "string",
+          "description": "人可读说明。"
+        }
+      }
+    }
+  }
+}

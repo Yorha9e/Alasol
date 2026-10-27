@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/event.json",
+  "title": "Event",
+  "description": "唯一事实流 envelope（F3/F5/F7/F8）+ 阶段 1 必须定稿的三段工具调用事件 payload（X1）。kind 是开放字符串 + 点分命名空间（D6）；未知 kind 必须宽容：忽略但持久化（D7）。",
+  "$defs": {
+    "Event": {
+      "type": "object",
+      "description": "事件 envelope。kind→payload 形状映射见 x-kind-payload；seq↔durable 不变式见 x-invariants（引擎强制，schema 不做条件表达）。",
+      "x-invariants": [
+        "durable=false ⇒ 不入库、不占 seq → seq 必须缺省（F8）",
+        "durable=true ⇒ seq 由存储在 append 时分配后回填（G9/G10）"
+      ],
+      "x-kind-payload": {
+        "tool.call.intent": "ToolCallIntentPayload",
+        "tool.call.completed": "ToolCallCompletedPayload",
+        "tool.call.failed": "ToolCallFailedPayload"
+      },
+      "required": ["v", "id", "kind", "ts", "session_id", "agent_id", "durable"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "envelope 契约版本（F7：只增不删、不改义；弃用字段标 x-deprecated）。"
+        },
+        "id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "框架事件 id（幂等去重键，S7：去重只看本字段）。"
+        },
+        "kind": {
+          "type": "string",
+          "description": "事件种类，命名空间点分（如 tool.call.intent）；core 定义核心子集。"
+        },
+        "seq": {
+          "type": "integer",
+          "description": "全局单调序号，由存储在 append 时分配（G9/G10）。durable=false 的流事件不入库、不占 seq（F8）→ 此字段可缺省。JSON integer（序号非 id）。"
+        },
+        "ts": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 时间戳。"
+        },
+        "session_id": { "$ref": "common.json#/$defs/Ulid" },
+        "agent_id": { "$ref": "common.json#/$defs/Ulid" },
+        "causation_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "因果指针：触发本事件的那个事件 id（F3，扁平因果，不引入 span 模型）。"
+        },
+        "durable": {
+          "type": "boolean",
+          "description": "事实事件 true（入库、占 seq、可回放）；流事件 false（总线直发订阅者，不入库）（F8）。"
+        },
+        "payload": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "事件载荷（原始 JSON，按 kind 解释；已知 kind 的 payload 形状见本文件 $defs）。"
+        },
+        "binary_ref": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "大 payload 外置 blob 引用（D4）。"
+        }
+      }
+    },
+    "ToolCallIntentPayload": {
+      "type": "object",
+      "description": "tool.call.intent —— 三段事件之①（X1）：意图必须 durable 落盘后才执行。有意图无结果 = 未知结果，不盲目重跑。",
+      "required": ["tool_call_id", "tool_name", "arguments", "idempotent", "replay"],
+      "properties": {
+        "tool_call_id": {
+          "$ref": "common.json#/$defs/ProviderId",
+          "description": "provider 的调用 id，黑盒原样回传；与 Event.id 永不共字段（S5）。"
+        },
+        "tool_name": { "type": "string" },
+        "arguments": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "调用参数（原始 JSON，原样保存）。"
+        },
+        "idempotent": {
+          "type": "boolean",
+          "description": "能否自动重试（429/5xx 类抖动）（M7/X2）。"
+        },
+        "replay": {
+          "$ref": "common.json#/$defs/ReplayKind",
+          "description": "崩溃续跑时的重放语义（X2）。"
+        },
+        "anchors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Anchor" },
+          "description": "外部可核验锚点（X1/X2 verify 用，如 commit sha）。"
+        },
+        "policy_snapshot": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "判定时刻的策略快照（M9：长工具 TOCTOU，判定只约束发起时刻——已知边界，快照供事后审计）。"
+        }
+      }
+    },
+    "ToolCallCompletedPayload": {
+      "type": "object",
+      "description": "tool.call.completed —— 三段事件之③a（X1）：执行结果 durable 落盘。",
+      "required": ["tool_call_id", "result"],
+      "properties": {
+        "tool_call_id": { "$ref": "common.json#/$defs/ProviderId" },
+        "result": {
+          "$ref": "tool-result.json#/$defs/ToolResult",
+          "description": "工具返回值（跨边界契约）。"
+        }
+      }
+    },
+    "ToolCallFailedPayload": {
+      "type": "object",
+      "description": "tool.call.failed —— 三段事件之③b（X1/M1/M8）：失败是普通事件，不是特殊通道；错误文案必须让模型能理解并自我修正。",
+      "required": ["tool_call_id", "error"],
+      "properties": {
+        "tool_call_id": { "$ref": "common.json#/$defs/ProviderId" },
+        "error": { "$ref": "#/$defs/ToolCallError" }
+      }
+    },
+    "ToolCallError": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "模型可读的错误说明（M5）。"
+        },
+        "code": {
+          "type": "string",
+          "description": "可重试/致命分类用的错误码（M4），开放字符串。"
+        },
+        "details": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "附加诊断（原始 JSON）。"
+        }
+      }
+    },
+    "Anchor": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "锚点类型（开放字符串，如 commit / url / hash）。"
+        },
+        "value": { "type": "string" }
+      }
+    }
+  }
+}

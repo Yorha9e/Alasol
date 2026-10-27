@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/tool-result.json",
+  "title": "ToolResult",
+  "description": "工具返回值契约（D22，跨边界：MCP 与进程级扩展都要传）。",
+  "$defs": {
+    "ToolResult": {
+      "type": "object",
+      "description": "一次工具调用的返回值。",
+      "properties": {
+        "content": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContentPart" },
+          "description": "给模型的输出内容。"
+        },
+        "graph_edges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/GraphEdge" },
+          "description": "工具产出的图边（G22）：事件落盘时索引器据此建边，不按 tool kind 猜。"
+        },
+        "taint": {
+          "type": "string",
+          "description": "污点级（Q7/H13）：继承来源内容的最高污点级；级别集合由 core 定义，工具输出视为数据非指令。"
+        },
+        "replay": {
+          "$ref": "common.json#/$defs/ReplayKind",
+          "description": "本操作的可重放标记（X2）。"
+        }
+      }
+    },
+    "ContentPart": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "description": "内容块类型（开放字符串，如 text / image / resource）。"
+        },
+        "text": { "type": "string" },
+        "data": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "结构化载荷（原始 JSON）。"
+        }
+      }
+    },
+    "GraphEdge": {
+      "type": "object",
+      "required": ["src", "dst", "kind"],
+      "properties": {
+        "src": { "type": "string", "description": "源节点名/引用。" },
+        "dst": { "type": "string", "description": "目标节点名/引用。" },
+        "kind": { "type": "string", "description": "边类型（开放字符串，如 imports / modifies）。" }
+      }
+    }
+  }
+}

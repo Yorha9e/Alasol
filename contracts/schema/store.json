@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/store.json",
+  "title": "Store",
+  "description": "Store 持久化格式的跨边界部分（D21）：事件日志的导出/交换格式。NDJSON 行式——每行一个 Event（event.json）。SQLite 表结构是 runtime 实现细节，不在本契约内（G2b 接口不泄漏 SQLite 特性）。",
+  "$defs": {
+    "Export": {
+      "type": "object",
+      "description": "一次事件日志导出的清单文件（与 NDJSON 事件文件配套）。",
+      "required": ["v", "created_at", "watermark_seq", "event_count"],
+      "properties": {
+        "v": {
+          "type": "integer",
+          "description": "契约版本（F7）。"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "source": {
+          "type": "string",
+          "description": "导出来源标识（如 hub 实例名）。"
+        },
+        "watermark_seq": {
+          "type": "integer",
+          "description": "导出已追至的全局 seq 水位（G24）。"
+        },
+        "event_count": {
+          "type": "integer",
+          "description": "导出的事件条数。"
+        }
+      }
+    }
+  }
+}

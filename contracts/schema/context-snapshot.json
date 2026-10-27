@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/context-snapshot.json",
+  "title": "ContextSnapshot",
+  "description": "上下文构成清单（06 §4.2）：由 core 生成、与上下文策略无关——让任何策略组合出的上下文都能被同一套 UI 渲染。每轮一条 durable 事件 context.assembled。",
+  "$defs": {
+    "ContextSnapshot": {
+      "type": "object",
+      "required": ["session_id", "turn", "tokens_used", "tokens_budget", "parts"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "turn": {
+          "type": "integer",
+          "description": "轮次（session 内序号，S2）。"
+        },
+        "tokens_used": {
+          "type": "integer",
+          "description": "已用 token（J21：provider usage 优先，自算兜底）。"
+        },
+        "tokens_budget": {
+          "type": "integer",
+          "description": "窗口预算 token（锚定装配时生效模型的窗口，J21）。"
+        },
+        "parts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ContextPart" },
+          "description": "构成清单。"
+        }
+      }
+    },
+    "ContextPart": {
+      "type": "object",
+      "required": ["source", "kind", "entries", "tokens", "state"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "description": "来源标识（如 base / ledger / rules / tools / history / stage:12）。"
+        },
+        "kind": {
+          "$ref": "#/$defs/PartKind"
+        },
+        "entries": {
+          "type": "integer",
+          "description": "条目数。"
+        },
+        "tokens": {
+          "type": "integer",
+          "description": "占用 token。"
+        },
+        "state": {
+          "$ref": "#/$defs/PartState"
+        },
+        "target_tokens": {
+          "type": "integer",
+          "description": "state=compacted 时的压缩目标占用（可度量压缩效果）。"
+        },
+        "origins": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "被覆盖原文的事件区间引用（如 e:1203..e:1290），可回捞（G6/J14）。"
+        },
+        "summary_ref": {
+          "type": "string",
+          "pattern": "^sum:[0-9A-HJKMNP-TV-Z]{26}$",
+          "description": "摘要引用，sum: 前缀 + ULID（08 命名空间）；沿指针精准下钻（J6/J15）。"
+        }
+      }
+    },
+    "PartKind": {
+      "type": "string",
+      "enum": ["system", "state", "injected", "schema", "history"],
+      "description": "构成类别（core 分类，可增量扩充）。"
+    },
+    "PartState": {
+      "type": "string",
+      "enum": ["verbatim", "compacted", "dropped", "deferred"],
+      "description": "该部分的状态（06 §4.2）。"
+    }
+  }
+}

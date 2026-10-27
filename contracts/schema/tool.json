@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema#",
+  "$id": "https://github.com/Yorha9e/alasol/contracts/schema/tool.json",
+  "title": "Tool",
+  "description": "工具描述契约（D12/D22，跨边界：模型看 + MCP 传输）。执行器是进程内接口，不进本契约。",
+  "$defs": {
+    "Tool": {
+      "type": "object",
+      "required": ["name", "schema", "side_effect", "cancelable", "approvable", "idempotent", "replay"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "工具名（可见性机制：不暴露即不存在，R5——agent_type 的 tools[] 是否含它）。"
+        },
+        "description": {
+          "type": "string",
+          "description": "给模型看的说明。"
+        },
+        "schema": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "参数 JSON Schema（元嵌套：值本身是 JSON Schema → codegen 当原始 JSON 处理，阶段 1 验收项）。"
+        },
+        "side_effect": {
+          "$ref": "common.json#/$defs/SideEffect",
+          "description": "副作用等级（D12）。"
+        },
+        "cancelable": {
+          "type": "boolean",
+          "description": "执行中是否可取消（M2）。"
+        },
+        "approvable": {
+          "type": "boolean",
+          "description": "是否需人审（为 true 时审批缺席 = deny，fail-close，D14/H8）。"
+        },
+        "idempotent": {
+          "type": "boolean",
+          "description": "能否自动重试（M7/X2）：只有声明幂等的操作才自动重试。"
+        },
+        "replay": {
+          "$ref": "common.json#/$defs/ReplayKind",
+          "description": "崩溃续跑时的重放语义（X2）。"
+        },
+        "required_env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "本工具需要注入的凭据 env 键名（H17/H21）：由策略裁决后注入本次调用；事件只记键名不记值。"
+        },
+        "returns": {
+          "type": "object",
+          "description": "返回值能力声明（D22 returns.graph_edges）。",
+          "properties": {
+            "graph_edges": {
+              "type": "boolean",
+              "description": "返回值中可能携带 graph_edges（G22）。"
+            }
+          }
+        }
+      }
+    }
+  }
+}

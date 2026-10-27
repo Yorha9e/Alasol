@@ -46,13 +46,13 @@ kind 是开放字符串（D6），core 定义核心子集。**本阶段必须定
   - 框架 id 字段 schema 标 `pattern: "^[0-9A-HJKMNP-TV-Z]{26}$"`（ULID 26 字符）+ `x-id-kind: "framework"`（S1/S12）
   - provider `tool_call_id` = 不透明 string（`x-id-kind: "provider"`），与 `Event.id` **永不共字段**（S5）；原样存原样回传
   - id 不做修复：字符集/长度不合则拒绝并记事件（S9）
-- **序列化**：JSON Schema + NDJSON（D3）；schema 导出 `contracts/schema/`，随契约版本发布（D20）
+- **序列化**：JSON Schema + NDJSON（D3）；schema 导出 `contracts/schema/`，随契约版本发布（D20）。**基线 = JSON Schema 2020-12**（`$defs`），各文件自带 `$id`（`https://github.com/Yorha9e/alasol/contracts/schema/<file>.json` 命名空间，跨文件 `$ref` 可自解析）；`x-invariants` / `x-kind-payload` 等 `x-` 注记为机器可读约定，codegen 忽略
 - **CI**：生成物入库，「再生成 diff 为空」（阶段 1 点亮 ci.yml 的 schema job）
 
 ## 4. 阶段 1 施工顺序（11 §2）
 
 1. ✅ 冻结本清单（2026-10-27）
-2. 手写 11 份 JSON Schema（`contracts/schema/`，含 §2 三段事件 payload）
+2. ✅ 手写 JSON Schema（2026-10-27 完成）：`contracts/schema/` 共 **12 文件 = 11 契约 + `common.json` 共享原语**（`Ulid` / `ProviderId` / `ReplayKind` / `SideEffect`，其余文件 `$ref` 引用——一个类型只定义一次，同包生成无重名）；含 §2 三段事件 payload。跨文件 `$ref` 形如 `tool-result.json#/$defs/ToolResult`（非循环）
 3. 自写受限 codegen（schema → Go 类型，生成物入库）
 4. TS 最小消费端验证（能读事件流，跨语言中立性）
 5. CI schema job 点亮（再生成 diff 为空）

@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Event",
+  "description": "Event fixture: covers required/optional, $ref, inline nested object, arrays, json.RawMessage and a cross-file $ref.",
+  "$defs": {
+    "Event": {
+      "type": "object",
+      "description": "事件 envelope（fixture）。",
+      "required": ["v", "id", "kind", "ts", "payload"],
+      "properties": {
+        "v": { "type": "integer", "description": "契约版本" },
+        "id": { "$ref": "#/$defs/Ulid", "description": "事件唯一 id" },
+        "kind": { "type": "string", "description": "点分命名空间，如 tool.call.intent" },
+        "ts": { "type": "string", "format": "date-time" },
+        "session_id": { "$ref": "#/$defs/Ulid" },
+        "agent_id": { "$ref": "#/$defs/Ulid" },
+        "seq": { "type": "integer" },
+        "durable": { "type": "boolean" },
+        "payload": {
+          "type": "object",
+          "x-go-type": "json.RawMessage",
+          "description": "载荷：原始 JSON，形状由 kind 决定"
+        },
+        "binary_ref": { "type": "string" },
+        "meta": {
+          "type": "object",
+          "description": "内联嵌套对象。",
+          "required": ["trace_id"],
+          "properties": {
+            "trace_id": { "type": "string" },
+            "retry": { "type": "integer" },
+            "labels": { "type": "object" }
+          }
+        },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "edges": { "type": "array", "items": { "$ref": "tool-result.json#/$defs/GraphEdge" } },
+        "scores": { "type": "array", "items": { "type": "number" } },
+        "flags": { "type": "array", "items": { "type": "boolean" } }
+      }
+    },
+    "Ulid": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+      "description": "框架 id：ULID，26 字符。"
+    }
+  }
+}
