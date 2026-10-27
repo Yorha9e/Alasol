@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–8 全部完成**（2026-10-27）：contracts（12 schema+codegen+Go 类型+TS 消费端）+ core 全链（bus/policy/registry/loop/agents/gate/**durable**）+ runtime 全链 + host/transport/客户端；各阶段评审循环均 clean（累计 30+ 修复闭环）；真模型 API 调用待凭据。进行 v0 酸测试总验收 |
+| **代码** | **v0 全部完成并终验收 ACCEPTED**（2026-10-27）：阶段 0–8 全部通过退出评审循环（critic clean），v0 酸测试 11 条逐条实测核销（06 §5）；22 包全测试 + race 干净 + codegen 零漂移 + TS 消费端三件套绿；唯一代办：**真模型 API 调用待凭据**（provider 已由 httptest 全覆盖） |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |

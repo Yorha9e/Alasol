@@ -28,7 +28,7 @@
 
 > **本项目已全量交接**：设计侧工作收尾，后续施工全部在另一 session 进行。
 > 施工入口 → [`docs/research/11-construction-plan.md`](docs/research/11-construction-plan.md)（含**环境与工具链事实**、阶段划分、硬验收、20 条施工期陷阱清单）。
-> **阶段 0–8 全部完成**（2026-10-27，每阶段通过退出评审循环 critic clean）：contracts → core（bus/policy/registry/loop/agents/gate/durable）→ runtime（SQLite/索引器/回放/provider/工具/审批/gate 执行/传输/verify）→ host + Web UI/CLI。进行 v0 酸测试总验收。命名已定：`alasol` · `github.com/Yorha9e/alasol`。
+> **v0 已完成并通过终验收**（2026-10-27，ACCEPTED）：阶段 0–8 全部完成（每阶段通过 critic→reviewer 退出评审循环），v0 酸测试 11 条逐条实测核销。用法：`alasol run/chat/serve/resume`。命名：`alasol` · `github.com/Yorha9e/alasol`。唯一待办：真模型 API 调用待凭据。
 
 - 目标已收敛：**搭一套可自定义、可拓展的骨架**（ACP 等具体特性后置），在骨架之上向任意方向扩展
 - **骨架验收标准（酸测试）**：把任意一个扩展点的实现整个换掉，core 代码一行不改
