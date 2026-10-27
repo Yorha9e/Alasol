@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–3 已完成**（2026-10-27）：仓库/CI/契约 + core 骨架（69 测）+ runtime（SQLite 事件日志 + 索引器 + 回放，含并发/乱序/崩溃续跑测试）；阶段 3 退出评审循环 critic clean（3 p1 + 9 p2 闭环）；下一步：阶段 4 loop + 真机回路 |
+| **代码** | **阶段 0–4 已完成**（2026-10-27）：core（bus/policy/registry/**loop 三段写路径**）+ runtime（SQLite/索引器/回放/**OpenAI 兼容 provider**/read·write·bash/终端审批）+ `cmd/alasol` 装配入口 + E2E；阶段 4 评审循环 3 轮（2 p1 + 5 p2）clean；真模型 API 调用待凭据。下一步：阶段 5 多 agent |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -149,7 +149,10 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 - agent loop 状态机 / 一个真 provider / read·write·bash 工具 / **env 注入 v0 子集**（H21：session + 单次调用两级作用域，**不给模型看任何 env**）
 - **写路径从第一个真实工具调用起就用三段事件**（`intent` → 执行 → `result`，X1）——阶段 8 只补 checkpoint / resume / ownership 的机器，**不回头改写路径**
 - **审批策略**：`deny-all` Approver 为**默认**（验 fail-close）；真机回路用 `always-allow` **显式开启**；**阶段 4 末尾补最小终端审批**（顺带验证 Approval 跨边界契约，让用户能自己跑通真机回路）
-- **验收**：真实仓库里跑通一次工具调用；**凭据永不进 prompt / 事件 / 日志**；事件流含完整 intent→result 三段
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean；真模型 API 调用待凭据，机制已由 E2E+httptest 覆盖）：
+  - [x] 真实仓库里跑通一次工具调用（E2E：真 SQLite + 真工具 + 真落盘 + 三段事件断言）
+  - [x] **凭据永不进 prompt / 事件 / 日志**（注入值精确 redact + 凭据分类收口）
+  - [x] 事件流含完整 intent→result 三段（X1，每调用恰好一对）
 
 ### 阶段 5 · 多 agent（v0 切片 ②）
 - `agent_type` 体系（含 `can_spawn`）/ spawn / **结构化 summary**（`refs` + `taint`）/ agent 树 / **父↔直系子可见**
