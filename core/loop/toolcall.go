@@ -8,6 +8,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/policy"
 )
 
@@ -23,7 +24,7 @@ import (
 //
 //	tool.call.intent → （不执行）tool.call.failed      ← deny / 工具缺失 / 执行失败
 //	tool.call.intent → 执行 → tool.call.completed      ← 执行成功
-func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq) (string, int, error) {
+func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, st *runState) (string, int, error) {
 	// a. policy 先判（fail-close）：判定只约束发起时刻（M9/陷阱 15），快照进 intent。
 	dec := policy.Decide(ctx, l.policy, l.approver, policy.Query{
 		Tool:      tc.Name,
@@ -69,6 +70,12 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq) (
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeBadArguments, badArgsDetails(tc.Args), events)
 	}
 
+	// c''. 生效权限收窄（H11/H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予）：
+	// 声明的权限是**上限**，超出即 deny，**不可被全局 allow 规则放宽**。
+	if denied, reason := l.permDenial(tc.Name); denied {
+		return l.failToolCall(ctx, &intentID, tc.ID, reason, CodePermDenied, nil, events)
+	}
+
 	// c. deny（含 ask 被 DenyAll 拒、无命中 fail-close）→ ③ failed，**不执行**。
 	if dec.Verdict != contracts.EffectAllow {
 		// 工具压根没注册时，主因是"工具不存在"（策略无命中只是连带现象）——
@@ -105,6 +112,8 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq) (
 	// 秘密收口（P1-1）：工具输出（命令回显）进事件、进下一轮 prompt 之前，
 	// 把**框架注入的值**逐个精确替换成 "***"。命令自己的输出是数据，原样保留。
 	res = redactResult(res, secrets)
+	// Q7：累积本次 Run 的最高污点级（工具输出可能带 taint；供 complete 时继承）。
+	st.acc.observe(res.Taint)
 	if execErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// ctx 取消：尽力补一条 failed（X1：有意图就要有结果），再返回取消语义。
@@ -131,6 +140,49 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq) (
 		return "", events, fmt.Errorf("loop: 工具 %q 的 completed 事件落盘失败: %w", tc.Name, err)
 	}
 	return toolResultText(res), events, nil
+}
+
+// permDenial 判定工具是否被本 agent 的**生效权限**禁止（H11/H22）。
+//
+// 生效权限 = 请求 ∩ ceiling ∩ 父级授予（树里节点的 perm；闸门③保证子 ⊆ 父）。
+// 这层约束是**强制并入**的：超出即 deny，**不可被全局 allow 规则放宽**
+// ——声明的权限是上限，不是建议（否则"声明 write=none 的子 agent"照样能写）。
+//
+// 工具所需的权限维度由 side_effect + 是否执行类推导（agents.RequiredCapabilities）。
+//
+// 单 agent 模式（没有 agent 树）→ 不受 perm 约束（ok=false）。
+func (l *Loop) permDenial(toolName string) (bool, string) {
+	perm, ok := l.effectivePerm()
+	if !ok {
+		return false, "" // 单 agent 模式：无 perm 约束
+	}
+	side := contracts.SideEffectNone
+	if entry, known := l.registry.Get(toolName); known && entry.Tool != nil {
+		side = entry.Tool.SideEffect
+	}
+	needs := agents.RequiredCapabilities(toolName, side)
+	var missing []string
+	for _, c := range needs {
+		if !agents.PermCovers(perm, c) {
+			missing = append(missing, string(c))
+		}
+	}
+	if len(missing) == 0 {
+		return false, ""
+	}
+	return true, fmt.Sprintf(
+		"fail-close: 工具 %q 需要权限 %s，但本 agent 的生效权限是 %s，未授予 %s（声明的权限是上限，不可被 allow 规则放宽）",
+		toolName, strings.Join(missing, "/"), agents.PermString(&perm), strings.Join(missing, "/"))
+}
+
+// effectivePerm 取本 agent 的生效权限（树里节点的 perm）。
+//
+// 没有 agent 树（单 agent 模式）→ ok=false = 不受 perm 约束。
+func (l *Loop) effectivePerm() (contracts.PermissionRequest, bool) {
+	if l == nil || l.agents == nil || l.agents.Tree == nil {
+		return contracts.PermissionRequest{}, false
+	}
+	return l.agents.Tree.PermOf(l.agentID)
 }
 
 // failToolCall 落一条 tool.call.failed 并规约成 runToolCall 的返回三元组：

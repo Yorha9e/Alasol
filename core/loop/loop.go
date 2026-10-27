@@ -45,6 +45,8 @@ const (
 	CodeToolError = "tool_error"
 	// CodeBadArguments 工具参数不满足契约（不是合法 JSON 对象）→ 普通失败，模型可改。
 	CodeBadArguments = "bad_arguments"
+	// CodePermDenied 工具所需的权限维度超出本 agent 的**生效权限**（H11/H22 收窄）。
+	CodePermDenied = "permission_denied"
 	// CodeLoopError loop 自身出错（模型调用失败 / intent 落盘失败）。
 	CodeLoopError = "loop_error"
 )
@@ -84,13 +86,19 @@ type Config struct {
 	SessionEnv core.EnvScope
 	// MaxTurns 单次 Run 的最大轮数（0 = DefaultMaxTurns；防模型失控）。
 	MaxTurns int
+	// Agents 多 agent 环境（阶段 5）。nil = 单 agent 模式（默认，向后兼容）：
+	// 不注入 spawn/complete、不用 agent 树、不过滤工具。
+	Agents *Agents
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
 //
-// 并发：Loop 本身无可变状态（每轮历史都是 Run 的局部变量）→ 同一个 Loop 可被多个
-// goroutine 并发 Run（各自独立历史）。但"一个 session 只由其宿主进程 append"（G25，
-// session 亲和写）是部署层约束：并发 Run 同一 session 时，事件 seq 是提交序而非因果序。
+// 并发：Loop 本身无可变状态（每轮历史、污点累积、spawn 缓存都是 Run 的局部变量）→ 同一个
+// Loop 可被多个 goroutine 并发 Run（各自独立历史）。但"一个 session 只由其宿主进程 append"
+// （G25，session 亲和写）是部署层约束：并发 Run 同一 session 时，事件 seq 是提交序而非因果序。
+//
+// 多 agent（阶段 5）：Agents 非 nil 时，本 loop 是其 AgentID 对应 agent 的一次执行；spawn 会
+// 另起一个共享 Bus/Registry/Provider 的子 loop（child.AgentID）同步跑子任务。
 type Loop struct {
 	provider   core.Provider
 	bus        *bus.Bus
@@ -103,18 +111,26 @@ type Loop struct {
 	system     string
 	sessionEnv core.EnvScope
 	maxTurns   int
+	agents     *Agents
 }
 
 // Result 是一次 Run 的产出。
 type Result struct {
-	// Text 模型最终文本（无工具调用那一轮的 Text；MaxTurns 截断时为最后一轮的 Text）。
+	// Text 模型最终文本（无工具调用那一轮的 Text；MaxTurns 截断时为最后一轮的 Text；
+	// 子 agent 经 complete 收敛时为 summary.Text）。
 	Text string
 	// Turns 实际发生的模型调用轮数。
 	Turns int
 	// ToolCalls 本 Run 执行的工具调用次数（含被 deny / 失败的：模型发起了就算一次）。
 	ToolCalls int
-	// Events 本 Run 成功落库的 durable 事件数（intent + completed/failed + loop.error）。
+	// Events 本 Run 成功落库的 durable 事件数（intent + completed/failed + loop.error +
+	// agent.spawned/completed/failed；子 loop 的事件计入父的 spawn 调用）。
 	Events int
+	// Summary 子 agent 经 complete 收敛时的结构化汇报（根 agent / 未收敛为 nil）。
+	Summary *contracts.AgentSummary
+	// Taint 本次 Run 累积的最高污点级（Q7；空 = clean）。父 agent 据其在子异常冒泡时标注
+	// summary 的 taint；根 agent 上为信息量（v0 无根 summary）。
+	Taint string
 }
 
 // New 构造 Loop 并校验必填项。
@@ -162,6 +178,7 @@ func New(cfg Config) (*Loop, error) {
 		system:     cfg.System,
 		sessionEnv: cfg.SessionEnv,
 		maxTurns:   maxTurns,
+		agents:     cfg.Agents,
 	}, nil
 }
 
@@ -186,7 +203,7 @@ func validateUlid(field string, id contracts.Ulid) error {
 //   - intent 事件落盘失败 → 返回 error 且**不执行**该工具调用（X1：没有意图记录就不许有副作用）；
 //   - 工具被 deny / 执行失败 / 工具缺失 → **不是** Run 的错误：它们已按三段写路径落
 //     failed 事件，错误文案回填给模型让它自我修正（M5），loop 继续。
-func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
+func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 	if l == nil {
 		return Result{}, errors.New("loop: Loop 为 nil")
 	}
@@ -194,14 +211,16 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 		return Result{}, err
 	}
 
+	// 每次 Run 的局部可变状态（不进 Loop 字段 → Loop 保持无可变状态以支持并发 Run）。
+	st := &runState{}
+	// 无论从哪条路径返回，都把本次累积的污点级写进 Result（Q7；空归一为 clean）。
+	defer func() { res.Taint = normalizeTaint(st.acc.level) }()
+
 	// 每轮历史都是局部变量：同一 Loop 可被并发 Run 而不互相污染。
 	history := make([]core.Message, 0, 8)
 	history = append(history, core.Message{Role: "user", Content: prompt})
 
-	var (
-		res      Result
-		lastText string
-	)
+	var lastText string
 
 	for turn := 1; turn <= l.maxTurns; turn++ {
 		// ctx 取消优先于任何模型调用：立即返回，不再发起新副作用。
@@ -239,7 +258,24 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 		})
 		for _, tc := range mr.ToolCalls {
 			res.ToolCalls++
-			text, events, err := l.runToolCall(ctx, turn, tc)
+			if l.isAgentTool(tc.Name) {
+				// 多 agent 生命周期工具（spawn / complete）。
+				text, events, stop, err := l.runAgentTool(ctx, turn, tc, st)
+				res.Events += events
+				if err != nil {
+					res.Text = lastText
+					return res, err
+				}
+				history = append(history, core.Message{Role: "tool", Content: text, ToolCallID: tc.ID})
+				if stop != nil {
+					// complete：本（子）loop 就此收敛，Result 带上结构化 summary。
+					res.Summary = stop
+					res.Text = stop.Text
+					return res, nil
+				}
+				continue
+			}
+			text, events, err := l.runToolCall(ctx, turn, tc, st)
 			res.Events += events
 			if err != nil {
 				// 写路径断裂（intent 没落盘 / ctx 取消）：中止，不编造结果。
@@ -281,19 +317,63 @@ func (l *Loop) request(history []core.Message) core.ModelRequest {
 //
 // 过滤口径（H4 字面）：**deny = 移出模型可见集**（裸工具名 deny）；
 // ask 保持可见——审批回路要靠模型发起调用才走得通，人审发生在调用时刻。
+//
+// 多 agent（阶段 5）在此叠加两层：
+//   - **type.Tools 过滤**（R5：不暴露即不存在）：若本 agent 在树中且有类型，则只有该类型
+//     Tools 列内的注册工具可见（子 loop 的 tools=type.Tools）；
+//   - **生命周期工具注入**：can_spawn 非空 → 注入 spawn；子 agent（depth>1）→ 注入 complete。
+//     二者由类型可达性/深度控制（K20/K21），不经注册表/policy（三闸门才是授权）。
 func (l *Loop) visibleTools() []contracts.Tool {
+	var (
+		typeFilter map[string]bool // 非 nil 时按类型 Tools 收窄注册工具
+		canSpawn   bool
+		isSubagent bool
+	)
+	if l.agents != nil && l.agents.Tree != nil {
+		if node, ok := l.agents.Tree.Get(l.agentID); ok {
+			isSubagent = node.Depth > 1
+			if ct, ok := l.agents.Tree.TypeOf(l.agentID); ok {
+				typeFilter = stringSet(ct.Tools)
+				canSpawn = len(ct.CanSpawn) > 0
+			}
+		}
+	}
+
 	entries := l.registry.List(registry.ExtensionKindTool)
-	out := make([]contracts.Tool, 0, len(entries))
+	out := make([]contracts.Tool, 0, len(entries)+2)
 	for _, e := range entries {
 		if e.Tool == nil {
 			continue // 非工具扩展（kind 不匹配时已被 List 过滤；Tool 为 nil 是装配残缺）
+		}
+		if typeFilter != nil && !typeFilter[e.Tool.Name] {
+			continue // R5：类型未列出的工具不暴露
 		}
 		if !l.toolVisible(e.Tool.Name) {
 			continue // H4：被 deny 的工具移出模型可见集
 		}
 		out = append(out, *e.Tool)
 	}
+
+	// 生命周期工具注入（阶段 5）。它们**也要过策略**（P2-4：spawn/complete 不许绕过
+	// 策略）：被 deny 的生命周期工具不进模型可见集。
+	if l.agents != nil && l.agents.Tree != nil {
+		if canSpawn && l.toolVisible(ToolSpawn) {
+			out = append(out, spawnToolDesc())
+		}
+		if isSubagent && l.toolVisible(ToolComplete) {
+			out = append(out, completeToolDesc())
+		}
+	}
 	return out
+}
+
+// stringSet 把字符串列表转成集合（type.Tools 过滤用）。
+func stringSet(list []string) map[string]bool {
+	m := make(map[string]bool, len(list))
+	for _, s := range list {
+		m[s] = true
+	}
+	return m
 }
 
 // toolVisible 判定工具是否在模型可见集里（H4：裸工具名 deny = 移出可见集）。

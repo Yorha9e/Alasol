@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–4 已完成**（2026-10-27）：core（bus/policy/registry/**loop 三段写路径**）+ runtime（SQLite/索引器/回放/**OpenAI 兼容 provider**/read·write·bash/终端审批）+ `cmd/alasol` 装配入口 + E2E；阶段 4 评审循环 3 轮（2 p1 + 5 p2）clean；真模型 API 调用待凭据。下一步：阶段 5 多 agent |
+| **代码** | **阶段 0–5 已完成**（2026-10-27）：core（bus/policy/registry/loop/**agents**：三闸门/可见性/taint/幂等键按 (父,request)）+ runtime 全链 + `cmd/alasol`；阶段 5 评审循环 3 轮（2 p1 + 5 p2）clean；真模型 API 调用待凭据。下一步：阶段 6 最小门禁 |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -156,11 +156,11 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 
 ### 阶段 5 · 多 agent（v0 切片 ②）
 - `agent_type` 体系（含 `can_spawn`）/ spawn / **结构化 summary**（`refs` + `taint`）/ agent 树 / **父↔直系子可见**
-- **验收**：
-  - [ ] 主 agent 拆任务 → spawn 带 role 的 subagent → 收回 summary → refs 可核验
-  - [ ] 深度超限**运行时拒绝**
-  - [ ] tainted summary 被主 agent 按不可信数据处理
-  - [ ] 异常向上冒泡（子 agent 失败/卡住 → 父的 summary 报告）
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] 主 agent 拆任务 → spawn 带 role 的 subagent → 收回 summary → refs 可核验
+  - [x] 深度超限**运行时拒绝**（三闸门：深度/类型/权限，K17）
+  - [x] tainted summary 被主 agent 按不可信数据处理（taint 只升不降 + ⚠ 前缀）
+  - [x] 异常向上冒泡（子 agent 失败/卡住 → 父的 summary 报告，abnormal 标记）
 
 ### 阶段 6 · 最小门禁（v0 切片 ③）
 - 不透明命令（仓库级注入）/ **一次性快照 worktree** / **receipt 四要素校验** / **最小 CI baseline**（W9c）
@@ -208,6 +208,7 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 | 18 | **改 module path 的代价** | 现在定死（已定 `github.com/Yorha9e/alasol`） |
 | 19 | **三段事件后补** | `tool.call.intent` 必须在**阶段 1** 进契约、写路径在**阶段 4** 就用——阶段 8 再补会返工所有工具调用点 |
 | 20 | **红仓上建不起 baseline** | baseline 必须支持**「只记录不阻断」**地首次建立，否则第一次跑就死锁 |
+| 21 | **exec 维度靠工具名名单（v0 边界）** | 契约 `side_effect` 无 exec 枚举 → 生效权限收窄对执行类工具只能按名字判定（bash/exec/shell/sh/cmd/command/run/powershell/pwsh）；**名单外的执行类工具（python/make 等）不享 exec 收窄**（write 维度仍在）。根治 = 工具注册期显式声明所需能力（阶段 6 可做），别再扩名单 |
 
 ---
 

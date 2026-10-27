@@ -64,4 +64,30 @@
 // 工具参数必须是**合法 JSON 对象**（契约：arguments 是 object）。不合时走普通失败
 // 路径：intent 照落（arguments 置 {}，原文进 error.details）→ tool.call.failed
 // （code=bad_arguments，文案告诉模型怎么改）→ loop 继续不中止。
+//
+// # 多 agent（阶段 5）
+//
+// Config.Agents 非 nil 时启用（nil = 单 agent，默认，向后兼容）。本 loop 即其 AgentID 对应
+// agent 的一次执行；注入两个**框架内部**生命周期工具（不经注册表/policy，仍遵循 X1）：
+//
+//   - spawn{agent_type,role,task,request_id}：过 core/agents 树的三闸门（K17：深度/类型/权限）
+//     → 落 agent.spawned（agent_id=child）→ 起一个**同 Bus/Registry/Provider/SessionID** 的子
+//     loop（AgentID=child.ID，Model/System/tools 取自 child 的 AgentType）同步跑 task → 收回
+//     子经 complete 产出的 summary 作为本调用的 ToolResult 返回父。闸门拒绝 → tool.call.failed
+//     （模型可读，loop 继续）；子出错 / MaxTurns 截断 → 异常冒泡（agent.failed + abnormal summary）。
+//   - complete{text,refs,taint}（子 agent 专属）：落 agent.completed 并停本 loop（Result 收敛）。
+//
+// 可见性由类型自然涌现（K20/K21）：spawn 只对 can_spawn 非空的 agent 可见；complete 只对
+// 子 agent（depth>1）可见；注册工具再按 agent_type.Tools 收窄（R5）。summary 强制带 taint
+// （Q7：继承来源最高污点级，只能升不能降）；父收到 tainted summary 时工具结果加
+// ⚠ [untrusted data] 前缀并按不可信数据处理。
+//
+// X5 幂等：同 **(parent_agent_id, spawn_request_id)** 的重复 spawn 返回同一 child、不重跑；
+// 换父或换类型都要换 request_id（换类型复用 → 冲突错误，不把别人的 child 交出去）。
+//
+// 生命周期工具（spawn/complete）**也要过策略**（与普通工具同款）：被 deny 的不进模型
+// 可见集，硬调也落 failed 不执行。子 agent 的**生效权限**（请求 ∩ ceiling ∩ 父级授予）
+// 在运行期约束它的工具调用：所需权限维度超出即 deny，全局 allow 规则不能放宽它
+// （H11/H22：声明的权限是上限）。Loop 仍无可变状态（污点累积 / spawn 缓存都是 Run 的
+// 局部变量）→ 可并发 Run。
 package loop

@@ -100,3 +100,47 @@ type BoardWrittenPayload struct {
 	// 写入者标识（可选，如 agent_id）。
 	Author *string `json:"author,omitempty"`
 }
+
+// agent.spawned —— 子 agent 派生（K17/X5）：父 agent 在 spawn 时由三闸门（深度/类型/权限，K17）放行后落盘；spawn_request_id 是续跑找回同一 child 的幂等键（X5：同 request 不新建）。
+type AgentSpawnedPayload struct {
+	// 父 agent id（树中的直系父，K26）。
+	ParentAgentID Ulid `json:"parent_agent_id"`
+	// 新派生的子 agent id（ULID，K26）。
+	ChildAgentID Ulid `json:"child_agent_id"`
+	// 子 agent 的能力模板类型 id（K16：类型可达性）。
+	AgentType string `json:"agent_type"`
+	// 部门标签（K13）：由父 agent 在 spawn 时指定，与 agent_type 正交；自由文本、可重复。
+	Role string `json:"role"`
+	// 子 agent 在树中的深度（root=1；child.depth = parent.depth + 1）。
+	Depth int64 `json:"depth"`
+	// spawn 幂等键（X5）：续跑按 (parent_agent_id, spawn_request_id) 找回同一 child，不新建。
+	SpawnRequestID Ulid `json:"spawn_request_id"`
+}
+
+// 子 agent 的结构化完成汇报（K24）：subagent 回到主 agent 上下文的唯一通道。taint 强制携带（Q7/陷阱 13：summary 是注入载荷出口，继承来源事件最高污点级）。
+type AgentSummary struct {
+	// 汇报正文（做了什么 / 改了哪些文件 / 结论 / 下一步 / 问题）。
+	Text string `json:"text"`
+	// 可核验引用（K24）：文件路径、事件 seq 区间（e:<seq>）等；主 agent 可用 Inquiry 拉原文核验。
+	Refs []string `json:"refs,omitempty"`
+	// 污点级（Q7/H13）：继承来源事件的最高污点级；级别集由 core 定义（clean / untrusted）。tainted summary 按不可信数据处理，不当指令执行。
+	Taint string `json:"taint"`
+	// 异常冒泡标记（K23）：子 agent 失败 / 卡住 / MaxTurns 截断时为 true，text 写失败原因。
+	Abnormal *bool `json:"abnormal,omitempty"`
+}
+
+// agent.completed —— 子 agent 经 complete(summary) 正常收敛（K24）：summary 作为主 agent 收回的汇报，停子 loop。
+type AgentCompletedPayload struct {
+	// 完成的 agent id（= child_agent_id）。
+	AgentID Ulid `json:"agent_id"`
+	// 结构化 summary（含 taint 标注，Q7）。
+	Summary AgentSummary `json:"summary"`
+}
+
+// agent.failed —— 子 agent 失败 / 卡住的冒泡通道（K23）：child Run 返回 error 或 MaxTurns 截断时落盘，异常向上冒泡到直系父 agent。
+type AgentFailedPayload struct {
+	// 失败的 agent id（= child_agent_id）。
+	AgentID Ulid `json:"agent_id"`
+	// 失败原因（复用 ToolCallError：模型可读 message + 分类 code）。
+	Error ToolCallError `json:"error"`
+}

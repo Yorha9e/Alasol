@@ -52,6 +52,29 @@ func (l *Loop) newEvent(kind string, causation *contracts.Ulid, payload any) (co
 	}, nil
 }
 
+// newAgentEvent 组装一条归属到**指定 agent**（而非 l.agentID）的 durable 事件（阶段 5）。
+//
+// 用于父 loop 代子 agent 落生命周期事件：agent.spawned / agent.failed 由父 loop 发出，但
+// agent_id 必须是 child（K25：靠 agent_id 区分视角；这些事件描述的是 child 的生命周期）。
+// session 仍用 l.sessionID（同 session 单流，K25）。
+func (l *Loop) newAgentEvent(agentID contracts.Ulid, kind string, causation *contracts.Ulid, payload any) (contracts.Event, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return contracts.Event{}, fmt.Errorf("loop: 序列化 %s 事件 payload 失败: %w", kind, err)
+	}
+	return contracts.Event{
+		V:           1,
+		ID:          core.NewUlid(),
+		Kind:        kind,
+		TS:          nowRFC3339(),
+		SessionID:   l.sessionID,
+		AgentID:     agentID,
+		CausationID: causation,
+		Durable:     true,
+		Payload:     raw,
+	}, nil
+}
+
 // publish 经 bus 发布一批 durable 事件，返回成功落库条数（用于 Result.Events 计数）。
 //
 // bus.Publish 对 durable 事件是"整批入库成功才通知"，失败即返回 error——调用方据此
