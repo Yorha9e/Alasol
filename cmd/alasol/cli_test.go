@@ -83,6 +83,31 @@ func captureStdout(t *testing.T) (stop func() string) {
 	}
 }
 
+// captureStderr 捕获 os.Stderr 的输出（与 captureStdout 同款）。
+func captureStderr(t *testing.T) (stop func() string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	var buf bytes.Buffer
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(&buf, r)
+	}()
+	return func() string {
+		_ = w.Close()
+		os.Stderr = old
+		wg.Wait()
+		_ = r.Close()
+		return buf.String()
+	}
+}
+
 // freePort 找一个空闲 loopback 端口（先听后关，测试里够用）。
 func freePort(t *testing.T) int {
 	t.Helper()

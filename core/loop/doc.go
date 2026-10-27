@@ -44,6 +44,14 @@
 // 崩溃语义（X1）：**有 intent 无 result = 未知结果，不盲目重跑**。本层只保证写路径顺序
 // （intent durable 成功才执行），恢复/重放在阶段 8 按 X2 的 replay 语义处理。
 //
+// # 阶段 8 durable 集成（core/durable）
+//
+//   - Config.Store 非 nil + Config.CheckpointEvery>0 → 每个有工具调用的 turn 末自动建一次
+//     checkpoint（X3，尽力而为，落盘失败不中止 Run）；Loop.Checkpoint(ctx) 手动建；
+//   - *Loop 同时实现 core/durable.Replayer：崩溃恢复时 durable.Resume 对 replay=safe（及
+//     verify 核验不通过）的操作调 Loop.Replay——按原 intent **再次执行工具并落结果事件**，
+//     不重跑策略链（M9：T0 已授权）、不走模型。恢复编排 / verify 核验 / ownership 在 core/durable。
+//
 // # fail-close 铁律（H8/陷阱 9）
 //
 //   - 策略无命中 / 引擎为 nil / Approver 为 nil（= DenyAll）/ 审批出错 → 一律 deny，不执行；

@@ -73,7 +73,7 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **阶段 0–7 已完成**（2026-10-27）：core 全链 + runtime 全链 + **host/transport/客户端**（WS+NDJSON、Web 三面板、CLI chat/serve/run、loop 每轮 context.assembled）；阶段 7 评审循环 2 轮（1 p1 loopback 域名绕过）clean；真模型 API 调用待凭据。下一步：阶段 8 durable（最后阶段） |
+| **代码** | **阶段 0–8 全部完成**（2026-10-27）：contracts（12 schema+codegen+Go 类型+TS 消费端）+ core 全链（bus/policy/registry/loop/agents/gate/**durable**）+ runtime 全链 + host/transport/客户端；各阶段评审循环均 clean（累计 30+ 修复闭环）；真模型 API 调用待凭据。进行 v0 酸测试总验收 |
 | **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
@@ -179,7 +179,9 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 
 ### 阶段 8 · durable（X 区）—— **只做"机器"，写路径形状已在阶段 1/4 定**
 - checkpoint（seq 水位 + ledger 版本 + in-flight + 树投影版本）/ resume / ownership（`spawn_request_id` 防重复 spawn）
-- **验收**：kill -9 后能续跑且**不重复副作用**；`replay:"verify"` 的操作先核验外部状态再决定
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean）：
+  - [x] kill -9 后能续跑且**不重复副作用**（真子进程 Kill 测试 + 会话级原子认领防并发重放）
+  - [x] `replay:"verify"` 的操作先核验外部状态再决定（Verifier 接口 + git anchor 核验器 + 核验出错转 manual fail-safe）
 
 ### v1（不在 v0）
 切片 ①（hub + 多 session 发现表 + gate）/ 多 worktree 隔离 / 完整 TUI / MCP server / 深度压缩 / 评测

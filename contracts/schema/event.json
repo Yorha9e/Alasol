@@ -21,7 +21,10 @@
         "agent.completed": "AgentCompletedPayload",
         "agent.failed": "AgentFailedPayload",
         "gate.checked": "GateCheckedPayload",
-        "context.assembled": "ContextSnapshot"
+        "context.assembled": "ContextSnapshot",
+        "checkpoint.created": "CheckpointCreatedPayload",
+        "session.resumed": "SessionResumedPayload",
+        "session.resume_claimed": "ResumeClaimedPayload"
       },
       "required": ["v", "id", "kind", "ts", "session_id", "agent_id", "durable"],
       "properties": {
@@ -329,6 +332,121 @@
         "elapsed_ms": {
           "type": "integer",
           "description": "门禁命令耗时毫秒（V5：必记，复盘不靠猜）。"
+        }
+      }
+    },
+    "CheckpointCreatedPayload": {
+      "type": "object",
+      "description": "checkpoint.created —— 崩溃恢复锚点（X3）。它本身是一条 durable 事件，内容是四项的引用：① 事件流 seq 水位 ② ledger 快照版本 ③ in-flight 清单 ④ agent 树投影版本。resume 时读最后一个 checkpoint 作为续跑起点。",
+      "required": ["session_id", "seq_watermark", "ledger_seq", "in_flight", "tree_version"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "seq_watermark": {
+          "type": "integer",
+          "description": "事件流 seq 水位（X3①）：本 session 事件的最大 seq（= 该 session 事实流 tip；单 session 部署下等于 store 全局 tip）。"
+        },
+        "ledger_seq": {
+          "type": "integer",
+          "description": "ledger 快照版本（X3②）= 最后一条 ledger.updated 事件的 seq；0 = 本 session 尚无 ledger。"
+        },
+        "in_flight": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/InFlightOp" },
+          "description": "in-flight 清单（X1/X3③）：有 tool.call.intent 而无对应 completed/failed 的操作。"
+        },
+        "tree_version": {
+          "type": "integer",
+          "description": "agent 树投影版本（X3④）= 最后一条 agent.* 事件的 seq；0 = 本 session 尚无 agent 事件。"
+        }
+      }
+    },
+    "InFlightOp": {
+      "type": "object",
+      "description": "in-flight 操作引用（X1/X3）：有 tool.call.intent 而无对应 completed/failed。只存引用（tool_call_id / tool_name / replay / anchors），参数等原文由事件流按 tool_call_id 回查（X3：checkpoint 内容是引用，不是全量副本）。",
+      "required": ["tool_call_id", "tool_name", "replay"],
+      "properties": {
+        "tool_call_id": {
+          "$ref": "common.json#/$defs/ProviderId",
+          "description": "provider 黑盒调用 id（与 intent 同一个；S4/S5 原样）。"
+        },
+        "tool_name": {
+          "type": "string"
+        },
+        "replay": {
+          "$ref": "common.json#/$defs/ReplayKind",
+          "description": "崩溃续跑重放语义（X2）：safe 自动重放 / verify 先核验外部状态 / unsafe 不重放转人工。"
+        },
+        "anchors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Anchor" },
+          "description": "外部可核验锚点（X2 verify 用；从 intent 透传）。"
+        }
+      }
+    },
+    "SessionResumedPayload": {
+      "type": "object",
+      "description": "session.resumed —— 一次 resume 的事实记录（X4⑤）：从哪个 checkpoint 续、对哪些 in-flight 做了什么处置。durable 事件；连跑两次时第二次不重复处置（幂等，见 core/durable）。",
+      "required": ["session_id", "from_checkpoint_seq", "in_flight_disposition"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "from_checkpoint_seq": {
+          "type": "integer",
+          "description": "从哪个 checkpoint 的 seq 水位续（X4①）；0 = 无 checkpoint，全量重建。"
+        },
+        "in_flight_disposition": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/InFlightDisposition" },
+          "description": "本次对每个 in-flight 操作的处置明细（X4③）。"
+        }
+      }
+    },
+    "InFlightDisposition": {
+      "type": "object",
+      "description": "单个 in-flight 操作的处置记录（X2/X4③）：tool_call_id + 处置结论 + 说明。",
+      "required": ["tool_call_id", "disposition"],
+      "properties": {
+        "tool_call_id": {
+          "$ref": "common.json#/$defs/ProviderId"
+        },
+        "disposition": {
+          "$ref": "#/$defs/ResumeDisposition",
+          "description": "处置结论：replayed 已重放 / verified 核验通过未重放 / aborted 本次放弃 / manual 转人工或 agent 判定。"
+        },
+        "detail": {
+          "type": "string",
+          "description": "处置说明（可选，供人工/agent 判定与事后审计）。"
+        }
+      }
+    },
+    "ResumeDisposition": {
+      "type": "string",
+      "enum": ["replayed", "replayed_failed", "verified", "aborted", "manual"],
+      "description": "in-flight 处置结论枚举（X2）：replayed=已自动重放且**成功**（safe，或 verify 核验不通过后重放）；replayed_failed=已自动重放但**失败**（工具侧失败，需人工重做；F7 只增不改义）；verified=核验外部状态通过、判定已完成故不重放；aborted=本次放弃（如 ctx 取消）；manual=unsafe 未知结果，转人工/agent 判定，不盲目重放。"
+    },
+    "ResumeClaimedPayload": {
+      "type": "object",
+      "description": "session.resume_claimed —— resume 认领（X4 并发互斥）：一次 resume 在处置 in-flight 之前对 session 的**原子认领**——同一 session 同时只允许一个 resume 在处置（否则同一 in-flight 会被重放两次，verify 类工具有副作用）。",
+      "required": ["session_id", "attempt_id", "round"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid"
+        },
+        "attempt_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "本次 resume 的尝试 id：认领归属——只有它与**存下来的**认领一致者才是赢家（其余并发者直接报「已有 resume 在进行」并退出）。"
+        },
+        "round": {
+          "type": "integer",
+          "description": "认领轮次（第几次接管）：崩溃后的接管用下一轮，避免与已存在的认领行撞 id（store 的幂等写按 Event.ID 去重）。"
+        },
+        "claimed_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "认领时刻（审计用）。"
         }
       }
     }

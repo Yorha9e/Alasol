@@ -21,6 +21,7 @@ func runMain(args []string) int {
 	allow := fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）")
 	dbPath := fs.String("db", "alasol.db", "事件库路径（SQLite）")
 	maxTurns := fs.Int("max-turns", 0, "最大轮数（0=默认 20）")
+	checkpointEvery := fs.Int("checkpoint-every", 0, "每 N 轮自动 checkpoint（X3；0=只手动）")
 	system := fs.String("system", "", "系统提示")
 	_ = fs.Parse(args)
 	if *prompt == "" {
@@ -32,15 +33,16 @@ func runMain(args []string) int {
 	defer stop()
 
 	r, err := newRunner(runnerOpts{
-		Model:      *model,
-		BaseURL:    *baseURL,
-		APIKey:     os.Getenv(*apiKeyEnv), // 凭据只从 env 取，不进 argv
-		Approval:   *approval,
-		Allow:      *allow,
-		DBPath:     *dbPath,
-		MaxTurns:   *maxTurns,
-		System:     *system,
-		SessionEnv: sessionEnvFromProcess(),
+		Model:           *model,
+		BaseURL:         *baseURL,
+		APIKey:          os.Getenv(*apiKeyEnv), // 凭据只从 env 取，不进 argv
+		Approval:        *approval,
+		Allow:           *allow,
+		DBPath:          *dbPath,
+		MaxTurns:        *maxTurns,
+		CheckpointEvery: *checkpointEvery,
+		System:          *system,
+		SessionEnv:      sessionEnvFromProcess(),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

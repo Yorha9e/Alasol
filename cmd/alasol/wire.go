@@ -31,6 +31,9 @@ type runnerOpts struct {
 	System     string
 	SessionEnv core.EnvScope
 
+	// CheckpointEvery 每 N 轮自动 checkpoint（X3；0 = 只手动）。透传给 loop.Config。
+	CheckpointEvery int
+
 	// provider 覆盖（测试注入脚本 provider；nil = openai）
 	provider core.Provider
 	// approver 覆盖（测试注入；nil = 按 Approval 选）
@@ -69,23 +72,9 @@ func newRunner(opts runnerOpts) (*runner, error) {
 	eng := policy.New(rules...)
 
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
-	fsImpl := local.FS{}
-	execImpl := local.Exec{}
-	descs := tools.Descriptors()
-	execs := map[string]core.ToolExecutor{
-		"read":  tools.NewRead(fsImpl),
-		"write": tools.NewWrite(fsImpl),
-		"bash":  tools.NewBash(execImpl),
-	}
-	for _, d := range descs {
-		ex, ok := execs[d.Name]
-		if !ok {
-			return nil, fmt.Errorf("工具 %q 无执行器", d.Name)
-		}
-		if err := reg.RegisterTool(d, ex); err != nil {
-			st.Close()
-			return nil, fmt.Errorf("注册工具 %s: %w", d.Name, err)
-		}
+	if err := registerBuiltinTools(reg); err != nil {
+		st.Close()
+		return nil, err
 	}
 
 	prov := opts.provider
@@ -106,17 +95,19 @@ func newRunner(opts runnerOpts) (*runner, error) {
 
 	b := bus.New(st)
 	cfg := loop.Config{
-		Provider:   prov,
-		Bus:        b,
-		Registry:   reg,
-		Policy:     eng,
-		Approver:   ap,
-		SessionID:  core.NewUlid(),
-		AgentID:    core.NewUlid(),
-		Model:      opts.Model,
-		System:     opts.System,
-		SessionEnv: opts.SessionEnv,
-		MaxTurns:   opts.MaxTurns,
+		Provider:        prov,
+		Bus:             b,
+		Registry:        reg,
+		Policy:          eng,
+		Approver:        ap,
+		SessionID:       core.NewUlid(),
+		AgentID:         core.NewUlid(),
+		Model:           opts.Model,
+		System:          opts.System,
+		SessionEnv:      opts.SessionEnv,
+		MaxTurns:        opts.MaxTurns,
+		Store:           st, // 阶段 8：同一 store 供 checkpoint / resume
+		CheckpointEvery: opts.CheckpointEvery,
 	}
 	lp, err := loop.New(cfg)
 	if err != nil {
@@ -124,6 +115,27 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		return nil, fmt.Errorf("构造 loop: %w", err)
 	}
 	return &runner{loop: lp, store: st}, nil
+}
+
+// registerBuiltinTools 把 read/write/bash 三个内置工具注册进 reg（run 与 resume 共用）。
+func registerBuiltinTools(reg *registry.Registry) error {
+	fsImpl := local.FS{}
+	execImpl := local.Exec{}
+	execs := map[string]core.ToolExecutor{
+		"read":  tools.NewRead(fsImpl),
+		"write": tools.NewWrite(fsImpl),
+		"bash":  tools.NewBash(execImpl),
+	}
+	for _, d := range tools.Descriptors() {
+		ex, ok := execs[d.Name]
+		if !ok {
+			return fmt.Errorf("工具 %q 无执行器", d.Name)
+		}
+		if err := reg.RegisterTool(d, ex); err != nil {
+			return fmt.Errorf("注册工具 %s: %w", d.Name, err)
+		}
+	}
+	return nil
 }
 
 // Run 跑一轮真机回路。

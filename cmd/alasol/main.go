@@ -8,6 +8,10 @@
 //	          [-api-key-env OPENAI_API_KEY] [-approval deny-all|always-allow|terminal] \
 //	          [-allow read,write,bash] [-db alasol.db] [-max-turns 20] [-system "..."]
 //
+//	alasol resume -session <id> [-db alasol.db] [-verify git|none]
+//	          → 跑 X4 恢复流程（读 checkpoint → fold → 处置 in-flight → session.resumed），
+//	            打印处置明细（safe 重放 / verify 先核验 / unsafe 转人工）
+//
 //	alasol serve [-addr 127.0.0.1:8720] [-db alasol.db] [-model ...] [-allow ...]
 //	          → 起 hub：GET / 是 Web UI、GET /ws 是 NDJSON 事件流、GET /api/* 是在线表/上下文
 //
@@ -35,6 +39,8 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		code = runMain(os.Args[2:])
+	case "resume":
+		code = resumeMain(os.Args[2:])
 	case "serve":
 		code = serveMain(os.Args[2:])
 	case "chat":
@@ -56,6 +62,7 @@ func usage() {
 
 用法：
   alasol run    -prompt <text> [flags]   跑一轮真机回路（单次）
+  alasol resume -session <id> [flags]     恢复一个 session（X4 durable：处置 in-flight）
   alasol serve  [flags]                 起常驻 hub：Web UI + WS 事件流 + HTTP API
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx
 

@@ -93,6 +93,14 @@ type Config struct {
 	// Agents 多 agent 环境（阶段 5）。nil = 单 agent 模式（默认，向后兼容）：
 	// 不注入 spawn/complete、不用 agent 树、不过滤工具。
 	Agents *Agents
+	// Store 事件库句柄（可选，阶段 8 durable）：配置后 Loop.Checkpoint 与自动 checkpoint 才可用。
+	// 它与 Bus 内部持有的 store 是同一个（Bus 已持 store 但不暴露，故此处显式传入以支持 checkpoint）。
+	// nil = 不建 checkpoint（Checkpoint 手动调用返回错误、自动 checkpoint 跳过）。
+	Store core.Store
+	// CheckpointEvery 每 N 轮自动建一次 checkpoint（X3；0 = 只手动，需配置 Store 才生效）。
+	// 自动 checkpoint 是**尽力而为**：落盘失败不中止 Run（Run 的事件本身已 durable，缺 checkpoint
+	// 只意味着 resume 退到全量重建）。
+	CheckpointEvery int
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -119,6 +127,10 @@ type Loop struct {
 
 	// contextBudget 是 ContextSnapshot.tokens_budget 的取值来源（占比分母，J21）。
 	contextBudget int64
+
+	// store / checkpointEvery 支撑阶段 8 durable：手动/自动 checkpoint 与 resume 重放的执行侧。
+	store           core.Store
+	checkpointEvery int
 }
 
 // Result 是一次 Run 的产出。
@@ -175,6 +187,9 @@ func New(cfg Config) (*Loop, error) {
 	if cfg.ContextBudget < 0 {
 		return nil, fmt.Errorf("loop: Config.ContextBudget 不能为负（得到 %d；0 = 用默认 %d）", cfg.ContextBudget, DefaultContextBudget)
 	}
+	if cfg.CheckpointEvery < 0 {
+		return nil, fmt.Errorf("loop: Config.CheckpointEvery 不能为负（得到 %d；0 = 只手动）", cfg.CheckpointEvery)
+	}
 	maxTurns := cfg.MaxTurns
 	if maxTurns == 0 {
 		maxTurns = DefaultMaxTurns
@@ -184,19 +199,21 @@ func New(cfg Config) (*Loop, error) {
 		budget = DefaultContextBudget
 	}
 	return &Loop{
-		provider:      cfg.Provider,
-		bus:           cfg.Bus,
-		registry:      cfg.Registry,
-		policy:        cfg.Policy,
-		approver:      cfg.Approver,
-		sessionID:     cfg.SessionID,
-		agentID:       cfg.AgentID,
-		model:         cfg.Model,
-		system:        cfg.System,
-		sessionEnv:    cfg.SessionEnv,
-		maxTurns:      maxTurns,
-		agents:        cfg.Agents,
-		contextBudget: budget,
+		provider:        cfg.Provider,
+		bus:             cfg.Bus,
+		registry:        cfg.Registry,
+		policy:          cfg.Policy,
+		approver:        cfg.Approver,
+		sessionID:       cfg.SessionID,
+		agentID:         cfg.AgentID,
+		model:           cfg.Model,
+		system:          cfg.System,
+		sessionEnv:      cfg.SessionEnv,
+		maxTurns:        maxTurns,
+		agents:          cfg.Agents,
+		contextBudget:   budget,
+		store:           cfg.Store,
+		checkpointEvery: cfg.CheckpointEvery,
 	}, nil
 }
 
@@ -319,6 +336,10 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 				ToolCallID: tc.ID,
 			})
 		}
+
+		// 阶段 8：turn 末（所有工具调用已解析、无 in-flight）按需自动 checkpoint（X3）。
+		// 尽力而为：落盘失败不中止 Run（Run 的事件已 durable，缺 checkpoint 只让 resume 退到全量重建）。
+		l.maybeCheckpoint(ctx, turn)
 	}
 
 	// MaxTurns 截断：模型还在要工具但轮数用尽（防呆护栏生效）。
