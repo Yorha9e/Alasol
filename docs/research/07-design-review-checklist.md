@@ -144,7 +144,7 @@
 | H12 | 凭据 | 按作用域注入 + 日志脱敏 | · |
 | H13 | 不可信输入 | 工具输出/网页标注来源，视为数据非指令 | · |
 | H14 | env 分层 | 四层分离：**凭据 env**（进 provider）/ **执行 env**（进工具进程）/ **上下文 env**（给模型看，默认不给）/ **作用域覆盖**。v0 未做——v1（env 全分层）再定；v0 只做执行 env（H16/H17/H18） | ★ |
-| H15 | 凭据来源 | 进程 env 读取 + 配置文件；**永不进 prompt / 事件 payload / 日志 / OTel**。v0 未做——v1（凭据来源加配置文件）再定；v0 只读进程 env，且已经 ctx 传递 + 精确 redact 保证不进事件/日志 | ★ |
+| H15 | 凭据来源 | ✅ **拍板（2026-10-28 用户）**：进程 env + **TOML 配置文件**（Windows `%APPDATA%\alasol\config.toml`，其他平台 XDG），**优先级：进程 env > 配置文件**；永不进 prompt/事件/日志（H18/H21 纪律不变）。实现在 v1 | ✅ |
 | H16 | 执行 env 默认 | 工具默认继承**净化后**的父 env（凭据类剥离）；普通 env（PATH/HOME 等）保留。落地：`core.ScrubEnv` 剥离凭据类键（`IsCredentialKey`）与凭据形态值（`IsCredentialValue`：sk-/ghp_/gho_/JWT），普通 env 保留；显式注入的 required_env 在 ScrubEnv 之后叠加（获批凭据不被剥）（实现：core/env.go + core/loop/env.go） | ✅ |
 | H17 | 凭据按需注入 | 工具显式声明 `required_env`，由策略引擎裁决后注入该次调用。落地：工具 `RequiredEnv` 声明的键每个当能力过同一套策略求值（`Query{Tool:"env:"+key}`，E3），allow 才从进程 env 取值注入；deny/ask 未放行 → 不注入（fail-close），注入值进 secrets 供输出脱敏（实现：core/loop/env.go） | ✅ |
 | H18 | 脱敏规则 | deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`）+ 值形态匹配（`sk-`/`ghp_`/JWT）。落地：deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`/`*_CREDENTIAL*`，`IsCredentialKey`）+ 值形态（`sk-`/`ghp_`/`gho_`/JWT，`IsCredentialValue`）；框架注入的秘密值在工具输出进事件/下一轮 prompt 前被 `redactResult`/`redactSecrets` 逐个精确替换成 `***`（零误伤，非法 JSON 退化为 `"***"`）（实现：core/env.go + core/loop/toolcall.go） | ✅ |
@@ -194,7 +194,7 @@
 | J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算。v0 未做——v2（深度压缩：级联候选解）再定；C 案的 goal ledger 已在 v0 事件化落地（J19/X6）备用 | ★ |
 | J19 | goal ledger 提案 | **目标、约束、已完成项、待解项**放在**上下文之外的独立持久存储**，由 agent 在关键点显式更新。压缩任一阶段只读账本 + 目标阶段全文 → 不需要级联；同时根治"目标偏移"。落地：`ledger.updated` durable 事件（全量快照），当前态 = 索引器 `ledger_state` 投影（LWW，seq 守卫），在上下文之外，X6 控制写放大（实现：core/durable/ledger.go + runtime/indexer） | ✅ |
 | J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」**。v0 未做——v2（深度压缩）再定 | ★ |
-| J21 | **tiered% 锚定 + token 计量口径** | 压缩等级的百分比**锚定「装配时生效模型」的窗口**（200k/128k 下档位会漂移），换模型时重算并记事件。**token 计量**：provider usage 事件优先，**自算兜底**（各家 tokenizer 不同）。实现与提案有出入：token 计量**只有自算兜底**（`len/4` 估算，调用前 `context.assembled` 的 tokens_used 恒为估算值）——**provider usage 尚未接入**（`core.ModelResult.Usage` 字段已存在但 loop 无人消费，契约注释的「usage 优先」前半句待落地）；tiered% 锚定未做（属 v2 深度压缩），待确认 | ★ |
+| J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩） | ✅ |
 
 ## K. 进程与多 session
 
@@ -213,8 +213,8 @@
 | K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环 | ✅ |
 | K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效）。v0 未做——v1（gate 水平可见性）再定 | ★ |
 | K13 | **role = 部门标签** | role 近似"部门"（backend / frontend / infra）而非"角色扮演"，**由父 agent 在 spawn 时指定**。与 `agent_type` 正交：`agent_type` = 能力模板（能干什么），`role` = 部门（负责哪块）。role 自由文本、可重复。落地：`agents.Node.Role` 字段 + `agent.spawned` 事件带 `role`，由父在 `Tree.Spawn(..., role, ...)` 指定，与 agent_type 正交（实现：core/agents/tree.go） | ✅ |
-| K14 | **暴露等级 = 注入长度** | 统一为"注入多少事件"：`summary`（0 条事件 + 1 条摘要）/ `n`（最近或最先 n 条事件）/ `full`（全部）。不是字段级过滤，是**窗口长度**。owner 通过 `set_exposure` 或 session 标记调控。v0 未做——v1（在线表注入/暴露等级）再定 | ★ |
-| K15 | **在线表注入** | 主 agent 上下文里**常驻一张在线表**（每个可见 session 一行 summary）。⚠️ **成本随 session 数线性增长** → 必须有上限与筛选（按 gate 过滤、最多 N 个、summary 限长）。v0 未做——v1（在线表注入）再定；v0 UI 已有 `/table` 在线表面板（读 indexer 投影），缺主 agent prompt 常驻注入 | ★ |
+| K14 | **暴露等级 = 注入长度** | ✅ **拍板（2026-10-28 用户）**：窗口长度语义不变（summary/n/full）；**默认 summary**，n 按需升、full 需显式；随 K15 一起可配。实现在 v1 | ✅ |
+| K15 | **在线表注入** | ✅ **拍板（2026-10-28 用户）**：默认 **N=50 行、每行 summary ≤100 token、按 gate 过滤**；**全部参数可配 + 支持动态管理（运行期调整，不写死——用户明确要求）**；注入位置恒在 prompt 末尾（Q4）。实现在 v1 | ✅ |
 | K16 | **深度限制 = 类型可达性（> 计数器）** | 主设计是**类型可达性**：`agent_type.can_spawn` 声明"我能派哪些类型"→ 第 4 层在类型层面就不可达。**数字计数器只是兜底**（`max_agent_depth` 可配置，默认两级委派）。每层成本线性叠加在三条链上：**summary 链**（深度 3 的 summary 是深度 2 的摘要 → 二次失真，同"多次压缩导致目标偏移"是同一个病）、**权限链**（每层 ∩ 父级 → 深度 3 时已很窄，再深一层纯开销）、**审计链**（责任追溯层数）。落地：`AgentType.CanSpawn` + `TypeRegistry.Register` 时 can_spawn 环检测（有向无环），数字深度（maxDepth 默认 3）兜底；只读型 CanSpawn 为空 → 更深层不可达（实现：core/agents/type.go + tree.go） | ✅ |
 | K17 | **spawn 三道闸门** | 全部**运行时强制**（不靠提示词）：① **深度** `child.depth ≤ max_agent_depth` ② **类型** `child.type ∈ parent.can_spawn` ③ **权限** `child.permission ⊆ parent.permission ∩ policy_ceiling`。类型闸门让 `can_spawn` 有向无环，注册时校验。落地：`Tree.Spawn` 三闸门全运行时强制，闸门③经 perm.go 三维 read/write/exec 只收窄（未知级 fail-close 拒）；任一道拒则落 tool.call.failed、不建节点（实现：core/agents/tree.go + perm.go） | ✅ |
 | K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议**。v0 未做——v1（agentlink 完整：Presence/Discover/Inquiry/Broadcast/Handoff 五件套）再定 | ★ |
@@ -227,7 +227,7 @@
 | K25 | 单流多 agent 视图 | 主 agent 与 subagent **共用全局事件流**（G3），靠 `agent_id` 区分。上下文装配 = **按 `agent_id` 对全局流做投影**（主 agent 的视图 = 自身事件 + 子 agent 的 summary + 注入内容；subagent 的视图 = 自身事件 + 注入内容）。subagent 的 trace 因此天然持久、可回放。落地：主/subagent 同 session_id 单流，`newAgentEvent` 让父 loop 代子落 agent.spawned/completed/failed（agent_id=child），子 loop 与父同 Bus/SessionID 仅 AgentID 不同（实现：core/loop/events.go + agenttools.go） | ✅ |
 | K27 | **垂直可见性口径定死** | ✅ 见 K11：**父 ↔ 直系子 可见 + Inquiry 沿父链逐级上查**（不是「全祖先/全后代自动可见」）。三处文档（06 §7.1 / K11 / handoff B#5）已统一 | ✅ |
 | K28 | **Durable 与恢复语义（承重墙）** | 见 X 区（单独成节）。承 X 区全部落地：三段写路径（X1）、replay 三分类（X2）、checkpoint 四要素（X3）、resume 五步（X4）、ownership 幂等键（X5）、ledger 写放大（X6）均在 core/durable + core/loop 实现，kill -9 后可续跑且不重复副作用（实现：core/durable + core/loop/replay.go） | ✅ |
-| K29 | **fork/clone 复制语义** | fork 生成新 id + `parent_id`（S10）；**agent 树 / ledger / gate 成员 / worktree 怎么复制或不复制**必须写死（本条待细化：建议 fork 只复制 ledger 快照与 gate 成员，agent 树与 worktree **不复制**）。v0 未做——v1（fork 语义细化）再定 | ★ |
+| K29 | **fork/clone 复制语义** | ✅ **拍板（2026-10-28 用户，改写原提案）**：fork **只附带上下文**——不复制 ledger/gate 全套（原提案"只复制 ledger 快照与 gate 成员"作废）；主场景 = `/btw` 类旁支命令。**实现后置**（随 /btw 命令落地，不进 v1） | ✅ |
 | K26 | agent 树的 id | `agent_id` = **ULID**（不是递增序列——递增序列在并发 spawn 下不安全，且跨树无意义）；`depth` = int；`parent_agent_id` = ULID 或 null；树内"第几个 subagent" = int64（仅供 UI 显示，非身份）。落地：`agent_id` = `core.NewUlid()`（并发 spawn 安全）、`depth` = int、`parent_agent_id` = ULID 或 nil（root）；树内 spawn 顺序由 `children` 切片记录供 UI 显示（实现：core/agents/tree.go） | ✅ |
 
 ## L. 可观测性与评测
@@ -357,8 +357,8 @@
 | S10 | 变更规则 | resume 保持同 id；fork/clone 生成**新 id + `parent_id`**；归档不改 id | ✅ |
 | S11 | 并发唯一性 | ULID 实现线程安全（时间戳单调 + 随机源加锁 / atomic 计数器）。落地：`core.NewUlid` 线程安全——48bit 毫秒时间戳 + 80bit 随机取自 `crypto/rand`（并发安全无需加锁），降级 `math/rand/v2`（顶层函数同样并发安全）；80bit 随机保证同毫秒内唯一（实现：core/ulid.go） | ✅ |
 | S12 | 校验与契约 | id 入 JSON 前统一校验（字符集/长度/非空/来源标记）；schema 里给每个 id 字段标 `pattern` + `x-id-kind`。落地：`core.ValidUlid` 校验 26 字符 Crockford base32（S9 不合则拒绝不修复），loop/agents/spawn 等入口调用它；schema 侧 id 字段标 `pattern` + `x-id-kind`（实现：core/ulid.go ValidUlid + contracts/schema） | ✅ |
-| S13 | 路径规范化 | `hash(cwd)` 前必须：解析符号链接 → Windows 转小写 → 统一分隔符 → 去尾斜杠。否则同一项目会裂成多个 id。v0 未做——v1（路径规范化：project_id = hash(canonical_cwd)）再定 | ★ |
-| S14 | repo_id 独立 | worktree 隔离下同一仓库有多个 cwd → `project_id` 分目录、`repo_id` 聚合（资产图按 repo 级）。v0 未做——v1（repo_id 独立：hash(canonical_git_root)，资产图按 repo 聚合）再定 | ★ |
+| S13 | 路径规范化 | ✅ **口径拍板（2026-10-28 用户）**：`hash(cwd)` 前必须 **解析符号链接（EvalSymlinks）→ Windows 转小写 → 统一分隔符 → 去尾斜杠**；`project_id = hash(canonical_cwd)`。实现在 v1（与 S14/K12 同批） | ✅ |
+| S14 | repo_id 独立 | ✅ **口径拍板（2026-10-28 用户）**：`repo_id = hash(canonical_git_root)`，worktree 隔离下多个 cwd **按 git root 聚合**（资产图按 repo 级）。实现在 v1（K12 gate 自动加入依赖它） | ✅ |
 | S16 | **命名空间补全** | ✅ 08 的命名空间表补入：`causation_id`（F3）、`gate_id`（K12）、`workflow:<run_id>`、`sum:` 引用（ContextSnapshot）、`parent_agent_id`（K26） | ✅ |
 | S15 | 展示前缀 | 日志/UI 用 `session_id[:8]`，**比较一律用完整值** | · |
 
@@ -370,7 +370,7 @@
 | Q2 | 注入源清单 | system/基础提示 · 工具 schema · agent_type 与权限声明 · 项目规则（AGENTS.md）· goal ledger · 历史事件 · **在线表/在线状态** · 当前阶段与 role。实现与提案有出入：v0 只落 system/工具 schema/历史事件三源（context.go 的 base/tools/history），项目规则/ledger/在线表/阶段与 role 未注入，待确认 | ★ |
 | Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾**。实现与提案有出入：v0 无多源注入的稳定性分级排序（只有 base/tools/history 三项粗粒度，顺序即注册序），待确认 | ★ |
 | Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效。v0 未做——v1（在线表注入末尾）再定 | ★ |
-| Q5 | 暴露等级收敛 | `full` **不建议常用**（事件全量注入，token 成本高且信息噪声大）；默认 `summary`，按需升到 `n`，`full` 需显式。v0 未做——v1（暴露等级收敛）再定 | ★ |
+| Q5 | 暴露等级收敛 | ✅ 随 K14 拍板（2026-10-28 用户）：默认 `summary`，按需升 `n`，`full` 需显式 | ✅ |
 | Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻。v0 未做——v1（Inquiry 返回：结构化摘要 + 事件窗口）再定 | ★ |
 | Q7 | **summary 污点继承** | ✅ subagent 的 summary 是回主 agent 的**唯一通道** → 若 subagent 读到被注入的内容，summary 就是攻击载荷出口。**summary 强制带 `taint`**（继承来源事件的最高污点级），主 agent 对 tainted summary **按不可信数据处理**（与 H13 同源） | ✅ |
 
@@ -419,7 +419,6 @@
 | G20 | 闭包缓存 | ★ |
 | G21 | 图的用途链 | ★ |
 | H14 | env 分层 | ★ |
-| H15 | 凭据来源 | ★ |
 | H20 | 注入作用域 | ★ |
 | H22 | 权限语义（工作流侧） | ★ |
 | H23 | 命中即放行（工作流侧） | ★ |
@@ -428,17 +427,13 @@
 | J17 | 级联问题（未解） | ★ |
 | J18 | 级联候选解 | ★ |
 | J20 | 压缩触发计入 prompt cache 成本 | ★ |
-| J21 | tiered% 锚定 + token 计量口径 | ★ |
 | K8 | ExecutionEnv 抽象 | ★ |
 | K9 | goroutine 隔离的代价（必须对冲） | ★ |
 | K10 | 发现表（Registry） | ★ |
 | K12 | 自动 / 显式 Gate | ★ |
-| K14 | 暴露等级 = 注入长度 | ★ |
-| K15 | 在线表注入 | ★ |
 | K18 | 交流能力做成可复用组件 | ★ |
 | K19 | 跨机 | ★ |
 | K20 | 层级 3 = 只读型 | ★ |
-| K29 | fork/clone 复制语义 | ★ |
 | M6 | 通用重试组件 | ★ |
 | N1 | MCP 方向 | ★ |
 | N4b | 公网暴露 / 远程访问 | ★ |
@@ -447,11 +442,8 @@
 | Q2 | 注入源清单 | ★ |
 | Q3 | 稳定 → 变动排序 | ★ |
 | Q4 | 缓存友好 | ★ |
-| Q5 | 暴露等级收敛 | ★ |
 | Q6 | Inquiry 返回 | ★ |
 | R8 | 能力池叠加 | ★ |
-| S13 | 路径规范化 | ★ |
-| S14 | repo_id 独立 | ★ |
 | V4 | 依赖缓存策略 | ★ |
 | V6 | review-tip 失效检测 | ★ |
 | V7 | 合并后冲突预测 | ★ |
@@ -472,9 +464,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **126** 条 · ★ 待议 **64** 条 · · 默认通过（我的主张，未逐条确认）**90** 条 · 共 **280** 条
+**合计**：✅ 已定 **134** 条 · ★ 待议 **56** 条 · · 默认通过（我的主张，未逐条确认）**90** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）
 
 ---
 

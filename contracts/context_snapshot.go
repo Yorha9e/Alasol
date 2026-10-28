@@ -6,7 +6,7 @@ type ContextSnapshot struct {
 	SessionID Ulid `json:"session_id"`
 	// 轮次（session 内序号，S2）。
 	Turn int64 `json:"turn"`
-	// 已用 token（J21：provider usage 优先，自算兜底）。
+	// 已用 token（J21 口径（2026-10-28 拍板）：本快照是调用前生成的 = **正式估算口径**（len/4 自算）；provider usage 只进成本统计、不回填快照）。
 	TokensUsed int64 `json:"tokens_used"`
 	// 窗口预算 token（锚定装配时生效模型的窗口，J21）。
 	TokensBudget int64 `json:"tokens_budget"`

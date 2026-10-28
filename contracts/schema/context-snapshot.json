@@ -17,7 +17,7 @@
         },
         "tokens_used": {
           "type": "integer",
-          "description": "已用 token（J21：provider usage 优先，自算兜底）。"
+          "description": "已用 token（J21 口径（2026-10-28 拍板）：本快照是调用前生成的 = **正式估算口径**（len/4 自算）；provider usage 只进成本统计、不回填快照）。"
         },
         "tokens_budget": {
           "type": "integer",
