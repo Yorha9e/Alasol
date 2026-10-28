@@ -196,7 +196,7 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 | **v1-S2 hub 与发现表** | hub daemon（多 session 宿管）+ K10 发现表（事件驱动内存活状态）+ K12 gate（自动 `repo:`/`workflow:` + `join_gate`）+ K11 水平可见性 | 两个 session 经 gate 互见主 agent；发现表崩溃重启后由事件流重建 | **✅ 完成（2026-10-28，评审循环 clean）**：`core/discovery` + `gate.joined` 事件 + host 装配（`/api/peers`、`/api/gates/join`）；K10/K12 ★→✅ |
 | **v1-S3 agentlink** | K18 五件套：Presence / Discover / Inquiry / Broadcast / Handoff（库形态，不绑协议） | Inquiry 拉原文可核验 summary 的 refs（端到端） | **✅ 完成（2026-10-28，评审循环 clean）**：`core/agentlink` + `agentlink.broadcast`/`agentlink.handoff` 事件；refs 核验 token 锚定 + 含空格路径整串核验 |
 | **v1-S4 在线表注入** | K14/K15：50 行 / ≤100 token / gate 过滤，**全可配 + 运行期动态管理**，恒在 prompt 末尾（Q4） | 主 agent prompt 尾部出现在线表；参数运行期可调且不重启 | **✅ 完成（2026-10-28，评审循环 clean）**：`core/loop/onlinetable.go` + host 配置面/HTTP；注入恒在请求尾部、不入持久历史 |
-| **v1-S5 宿主补全** | 多 worktree 隔离 + 完整 TUI（O6）+ 模型目录（I5）+ H15 TOML 配置（env > 文件）+ K9 hub 监控 + token 成本统计（J21 usage 进成本） | TUI 对话/审批/在线表；配置文件优先级正确；成本统计可查 |
+| **v1-S5 宿主补全** | 多 worktree 隔离 + 完整 TUI（O6）+ 模型目录（I5）+ H15 TOML 配置（env > 文件）+ K9 hub 监控 + token 成本统计（J21 usage 进成本） | TUI 对话/审批/在线表；配置文件优先级正确；成本统计可查 | **✅ 完成（2026-10-28，评审循环 2 轮）**：六项全落（worktree 管理/TUI 三面/模型目录/TOML env>文件/hub 监控/cost_tokens）；**挂后续**：worktree 工具级隔离（工具仍跑进程 cwd）、K9 告警入事件流、登记表持久化 |
 
 （原清单里的 MCP / 深度压缩 / 评测已在 v3 / v2 / v4 归位，见 `12-roadmap.md`。）
 

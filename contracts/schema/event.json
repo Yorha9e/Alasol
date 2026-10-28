@@ -483,12 +483,16 @@
     },
     "ModelTurnPayload": {
       "type": "object",
-      "description": "model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。",
+      "description": "model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。model 为本轮模型名（成本统计按模型分组用；provider 不上报或缺省时可为空）。",
       "required": ["text"],
       "properties": {
         "text": {
           "type": "string",
           "description": "模型本轮文本输出。"
+        },
+        "model": {
+          "type": "string",
+          "description": "本轮模型名（成本统计按模型分组；可缺省）。"
         },
         "usage": {
           "$ref": "#/$defs/ModelTurnUsage",

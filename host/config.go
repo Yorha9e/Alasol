@@ -54,6 +54,10 @@ type Config struct {
 	Approval string
 	// BaseURL provider 端点（空 = 官方）。原样传给 provider，不进事件/日志。
 	BaseURL string
+	// APIKey 是**已解析**的 provider 凭据（H15：cmd 装配时按 env>文件 收敛后填入）。
+	// 优先于 APIKeyEnv 从 env 取的值；为空才回退 os.Getenv(APIKeyEnv)。
+	// **永不进 argv / 事件 / 日志**（H12/H19）——host.Config 本身不得被整体日志化。
+	APIKey string
 	// APIKeyEnv 持有 API key 的**环境变量名**（缺省 OPENAI_API_KEY）。
 	// 只传变量名：值由 host 在装配时从 env 取出直接交给 provider，
 	// 永不进 argv / 事件 / 日志（H12/H19）。
@@ -78,6 +82,16 @@ type Config struct {
 	OnlineTableLineTokens int
 	OnlineTableLevel      string
 	OnlineTableWindow     int
+	// Monitor hub 级 CPU/内存监控（K9）阈值。0 = 用框架默认（见 monitor.go）。
+	// 周期采样，超阈值记告警（日志 + 内存环 + /api/monitor，可查）。
+	MonitorCPUPercent float64
+	MonitorMemMB      float64
+	MonitorGoroutines int
+	// MonitorIntervalSec 采样周期（秒；0 = 框架默认）。
+	MonitorIntervalSec int
+	// WorktreeRoot 多 worktree 隔离（v1-S5 D）的受管根目录（所有 worktree 建在其下）。
+	// 空 = 派生自事件库目录（<DBPath 所在目录>/worktrees）。
+	WorktreeRoot string
 }
 
 // validate 校验并归一化配置。
@@ -132,6 +146,19 @@ func (c *Config) validate() error {
 		!discovery.ValidGateID(discovery.WorkflowGate(runID)) {
 		return fmt.Errorf("host: Config.RunID %q 不合法（含空白/控制字符，或拼成 workflow gate 后超过 %d 字符）",
 			c.RunID, discovery.MaxGateIDLen)
+	}
+	// hub 监控阈值（K9）：负值拒绝；0 = 用框架默认。
+	if c.MonitorCPUPercent < 0 {
+		return fmt.Errorf("host: Config.MonitorCPUPercent 不能为负（得到 %v；0 = 默认）", c.MonitorCPUPercent)
+	}
+	if c.MonitorMemMB < 0 {
+		return fmt.Errorf("host: Config.MonitorMemMB 不能为负（得到 %v；0 = 默认）", c.MonitorMemMB)
+	}
+	if c.MonitorGoroutines < 0 {
+		return fmt.Errorf("host: Config.MonitorGoroutines 不能为负（得到 %d；0 = 默认）", c.MonitorGoroutines)
+	}
+	if c.MonitorIntervalSec < 0 {
+		return fmt.Errorf("host: Config.MonitorIntervalSec 不能为负（得到 %d；0 = 默认）", c.MonitorIntervalSec)
 	}
 	return nil
 }

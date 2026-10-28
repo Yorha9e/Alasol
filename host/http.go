@@ -13,6 +13,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agentlink"
 	"github.com/Yorha9e/alasol/core/discovery"
+	"github.com/Yorha9e/alasol/runtime/worktree"
 	"github.com/Yorha9e/alasol/ui/web"
 )
 
@@ -27,10 +28,19 @@ var httpLog = slog.Default()
 //	GET /index.html              → 同上
 //	GET /ws                      → transport.Server.ServeWS（NDJSON 行式事件流）
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
+//	GET /api/monitor             → MonitorView（K9：当前采样 + 阈值 + 告警环）
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行）
+//	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
+//	GET /api/cost/{session_id}   → TokenCostView（单 session token 成本，按模型分组）
 //	GET /api/context/{session_id}→ 最新 ContextSnapshot；没有 → 404
 //	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
 //	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
+//
+// 多 worktree 隔离（v1-S5 D：并行任务各占一个工作区）：
+//
+//	GET    /api/worktrees          → [Worktree, ...]（已登记，按 name 排序）
+//	POST   /api/worktrees          → Worktree（建一个；体 {"repo","name"}）
+//	DELETE /api/worktrees/{name}   → {"removed":name}（junction-safe 清理）
 //
 // 在线表注入配置（K14/K15：运行期动态管理，改完下一轮生效、不重启）：
 //
@@ -62,10 +72,18 @@ func (h *Hub) Handler() http.Handler {
 
 	// API。
 	mux.HandleFunc("GET /api/health", h.serveHealth)
+	mux.HandleFunc("GET /api/monitor", h.serveMonitor)
 	mux.HandleFunc("GET /api/sessions", h.serveSessions)
+	mux.HandleFunc("GET /api/cost", h.serveCostTotal)
+	mux.HandleFunc("GET /api/cost/{session_id}", h.serveCost)
 	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
 	mux.HandleFunc("GET /api/peers", h.servePeers)
 	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
+
+	// 多 worktree 隔离（v1-S5 D）：创建 / 列表 / 删除。
+	mux.HandleFunc("GET /api/worktrees", h.serveWorktreesList)
+	mux.HandleFunc("POST /api/worktrees", h.serveWorktreeCreate)
+	mux.HandleFunc("DELETE /api/worktrees/{name}", h.serveWorktreeRemove)
 
 	// 在线表注入配置（K14/K15：运行期动态管理，不重启）。
 	mux.HandleFunc("GET /api/online-table/config", h.serveOnlineTableConfig)
@@ -112,6 +130,16 @@ func (h *Hub) serveHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSONBody(w, http.StatusOK, health)
 }
 
+// serveMonitor 服务 GET /api/monitor（K9：当前采样 + 生效阈值 + 告警环）。
+func (h *Hub) serveMonitor(w http.ResponseWriter, r *http.Request) {
+	m := h.Monitor()
+	if m == nil {
+		writeJSONError(w, http.StatusInternalServerError, "monitor_unavailable", "hub 未起监控器")
+		return
+	}
+	writeJSONBody(w, http.StatusOK, m.View())
+}
+
 // serveSessions 服务 GET /api/sessions（在线表）。
 func (h *Hub) serveSessions(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.Sessions(r.Context())
@@ -124,6 +152,36 @@ func (h *Hub) serveSessions(w http.ResponseWriter, r *http.Request) {
 		rows = []SessionRow{}
 	}
 	writeJSONBody(w, http.StatusOK, rows)
+}
+
+// serveCostTotal 服务 GET /api/cost（跨 session token 成本汇总，J21）。
+func (h *Hub) serveCostTotal(w http.ResponseWriter, r *http.Request) {
+	view, err := h.TokenCostTotal(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "cost_failed", err.Error())
+		return
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// serveCost 服务 GET /api/cost/{session_id}（单 session token 成本，J21）。
+func (h *Hub) serveCost(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r.PathValue("session_id"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
+		return
+	}
+	view, ok, err := h.TokenCost(r.Context(), sid)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "cost_failed", err.Error())
+		return
+	}
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "no_cost",
+			fmt.Sprintf("session %s 还没有带 usage 的 model.turn（跑一轮对话后就有）", sid))
+		return
+	}
+	writeJSONBody(w, http.StatusOK, view)
 }
 
 // serveContext 服务 GET /api/context/{session_id}。
@@ -216,6 +274,49 @@ func (h *Hub) serveGateJoin(w http.ResponseWriter, r *http.Request) {
 		view.Peers = []discovery.PeerRow{}
 	}
 	writeJSONBody(w, http.StatusOK, view)
+}
+
+// maxWorktreeBody 限制 POST /api/worktrees 请求体大小。
+const maxWorktreeBody = 4 << 10
+
+// serveWorktreesList 服务 GET /api/worktrees（列表，按 name 排序）。
+func (h *Hub) serveWorktreesList(w http.ResponseWriter, r *http.Request) {
+	wts := h.Worktrees()
+	if wts == nil {
+		wts = []worktree.Worktree{}
+	}
+	writeJSONBody(w, http.StatusOK, wts)
+}
+
+// serveWorktreeCreate 服务 POST /api/worktrees（建一个并行任务工作区）。
+//
+//	请求体：{"repo":"<仓库路径>","name":"<短名>"}
+//	200 → Worktree（含 path）；400 体坏 / name 非法；500 git 失败等。
+func (h *Hub) serveWorktreeCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Repo string `json:"repo"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxWorktreeBody)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
+		return
+	}
+	wt, err := h.CreateWorktree(r.Context(), body.Repo, body.Name)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "worktree_create_failed", err.Error())
+		return
+	}
+	writeJSONBody(w, http.StatusOK, wt)
+}
+
+// serveWorktreeRemove 服务 DELETE /api/worktrees/{name}（junction-safe 清理）。
+func (h *Hub) serveWorktreeRemove(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := h.RemoveWorktree(r.Context(), name); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "worktree_remove_failed", err.Error())
+		return
+	}
+	writeJSONBody(w, http.StatusOK, map[string]string{"removed": name})
 }
 
 // writeHubError 把 Hub / agentlink 的错误映射成 HTTP 状态码。

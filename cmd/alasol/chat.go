@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -33,7 +34,7 @@ func chatMain(args []string) int {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
 	f := registerHubFlags(fs)
 	session := fs.String("session", "", "复用已有 session id（空=新建一个）")
-	_ = fs.Parse(args)
+	f.parse(fs, args)
 
 	cfg, err := f.config()
 	if err != nil {
@@ -58,7 +59,7 @@ func chatMain(args []string) int {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Printf("[alasol] chat 就绪：session=%s model=%s approval=%s allow=%v\n",
 		sid, cfg.Model, *f.approval, splitList(*f.allow))
-	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /quit 退出")
+	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /quit 退出")
 
 	for {
 		fmt.Print("you> ")
@@ -79,11 +80,14 @@ func chatMain(args []string) int {
 		case "/ctx":
 			printContext(ctx, h, sid)
 			continue
+		case "/cost":
+			printCost(ctx, h, sid)
+			continue
 		case "/session":
 			fmt.Printf("session=%s\n", sid)
 			continue
 		case "/help":
-			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /session 当前 session · /quit 退出")
+			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /session 当前 session · /quit 退出")
 			continue
 		}
 		if ctx.Err() != nil {
@@ -165,5 +169,34 @@ func printContext(ctx context.Context, h *host.Hub, sid contracts.Ulid) {
 			fmt.Printf(" summary=%s", *p.SummaryRef)
 		}
 		fmt.Println()
+	}
+}
+
+// printCost 打印当前 session 的 token 成本统计（/cost，J21：usage 只进成本）。
+func printCost(ctx context.Context, h *host.Hub, sid contracts.Ulid) {
+	view, ok, err := h.TokenCost(ctx, sid)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "拉成本统计失败:", err)
+		return
+	}
+	if !ok {
+		fmt.Printf("（session %s 还没有带 usage 的 model.turn）\n", sid)
+		return
+	}
+	fmt.Printf("session=%s tokens: input=%d output=%d total=%d（%d 个计量轮）\n",
+		sid, view.InputTokens, view.OutputTokens, view.TotalTokens, view.ModelTurns)
+	if len(view.ByModel) == 0 {
+		return
+	}
+	// 按模型分组（字典序，确定性输出）。
+	models := make([]string, 0, len(view.ByModel))
+	for m := range view.ByModel {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	fmt.Printf("  %-24s %10s %10s %8s\n", "model", "input", "output", "turns")
+	for _, m := range models {
+		mu := view.ByModel[m]
+		fmt.Printf("  %-24s %10d %10d %8d\n", m, mu.InputTokens, mu.OutputTokens, mu.Turns)
 	}
 }

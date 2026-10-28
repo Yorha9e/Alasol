@@ -1,7 +1,8 @@
 // Package indexer 消费全局事件流、增量维护**持久投影**（G17/G24）。
 //
 // 定位（G9 Kafka 模式）：写者只管 append 事件；**派生表由本索引器单独维护**——
-// 它是 sessions 目录 / ledger 当前态 / 黑板当前态 / 成本统计的唯一写者（单索引写者）。
+// 它是 sessions 目录 / ledger 当前态 / 黑板当前态 / 成本统计（事件计数 cost_stats +
+// token 计量 cost_tokens，J21）的唯一写者（单索引写者）。
 // 索引是最终一致的：延迟毫秒级，UI 通过 Watermark 看到「已追至 seq N」（G24③）。
 //
 // 恢复语义（G24）：① 水位持久化在 indexer_watermark 单行表，崩溃后从 N 续跑；
@@ -47,10 +48,11 @@ const defaultBatch = 1000
 // pollInterval 是 Run 追平后的轮询间隔。
 const pollInterval = 50 * time.Millisecond
 
-// 事件 kind 常量（索引器只对这三个 kind 做专属投影；其余忽略但计数，D7）。
+// 事件 kind 常量（索引器只对这些 kind 做专属投影；其余忽略但计数，D7）。
 const (
 	kindLedgerUpdated = "ledger.updated"
 	kindBoardWritten  = "board.written"
+	kindModelTurn     = "model.turn"
 )
 
 // badPayloadKind 是「坏载荷」的诊断名（**只出现在告警里**，不进 by_kind ——
@@ -183,7 +185,7 @@ func (ix *Indexer) Run(ctx context.Context) error {
 	}
 }
 
-// Rebuild 重建（G24②）：清空四张派生表 + 水位归零，再从 0 重放到追平。
+// Rebuild 重建（G24②）：清空五张派生表 + 水位归零，再从 0 重放到追平。
 // 清空与归零在同一事务内原子完成；重放走 Step（同一把锁内），崩溃后可再次
 // Rebuild 或续跑。
 func (ix *Indexer) Rebuild(ctx context.Context) error {
@@ -195,7 +197,7 @@ func (ix *Indexer) Rebuild(ctx context.Context) error {
 		return fmt.Errorf("indexer: rebuild begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, table := range []string{"sessions", "ledger_state", "board_state", "cost_stats"} {
+	for _, table := range []string{"sessions", "ledger_state", "board_state", "cost_stats", "cost_tokens"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return fmt.Errorf("indexer: rebuild clear %s: %w", table, err)
 		}
@@ -244,7 +246,8 @@ func (ix *Indexer) applyBatch(ctx context.Context, events []contracts.Event) err
 	return nil
 }
 
-// applyEvent 把单条事件应用到四张投影。每个事件都更新 sessions + cost_stats；
+// applyEvent 把单条事件应用到投影。每个事件都更新 sessions + cost_stats；
+// ledger.updated / board.written / model.turn 额外更新对应当前态/成本；未知 kind 忽略但已计数（D7）。
 // ledger.updated / board.written 额外更新对应当前态；未知 kind 忽略但已计数（D7）。
 //
 // **坏载荷隔离**（P1-2）：已知 kind 的载荷不可解析时**不致命**——记一条告警、
@@ -277,6 +280,14 @@ func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 		}
 	case kindBoardWritten:
 		if err := applyBoard(ctx, tx, ev); err != nil {
+			if !errors.Is(err, errBadPayload) {
+				return err
+			}
+			badPayload = true
+		}
+	case kindModelTurn:
+		// token 成本（J21）：usage 只进成本统计，绝不回填 context 快照/预算。
+		if err := applyModelTurn(ctx, tx, ev); err != nil {
 			if !errors.Is(err, errBadPayload) {
 				return err
 			}
@@ -384,6 +395,65 @@ func applyBoard(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 	}
 	if _, err := tx.ExecContext(ctx, upsertBoardSQL, sid, p.Key, value, author, tombstone, *ev.Seq); err != nil {
 		return fmt.Errorf("indexer: board projection: %w", err)
+	}
+	return nil
+}
+
+// applyModelTurn 投影 model.turn 的 token usage 到 cost_tokens（J21：usage **只进成本
+// 统计**，绝不回填 context 快照/预算——那是调用前估算的正式口径，与 provider 事后上报的
+// usage 是两件事）。
+//
+//   - 无 usage（provider 不上报）→ 本事件不计 token（cost_stats 的事件计数已覆盖"有一轮"）；
+//   - 有 usage → 累加 input/output tokens，按 model 名分组（by_model），metered turn 计数 +1。
+//
+// 载荷不可解析 → errBadPayload（隔离，不致命，P1-2）。
+func applyModelTurn(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
+	var p contracts.ModelTurnPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		return fmt.Errorf("%w: model.turn payload id=%s: %v", errBadPayload, ev.ID, err)
+	}
+	if p.Usage == nil {
+		return nil // 无 usage：不计 token
+	}
+	model := ""
+	if p.Model != nil {
+		model = *p.Model
+	}
+	return bumpTokenCost(ctx, tx, string(ev.SessionID), model, p.Usage.InputTokens, p.Usage.OutputTokens)
+}
+
+// bumpTokenCost 累加 cost_tokens：读-改-写（事务内可见自身未提交写）。
+// input/output tokens 累加；metered turn +1；by_model 里对应模型的 input/output/turns 累加。
+func bumpTokenCost(ctx context.Context, tx *sql.Tx, sid, model string, in, out int64) error {
+	var curIn, curOut, curTurns int64
+	var byModel string
+	err := tx.QueryRowContext(ctx,
+		`SELECT input_tokens, output_tokens, model_turns, by_model FROM cost_tokens WHERE session_id = ?`, sid).
+		Scan(&curIn, &curOut, &curTurns, &byModel)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("indexer: token cost read: %w", err)
+	}
+	byModelMap := map[string]ModelUsage{}
+	if err == nil && byModel != "" {
+		if uerr := json.Unmarshal([]byte(byModel), &byModelMap); uerr != nil {
+			return fmt.Errorf("indexer: token cost by_model decode: %w", uerr)
+		}
+	}
+	curIn += in
+	curOut += out
+	curTurns++
+	mu := byModelMap[model]
+	mu.InputTokens += in
+	mu.OutputTokens += out
+	mu.Turns++
+	byModelMap[model] = mu
+
+	blob, err := json.Marshal(byModelMap)
+	if err != nil {
+		return fmt.Errorf("indexer: token cost by_model encode: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, upsertCostTokensSQL, sid, curIn, curOut, curTurns, string(blob)); err != nil {
+		return fmt.Errorf("indexer: token cost write: %w", err)
 	}
 	return nil
 }
@@ -496,6 +566,84 @@ func (ix *Indexer) ReadCostStats(ctx context.Context, sessionID contracts.Ulid) 
 	return CostStats{EventCount: count, ByKind: m, BadPayloadCount: badCount}, true, nil
 }
 
+// ModelUsage 是单个模型的 token 计量聚合（J21：只做成本记录）。
+type ModelUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	Turns        int64 `json:"turns"`
+}
+
+// TokenStats 是某 session 的 token 成本统计（J21）。**只进成本，不回填快照/预算**。
+type TokenStats struct {
+	// InputTokens / OutputTokens 是该 session 累计的输入/输出 token（所有 metered turn 之和）。
+	InputTokens  int64
+	OutputTokens int64
+	// ModelTurns 是携带 usage 的 model.turn 条数（metered turn；无 usage 的轮不计）。
+	ModelTurns int64
+	// ByModel 按模型名分组的计量（cost 按模型分组）。
+	ByModel map[string]ModelUsage
+}
+
+// ReadTokenStats 读某 session 的 token 成本统计（不存在 → ok=false）。
+func (ix *Indexer) ReadTokenStats(ctx context.Context, sessionID contracts.Ulid) (TokenStats, bool, error) {
+	var in, out, turns int64
+	var byModel string
+	err := ix.w.QueryRowContext(ctx,
+		`SELECT input_tokens, output_tokens, model_turns, by_model FROM cost_tokens WHERE session_id = ?`,
+		string(sessionID)).Scan(&in, &out, &turns, &byModel)
+	if err == sql.ErrNoRows {
+		return TokenStats{}, false, nil
+	}
+	if err != nil {
+		return TokenStats{}, false, fmt.Errorf("indexer: read token stats: %w", err)
+	}
+	m := map[string]ModelUsage{}
+	if byModel != "" {
+		if uerr := json.Unmarshal([]byte(byModel), &m); uerr != nil {
+			return TokenStats{}, false, fmt.Errorf("indexer: token stats by_model decode: %w", uerr)
+		}
+	}
+	return TokenStats{InputTokens: in, OutputTokens: out, ModelTurns: turns, ByModel: m}, true, nil
+}
+
+// ReadAllTokenStats 读**所有** session 的 token 成本统计（按 session_id 索引）。
+// 用于 /api/cost 的总额聚合（hub 汇总各 session 的 input/output）。
+//
+// 用 BeginTx + tx.Query 做多行读（不拓宽 Writer 接口：仍是 Exec/QueryRow/BeginTx 三件）。
+func (ix *Indexer) ReadAllTokenStats(ctx context.Context) (map[contracts.Ulid]TokenStats, error) {
+	tx, err := ix.w.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("indexer: read all token stats begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx,
+		`SELECT session_id, input_tokens, output_tokens, model_turns, by_model FROM cost_tokens`)
+	if err != nil {
+		return nil, fmt.Errorf("indexer: read all token stats query: %w", err)
+	}
+	defer rows.Close()
+	out := map[contracts.Ulid]TokenStats{}
+	for rows.Next() {
+		var sid string
+		var in, out2, turns int64
+		var byModel string
+		if err := rows.Scan(&sid, &in, &out2, &turns, &byModel); err != nil {
+			return nil, fmt.Errorf("indexer: read all token stats scan: %w", err)
+		}
+		m := map[string]ModelUsage{}
+		if byModel != "" {
+			if uerr := json.Unmarshal([]byte(byModel), &m); uerr != nil {
+				return nil, fmt.Errorf("indexer: token stats by_model decode: %w", uerr)
+			}
+		}
+		out[contracts.Ulid(sid)] = TokenStats{InputTokens: in, OutputTokens: out2, ModelTurns: turns, ByModel: m}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("indexer: read all token stats rows: %w", err)
+	}
+	return out, nil
+}
+
 // ReadSession 读 session 目录条目（不存在 → ok=false）。
 func (ix *Indexer) ReadSession(ctx context.Context, sessionID contracts.Ulid) (SessionStats, bool, error) {
 	var (
@@ -526,7 +674,7 @@ func decodeStrings(s string) []string {
 	return out
 }
 
-// ensureSchema 建四张投影表 + 水位表，并播种水位行（seq=0）。
+// ensureSchema 建投影表 + 水位表，并播种水位行（seq=0）。
 func (ix *Indexer) ensureSchema(ctx context.Context) error {
 	if _, err := ix.w.ExecContext(ctx, indexerSchemaSQL); err != nil {
 		return fmt.Errorf("indexer: create schema: %w", err)
@@ -552,6 +700,15 @@ ON CONFLICT(session_id) DO UPDATE SET
   event_count       = excluded.event_count,
   by_kind           = excluded.by_kind,
   bad_payload_count = excluded.bad_payload_count`
+
+// upsertCostTokensSQL：token 成本（J21）。读-改-写在 bumpTokenCost 里算好全量值后整行覆写。
+const upsertCostTokensSQL = `INSERT INTO cost_tokens (session_id, input_tokens, output_tokens, model_turns, by_model)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(session_id) DO UPDATE SET
+  input_tokens  = excluded.input_tokens,
+  output_tokens = excluded.output_tokens,
+  model_turns   = excluded.model_turns,
+  by_model      = excluded.by_model`
 
 const upsertLedgerSQL = `INSERT INTO ledger_state (session_id, goals, constraints, completed, pending, last_seq)
 VALUES (?, ?, ?, ?, ?, ?)
@@ -606,6 +763,13 @@ CREATE TABLE IF NOT EXISTS cost_stats (
   event_count INTEGER NOT NULL,
   by_kind     TEXT NOT NULL DEFAULT '{}',
   bad_payload_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS cost_tokens (
+  session_id   TEXT PRIMARY KEY COLLATE BINARY,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  model_turns  INTEGER NOT NULL DEFAULT 0,
+  by_model     TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS indexer_watermark (
   id  INTEGER PRIMARY KEY CHECK (id = 1),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -32,18 +33,39 @@ const discoveryScanBatch = 500
 // 事实源里写垃圾）。
 var ErrSessionNotHosted = errors.New("host: session 不是本 hub 在托管的 session")
 
+// worktreeIsolationNotice 是"worktree 绑定**未**启用工具级隔离"的醒目告警出口。
+//
+// 走 slog.Default() 且**调用时**取（不是包级 var）：这样宿主换掉默认 logger 就能接住它、
+// 测试也能断言"绑定时确实告警了"（host/worktree_test.go）。默认输出与 hubLog 一致。
+func worktreeIsolationNotice(msg string, args ...any) {
+	slog.Default().Warn(msg, args...)
+}
+
 // SessionSpec 是新建 session 的归属（K12 自动 gate 的输入）。
 //
-// v1-S2 只用到两个字段；多 worktree 隔离（v1-S5）会扩展它，但 gate 机制本身不用改
-// （成员关系按 session 算，与 session 从哪来无关）。
+// v1-S2 只用到 CWD/RunID；多 worktree 隔离（v1-S5 D）加 Worktree：把一个 session **登记**到
+// 某个 hub 托管的 worktree —— **仅影响自动 gate 的 repo_id 计算与工作区登记**
+// （自动 gate 的 repo_id 按 worktree 路径算——经 git root 聚合，与主仓库同一 repo_id，S14）。
+// gate 机制本身不随绑定改变（成员关系按 session 算，与 session 从哪来无关）。
+//
+// ⚠ **worktree 绑定目前不提供工具级隔离**：工具（read/write/bash）由 hub **一次性注册**
+// （host/hub.go：tools.NewRead(local.FS{}) 等）——相对路径落到**进程 cwd**、bash 继承进程 cwd。
+// 也就是说：绑了 worktree 的 session 写文件**不会**落在该 worktree 里（实测：落在进程 cwd）。
+// 把工具执行真正 chroot 进各 worktree 要改 core/loop 的工具执行上下文（与 X1 冲突），
+// 留作后续项；CreateSession 命中 Worktree 时会打一条醒目告警（见 worktreeIsolationNotice）。
 type SessionSpec struct {
 	// CWD 工作目录。自动 gate repo:<repo_id> 按它算（runtime/identity 的 RepoID，
 	// 复用其 worktree 聚合语义：同 git root 的多个 worktree 聚成同一 repo_id）。
-	// 空 = 用 hub 级默认（Config.CWD，再缺省用进程 cwd）。
+	// 空 = 用 hub 级默认（Config.CWD，再缺省用进程 cwd）。设了 Worktree 时以 worktree 路径为准。
+	// **不影响工具执行**（工具仍在进程 cwd——见类型注释的 ⚠）。
 	CWD string
 	// RunID 工作流运行 id。有则自动加入 workflow:<run_id>；空 = 不加。
 	// 工作流引擎在 v3，这里只留钩子（没有 run_id 就没有 workflow gate）。
 	RunID string
+	// Worktree 是把本 session **登记**到哪个 hub 托管的 worktree（名字，非路径）。
+	// 非空 → CreateSession 校验它存在，并按该 worktree 路径算自动 gate 的 repo_id。
+	// ⚠ **不提供工具级隔离**（工具仍在进程 cwd 执行）——见类型注释。
+	Worktree string
 }
 
 // PeersView 是水平可见性查询的形状（GET /api/peers 与 POST /api/gates/join 共用）。
@@ -154,6 +176,19 @@ func (h *Hub) CreateSession(spec SessionSpec) (contracts.Ulid, error) {
 		return "", errors.New("host: Hub 为 nil")
 	}
 	cwd := strings.TrimSpace(spec.CWD)
+	wtName := strings.TrimSpace(spec.Worktree)
+	if wtName != "" {
+		// 登记到 worktree：校验它存在，并按 worktree 路径算自动 gate 的 repo_id。
+		// ⚠ 工具级隔离未启用（工具仍在进程 cwd）——见 SessionSpec 的注释。
+		wt, ok := h.worktrees.Get(wtName)
+		if !ok {
+			return "", fmt.Errorf("host: worktree %q 不存在（先用 CreateWorktree 建）", wtName)
+		}
+		cwd = wt.Path
+		// 醒目告警：别让用户以为"绑了 worktree = 工具在 worktree 里跑"。
+		worktreeIsolationNotice("⚠ 工具级隔离未启用：工具仍在进程 cwd 执行，worktree 绑定仅影响 gate/登记",
+			"worktree", wtName, "worktree_path", wt.Path)
+	}
 	if cwd != "" {
 		// 提前把路径规范化一遍（S13）：不合法的目录在这里就拒，别等到激活时才发现。
 		canonical, err := identity.CanonicalPath(cwd)
@@ -169,7 +204,7 @@ func (h *Hub) CreateSession(spec SessionSpec) (contracts.Ulid, error) {
 	}
 	sid := core.NewUlid()
 	h.mu.Lock()
-	h.specs[sid] = SessionSpec{CWD: cwd, RunID: runID}
+	h.specs[sid] = SessionSpec{CWD: cwd, RunID: runID, Worktree: wtName}
 	h.mu.Unlock()
 	return sid, nil
 }

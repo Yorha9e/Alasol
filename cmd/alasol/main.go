@@ -51,6 +51,8 @@ func main() {
 		code = serveMain(os.Args[2:])
 	case "chat":
 		code = chatMain(os.Args[2:])
+	case "tui":
+		code = tuiMain(os.Args[2:])
 	case "models":
 		code = modelsMain(os.Args[2:])
 	case "-h", "--help", "help":
@@ -74,7 +76,8 @@ func usage() {
                                         -continue "<提示>" 续跑一轮对话：折叠整场 session 的
                                         对话、不区分 agent 视角）
   alasol serve  [flags]                 起常驻 hub：Web UI + WS 事件流 + HTTP API
-  alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx
+  alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx / /cost
+  alasol tui    [flags]                 三面 TUI（对话/审批/在线表，bubbletea，O6/B2）
   alasol models [flags]                 列出端点支持的模型（发现模型名）
 
 模型名无默认值（模型名是端点相关的）：用 -model 指定或设 ALASOL_MODEL；

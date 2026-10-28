@@ -18,85 +18,81 @@ import (
 
 // hubFlags 是 serve / chat 共有的装配参数（都走 host.Hub 这个唯一组合根）。
 type hubFlags struct {
-	dbPath           *string
-	addr             *string
-	model            *string
-	baseURL          *string
-	apiKeyEnv        *string
-	approval         *string
-	allow            *string
-	ask              *string
-	maxTurns         *int
-	contextBudget    *int64
-	system           *string
-	indexerBatch     *int
-	maxSessionRows   *int
-	cwd              *string
-	runID            *string
-	onlineRows       *int
-	onlineLineTokens *int
-	onlineLevel      *string
-	onlineWindow     *int
+	dbPath            *string
+	addr              *string
+	model             *string
+	baseURL           *string
+	apiKeyEnv         *string
+	approval          *string
+	allow             *string
+	ask               *string
+	maxTurns          *int
+	contextBudget     *int64
+	system            *string
+	indexerBatch      *int
+	maxSessionRows    *int
+	cwd               *string
+	runID             *string
+	onlineRows        *int
+	onlineLineTokens  *int
+	onlineLevel       *string
+	onlineWindow      *int
+	configPath        *string
+	monitorCPU        *float64
+	monitorMem        *float64
+	monitorGoroutines *int
+	monitorInterval   *int
+	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
+	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
+	set map[string]bool
 }
 
 // registerHubFlags 把共有 flag 注册到 fs（serve 额外有 -addr，chat 也有但可忽略）。
 func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 	return &hubFlags{
-		dbPath:           fs.String("db", "alasol.db", "事件库路径（SQLite）"),
-		addr:             fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
-		model:            fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
-		baseURL:          fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
-		apiKeyEnv:        fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
-		approval:         fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
-		allow:            fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
-		ask:              fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
-		maxTurns:         fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
-		contextBudget:    fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
-		system:           fs.String("system", "", "系统提示"),
-		indexerBatch:     fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
-		maxSessionRows:   fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
-		cwd:              fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
-		runID:            fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
-		onlineRows:       fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
-		onlineLineTokens: fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
-		onlineLevel:      fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
-		onlineWindow:     fs.Int("online-window", 0, "在线表 level=n 每行窗口行数（0=默认 5，K14）"),
+		dbPath:            fs.String("db", "alasol.db", "事件库路径（SQLite）"),
+		addr:              fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
+		model:             fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
+		baseURL:           fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
+		apiKeyEnv:         fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
+		approval:          fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
+		allow:             fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
+		ask:               fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
+		maxTurns:          fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
+		contextBudget:     fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
+		system:            fs.String("system", "", "系统提示"),
+		indexerBatch:      fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
+		maxSessionRows:    fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
+		cwd:               fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
+		runID:             fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
+		onlineRows:        fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
+		onlineLineTokens:  fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
+		onlineLevel:       fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
+		onlineWindow:      fs.Int("online-window", 0, "在线表 level=n 每行窗口行数（0=默认 5，K14）"),
+		configPath:        fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15：%APPDATA%\\alasol\\config.toml 或 XDG）"),
+		monitorCPU:        fs.Float64("monitor-cpu", 0, "hub CPU 监控阈值%（单核等价，可>100；0=默认，K9）"),
+		monitorMem:        fs.Float64("monitor-mem", 0, "hub 内存监控阈值 MB（0=默认，K9）"),
+		monitorGoroutines: fs.Int("monitor-goroutines", 0, "hub goroutine 数监控阈值（0=默认，K9）"),
+		monitorInterval:   fs.Int("monitor-interval", 0, "hub 监控采样周期秒（0=默认，K9）"),
 	}
 }
 
-// config 把 flag 值转成 host.Config（唯一装配处）。
-func (f *hubFlags) config() (host.Config, error) {
-	modelName, err := resolveModel(*f.model)
-	if err != nil {
-		return host.Config{}, err
-	}
-	cfg := host.Config{
-		DBPath:         *f.dbPath,
-		Addr:           *f.addr,
-		Model:          modelName,
-		System:         *f.system,
-		MaxTurns:       *f.maxTurns,
-		ContextBudget:  *f.contextBudget,
-		Allow:          splitList(*f.allow),
-		Ask:            splitList(*f.ask),
-		Approval:       *f.approval,
-		BaseURL:        *f.baseURL,
-		APIKeyEnv:      *f.apiKeyEnv,
-		IndexerBatch:   *f.indexerBatch,
-		MaxSessionRows: *f.maxSessionRows,
-		CWD:            strings.TrimSpace(*f.cwd),
-		RunID:          strings.TrimSpace(*f.runID),
+// parse 解析 args 并记录被显式设置的 flag（供 buildConfig 做 flag>env>文件 优先级）。
+func (f *hubFlags) parse(fs *flag.FlagSet, args []string) {
+	_ = fs.Parse(args)
+	f.set = map[string]bool{}
+	fs.Visit(func(fl *flag.Flag) { f.set[fl.Name] = true })
+}
 
-		OnlineTableRows:       *f.onlineRows,
-		OnlineTableLineTokens: *f.onlineLineTokens,
-		OnlineTableLevel:      strings.TrimSpace(*f.onlineLevel),
-		OnlineTableWindow:     *f.onlineWindow,
-	}
-	if testProviderOverride != nil {
-		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
-		cfg.Provider = testProviderOverride
-	}
-	return cfg, nil
+// explicitlySet 报告某 flag 是否被用户在命令行显式设置（区别于"用了默认值"）。
+func (f *hubFlags) explicitlySet(name string) bool {
+	return f.set != nil && f.set[name]
+}
+
+// config 把 flag 值 + 用户级 TOML 配置（H15）合并成 host.Config（唯一装配处）。
+// 优先级：显式 flag > 进程 env > 配置文件（见 buildConfig）。
+func (f *hubFlags) config() (host.Config, error) {
+	return f.buildConfig()
 }
 
 // testProviderOverride 是**仅供测试**的 provider 注入点（nil = 用真 provider）。
@@ -122,7 +118,7 @@ func splitList(s string) []string {
 func serveMain(args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	f := registerHubFlags(fs)
-	_ = fs.Parse(args)
+	f.parse(fs, args)
 
 	cfg, err := f.config()
 	if err != nil {

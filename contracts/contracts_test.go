@@ -167,6 +167,11 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Usage.InputTokens == 0 || p.Usage.OutputTokens == 0 {
 				t.Errorf("line %d: model.turn usage 应带非零 token 数: %+v", lineNo, p.Usage)
 			}
+			// model 是本轮模型名（成本统计按模型分组用）：样本里必须带得上且非空——
+			// "成本按模型分组"依赖这个样本事实（每处契约增量都要有钉子）。
+			if p.Model == nil || *p.Model == "" {
+				t.Errorf("line %d: model.turn 应带非空 model（成本统计按模型分组）", lineNo)
+			}
 		case "gate.joined":
 			var p GateJoinedPayload
 			if err := json.Unmarshal(ev.Payload, &p); err != nil {

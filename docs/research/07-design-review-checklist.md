@@ -20,7 +20,7 @@
 | ID | 决策项 | 我的主张 | 备选 | 状态 |
 |---|---|---|---|---|
 | B1 | 核心语言 | Go | — | ✅（独立产品 + Windows 一等 → 翻转） |
-| B2 | TUI | Go + bubbletea / lipgloss | — | · |
+| B2 | TUI | Go + bubbletea / lipgloss。**选型落地（2026-10-28 v1-S5）**：`ui/tui` 独立包（O6）——对话/审批/在线表三面，进程内 hub 后端；依赖 bubbletea+lipgloss（手写输入框，未引 bubbles） | — | ✅ |
 | B3 | GUI / IDE 插件 | 语言自由，通过协议接入 hub | — | · |
 | B4 | 解释型扩展运行时 | v1 再说；候选 Starlark / CEL / goja / WASM。v0 未做——v3（解释型扩展运行时选型，12 路线图）再定 | — | ★ |
 | B5 | 依赖约束 | 避免 cgo（纯 Go SQLite）；go modules | — | · |
@@ -144,7 +144,7 @@
 | H12 | 凭据 | 按作用域注入 + 日志脱敏 | · |
 | H13 | 不可信输入 | 工具输出/网页标注来源，视为数据非指令 | · |
 | H14 | env 分层 | 四层分离：**凭据 env**（进 provider）/ **执行 env**（进工具进程）/ **上下文 env**（给模型看，默认不给）/ **作用域覆盖**。v0 未做——v1（env 全分层）再定；v0 只做执行 env（H16/H17/H18） | ★ |
-| H15 | 凭据来源 | ✅ **拍板（2026-10-28 用户）**：进程 env + **TOML 配置文件**（Windows `%APPDATA%\alasol\config.toml`，其他平台 XDG），**优先级：进程 env > 配置文件**；永不进 prompt/事件/日志（H18/H21 纪律不变）。实现在 v1 | ✅ |
+| H15 | 凭据来源 | ✅ **拍板（2026-10-28 用户）**：进程 env + **TOML 配置文件**（Windows `%APPDATA%\alasol\config.toml`，其他平台 XDG），**优先级：进程 env > 配置文件**；永不进 prompt/事件/日志（H18/H21 纪律不变）。**落地（2026-10-28 v1-S5）**：`host/config_file.go`（BurntSushi/toml，零传递依赖）+ `Precedence(flag,env,file)` 唯一优先级实现处；`FileConfig.Redacted()` 打码、解析错误不回显值；实测 secret 不进事件/HTTP/日志 | ✅ |
 | H16 | 执行 env 默认 | 工具默认继承**净化后**的父 env（凭据类剥离）；普通 env（PATH/HOME 等）保留。落地：`core.ScrubEnv` 剥离凭据类键（`IsCredentialKey`）与凭据形态值（`IsCredentialValue`：sk-/ghp_/gho_/JWT），普通 env 保留；显式注入的 required_env 在 ScrubEnv 之后叠加（获批凭据不被剥）（实现：core/env.go + core/loop/env.go） | ✅ |
 | H17 | 凭据按需注入 | 工具显式声明 `required_env`，由策略引擎裁决后注入该次调用。落地：工具 `RequiredEnv` 声明的键每个当能力过同一套策略求值（`Query{Tool:"env:"+key}`，E3），allow 才从进程 env 取值注入；deny/ask 未放行 → 不注入（fail-close），注入值进 secrets 供输出脱敏（实现：core/loop/env.go） | ✅ |
 | H18 | 脱敏规则 | deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`）+ 值形态匹配（`sk-`/`ghp_`/JWT）。落地：deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`/`*_CREDENTIAL*`，`IsCredentialKey`）+ 值形态（`sk-`/`ghp_`/`gho_`/JWT，`IsCredentialValue`）；框架注入的秘密值在工具输出进事件/下一轮 prompt 前被 `redactResult`/`redactSecrets` 逐个精确替换成 `***`（零误伤，非法 JSON 退化为 `"***"`）（实现：core/env.go + core/loop/toolcall.go） | ✅ |
@@ -164,7 +164,7 @@
 | I2 | Go SDK | anthropic/v2、openai/v3、genai（已实测活跃） | ✅ |
 | I3 | 统一事件 | 12 类（text/thinking/toolcall 各 start-delta-end）+ done/error | · |
 | I4 | 跨 provider 上下文交接 | **必做**：行业真空（kosong 静默丢弃、pi 不完整） | · |
-| I5 | 模型目录 | 内置静态快照 + 在线拉取（models.dev 形态）+ 周期刷新 | · |
+| I5 | 模型目录 | 内置静态快照 + 在线拉取（models.dev 形态）+ 周期刷新。**落地（2026-10-28 v1-S5）**：`runtime/models`（BuiltinSnapshot + FetchFunc + Catalog.Run 周期刷新 + 内置∪在线合并；刷新失败保留旧值）；`alasol models` 默认在线刷新失败回落内置，`-offline` 只用内置 | ✅ |
 | I6 | 模型绑定 | per-agent 持久化，subagent/fork 继承 | · |
 | I7 | 路由 | 作为扩展点（RoutingPolicy） | · |
 | I8 | 成本 | token/成本核算内置 | · |
@@ -194,7 +194,7 @@
 | J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算。v0 未做——v2（深度压缩：级联候选解）再定；C 案的 goal ledger 已在 v0 事件化落地（J19/X6）备用 | ★ |
 | J19 | goal ledger 提案 | **目标、约束、已完成项、待解项**放在**上下文之外的独立持久存储**，由 agent 在关键点显式更新。压缩任一阶段只读账本 + 目标阶段全文 → 不需要级联；同时根治"目标偏移"。落地：`ledger.updated` durable 事件（全量快照），当前态 = 索引器 `ledger_state` 投影（LWW，seq 守卫），在上下文之外，X6 控制写放大（实现：core/durable/ledger.go + runtime/indexer） | ✅ |
 | J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」**。v0 未做——v2（深度压缩）再定 | ★ |
-| J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩）。**落点（2026-10-28 v1-S1）**：usage 落 `model.turn` 事件 `ModelTurnUsage`，只进成本统计（实现：core/loop/events.go） | ✅ |
+| J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩）。**落点（2026-10-28 v1-S1）**：usage 落 `model.turn` 事件 `ModelTurnUsage`，只进成本统计（实现：core/loop/events.go）。**成本统计落地（2026-10-28 v1-S5）**：`runtime/indexer` 的 `cost_tokens` 派生表 + `GET /api/cost`（总额）/`/api/cost/{id}`（per-session 按模型分组）+ chat `/cost`；`ModelTurnPayload` 增可选 `model` 字段（按模型分组）；实测 usage 未回填快照 | ✅ |
 
 ## K. 进程与多 session
 
@@ -208,7 +208,7 @@
 | K6 | 崩溃域 | 单 session 崩溃不影响其他 session，也不拖垮 hub | · |
 | K7 | 并发控制 | 资源冲突调度（非裸并发）+ 配额 + provider 限流指数退避 | · |
 | K8 | **ExecutionEnv 抽象** | agent 的工具执行环境可插拔：`LocalExecutionEnv`（hub 进程内，v0）→ `SandboxedExecutionEnv`（子进程 + 沙箱，v1）→ `RemoteExecutionEnv`（远端 SSH，v2）。**升级到进程隔离只需换 env 实现，不动 agent 逻辑**。v0 未做 SandboxedExecutionEnv/RemoteExecutionEnv——v2（OS 沙箱）/ v3（远端 SSH）再定（12 路线图）；v0 已有可插拔能力抽象（core Exec/Fs/Net/Proc）+ LocalExecutionEnv（runtime/cap/local）作底座 | ★ |
-| K9 | goroutine 隔离的代价（必须对冲） | OS 级崩溃（OOM / 栈溢出 / cgo 崩溃）会带走整个 hub；死循环 goroutine 抢占其他；内存泄漏拖垮 hub。对冲：turn 超时 + 工具超时 + hub 级 CPU/内存监控告警 + 单 agent panic recover 后记事件并标记失败（不影响其他 agent）。实现与提案有出入：panic 隔离（`executeSafely` recover）+ MaxTurns 截断已做，但 hub 级 CPU/内存监控告警未做，待确认 | ★ |
+| K9 | goroutine 隔离的代价（必须对冲） | OS 级崩溃（OOM / 栈溢出 / cgo 崩溃）会带走整个 hub；死循环 goroutine 抢占其他；内存泄漏拖垮 hub。对冲：turn 超时 + 工具超时 + hub 级 CPU/内存监控告警 + 单 agent panic recover 后记事件并标记失败（不影响其他 agent）。**落地（2026-10-28 v1-S5）**：panic 隔离（`executeSafely` recover）+ MaxTurns 截断 + hub 级 CPU/内存/goroutine 三档监控告警（`host/monitor.go`：SampleSource 可注入、周期采样、阈值 flag>env>文件>默认、有界告警环 + `/api/monitor`；告警走 slog+内存环，**未入事件流**——刻意不动契约面，入流/审计留后续） | ✅ |
 | K10 | **发现表（Registry）** | core 的**内存活状态**组件，不是扩展点。属于**容器管理 + subagent 管理**的一部分，不是协议层。事件驱动更新（`agent.started` / `policy.asked` / `workflow.stage.changed` / `agent.finished` → 改内存）。**落地（2026-10-28 v1-S2）**：落 **`core/discovery`**（命名决策：原名"Registry"与扩展注册表 `core/registry`（E3/E5/E6）撞名 → 改 `core/discovery`）；双层语义=事件折叠层（可重建，Apply 幂等）+ 进程本地 live 层（G17b 两分法）；数据流入=**拉式扫描**（跟在线表同口径，防重复计数）；崩溃重启从事件流全量重放重建（真库测试）；来源事件 agent 生命周期已有，`policy.asked`/`workflow.stage.changed` 待 v3 对应 kind 落地后加 case（实现：core/discovery + host/discovery.go） | ✅ |
 | K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环。**落地（2026-10-28 v1-S2）**：水平维 = `discovery.VisiblePeers`（对端主 agent ∩ gates 相交 ∩ 存活），别 session subagent 不泄漏（负例测试） | ✅ |
 | K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效）。**落地（2026-10-28 v1-S2）**：`gate.joined` durable 事件（`gate_id` + `source` 枚举 auto_repo/auto_workflow/explicit；**无 gate.left**——离开=session 结束，join 历史只增可审计）；**成员"活"语义** = 折叠 join 历史 ∩ 存活 session；自动 `repo:<repo_id>`（复用 identity 的 worktree 聚合）/`workflow:<run_id>`（留钩子，工作流 v3）+ 显式 `JoinGate`；幂等 = 确定性 Event.ID（(session,gate,source) 导出 26 字符 Crockford）+ store ON CONFLICT 去重 + host per-session 锁（实现：core/discovery + host/discovery.go） | ✅ |
@@ -276,7 +276,7 @@
 | O3 | 必须 UI 无关的 5 项 | 事件流格式 / transcript 契约 / 权限语义 / 会话句柄 / 长时程状态机 | · |
 | O4 | GUI | v0 不做 | · |
 | O5 | **v0 先做 Web UI** | ✅ **v0 优先 Web UI，TUI 后做**。理由：我们的差异化卖点就是**上下文可视化**（token 构成树 / 压缩痕迹 / 多 session 在线表）与**多 session 并行面板**——这两项在 Web 上表达力强一个量级；且传输已定 **WS + NDJSON** → Web UI 成本极低；迭代验证快 | ✅ |
-| O6 | **TUI 保留位** | ✅ core 只依赖 contracts → **TUI 随时可加**（独立包 + 独立进程）。TUI 的定位是**终端里的日常交互面**（对话 / 审批 / 流式），Web 是**深度视图**（可视化 / 多面板）。v0 **不承诺 TUI** | ✅ |
+| O6 | **TUI 保留位** | ✅ core 只依赖 contracts → **TUI 随时可加**（独立包 + 独立进程）。TUI 的定位是**终端里的日常交互面**（对话 / 审批 / 流式），Web 是**深度视图**（可视化 / 多面板）。v0 **不承诺 TUI**。**落地（2026-10-28 v1-S5）**：`ui/tui`（bubbletea+lipgloss）三面——对话/审批/在线表；`tui.Approver` 桥接审批进事件循环（fail-close，取消=deny）；`alasol tui` 入口 | ✅ |
 | O7 | **Web UI 带来的安全代价** | ✅ Web 让「手机远程」变自然 → 强化 N4b/N5b：hub 只监听 loopback、凭证只在 header、校验 Origin、远端客户端用**降权视图**。另注意 Web UI 与「单二进制即用」的初衷有张力 → hub 是常驻进程，TUI/CLI/Web 都是它的客户端 | ✅ |
 
 ## R. 工具与角色（工具集按角色分离）
@@ -428,7 +428,6 @@
 | J18 | 级联候选解 | ★ |
 | J20 | 压缩触发计入 prompt cache 成本 | ★ |
 | K8 | ExecutionEnv 抽象 | ★ |
-| K9 | goroutine 隔离的代价（必须对冲） | ★ |
 | K19 | 跨机 | ★ |
 | K20 | 层级 3 = 只读型 | ★ |
 | M6 | 通用重试组件 | ★ |
@@ -459,9 +458,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **140** 条 · ★ 待议 **51** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
+**合计**：✅ 已定 **143** 条 · ★ 待议 **50** 条 · · 默认通过（我的主张，未逐条确认）**87** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）。2026-10-28 v1-S4 落地回填：**Q4 ★→✅**（在线表恒在 prompt 末尾），✅ 139 → **140**、★ 52 → **51**；K14/K15 补落地注记；S15 补短 id 尾段注（前缀同毫秒碰撞）。评审循环 2 轮（p2 短 id 碰撞 + 3 p3 → clean）；修复由主 agent 亲手完成并自证（reviewer 模型账户余额耗尽 402 期间），critic 复查确认 clean
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）。2026-10-28 v1-S4 落地回填：**Q4 ★→✅**（在线表恒在 prompt 末尾），✅ 139 → **140**、★ 52 → **51**；K14/K15 补落地注记；S15 补短 id 尾段注（前缀同毫秒碰撞）。评审循环 2 轮（p2 短 id 碰撞 + 3 p3 → clean）；修复由主 agent 亲手完成并自证（reviewer 模型账户余额耗尽 402 期间），critic 复查确认 clean。2026-10-28 v1-S5 落地回填：**K9 ★→✅、I5/B2 ·→✅**（hub 监控三档告警、模型目录、bubbletea TUI 选型），✅ 140 → **143**、★ 51 → **50**、· 89 → **87**；H15/J21/O6 补落地注记（TOML env>文件、cost_tokens 成本统计、TUI 三面）。**v1 五段全部收口**。评审循环 2 轮（p2 worktree 文档言过其实 + p3 model 断言缺口 → 修复落盘后主 agent 变异自证，critic 复查轮因 402 未跑完——如实挂账）。**S5 挂账后续项**：worktree 工具级隔离（工具仍跑进程 cwd，改 core/loop 执行上下文与 X1 冲突）、K9 告警入事件流、worktree 登记表持久化、TUI 自动化交互测试
 
 ---
 

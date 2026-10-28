@@ -179,6 +179,9 @@ func (l *Loop) publishUserPrompt(ctx context.Context, prompt string) {
 func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResult) {
 	ev, err := l.newEvent(KindModelTurn, nil, contracts.ModelTurnPayload{
 		Text: mr.Text,
+		// model 名随事件落库（成本统计按模型分组用，J21）：它**不是凭据**（模型名可安全
+		// 进事件/日志），仅用于聚合口径。
+		Model: strPtr(l.model),
 		Usage: &contracts.ModelTurnUsage{
 			InputTokens:  mr.Usage.InputTokens,
 			OutputTokens: mr.Usage.OutputTokens,

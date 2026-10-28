@@ -245,10 +245,12 @@ type ModelTurnUsage struct {
 	OutputTokens int64 `json:"output_tokens"`
 }
 
-// model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。
+// model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。model 为本轮模型名（成本统计按模型分组用；provider 不上报或缺省时可为空）。
 type ModelTurnPayload struct {
 	// 模型本轮文本输出。
 	Text string `json:"text"`
+	// 本轮模型名（成本统计按模型分组；可缺省）。
+	Model *string `json:"model,omitempty"`
 	// token 计量（J21：只做成本记录，provider 不上报 usage 时可缺省）。
 	Usage *ModelTurnUsage `json:"usage,omitempty"`
 }

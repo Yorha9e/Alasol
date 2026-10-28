@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/tools"
 	"github.com/Yorha9e/alasol/runtime/transport"
+	"github.com/Yorha9e/alasol/runtime/worktree"
 )
 
 // Hub 是装配好的常驻服务：事件流 + 在线表 + 上下文快照 + 发现表（K10）+ Web UI + WS。
@@ -58,6 +60,10 @@ type Hub struct {
 	// link 是 K18 交流能力五件套（core/agentlink）：发现表 + store 读 + bus/store 写
 	// 三件事都在 host/agentlink.go 注入。与 disc 同生命周期（无自身状态，无需关闭）。
 	link *agentlink.Link
+	// monitor 是 K9 hub 级 CPU/内存监控（周期采样 + 超阈值告警）。New 起、Close 停。
+	monitor *Monitor
+	// worktrees 是 v1-S5 D 多 worktree 隔离管理器（并行任务各占一个工作区）。
+	worktrees *worktree.Manager
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -66,6 +72,10 @@ type Hub struct {
 	ixCtx    context.Context
 	ixCancel context.CancelFunc
 	ixDone   chan struct{}
+
+	// monCtx 是后台监控器的生命周期（Close 时取消）。
+	monCtx    context.Context
+	monCancel context.CancelFunc
 
 	mu sync.Mutex
 	// loops：session → Loop（一个 session 一个 loop）。
@@ -148,15 +158,20 @@ func New(cfg Config) (*Hub, error) {
 
 	prov := cfg.Provider
 	if prov == nil {
-		// 真 provider：API key 只从 env 取（-api-key-env 只传变量名），
-		// 永不进 argv / 事件 / 日志（H12/H19）。
+		// 真 provider：凭据按 H15 收敛（env > 文件）后由 cmd 填进 cfg.APIKey；
+		// 直连 host.New 的调用方（测试）只设 APIKeyEnv 时，回退从 env 取。
+		// 凭据永不进 argv / 事件 / 日志（H12/H19）。
 		keyEnv := strings.TrimSpace(cfg.APIKeyEnv)
 		if keyEnv == "" {
 			keyEnv = DefaultAPIKeyEnv
 		}
+		apiKey := cfg.APIKey
+		if apiKey == "" {
+			apiKey = os.Getenv(keyEnv)
+		}
 		prov = openai.New(openai.Options{
 			BaseURL: strings.TrimSpace(cfg.BaseURL),
-			APIKey:  os.Getenv(keyEnv),
+			APIKey:  apiKey,
 			Stream:  true,
 		})
 	}
@@ -233,13 +248,35 @@ func New(cfg Config) (*Hub, error) {
 		Sink:   agentlinkSink{bus: b, store: st},
 	})
 
-	// 后台索引器：派生表（sessions / ledger / board / cost_stats）的**唯一写者**。
+	// 后台索引器：派生表（sessions / ledger / board / cost_stats / cost_tokens）的**唯一写者**。
 	h.ixCtx, h.ixCancel = context.WithCancel(context.Background())
 	h.ixDone = make(chan struct{})
 	go func() {
 		defer close(h.ixDone)
 		_ = ix.Run(h.ixCtx) // ctx 取消时返回 ctx.Err()，不是故障
 	}()
+
+	// 后台监控（K9）：hub 级 CPU/内存周期采样 + 超阈值告警。用独立 ctx（Close 时取消）。
+	h.monitor = NewMonitor(monitorConfig{
+		CPUPercent:  cfg.MonitorCPUPercent,
+		MemMB:       cfg.MonitorMemMB,
+		Goroutines:  cfg.MonitorGoroutines,
+		IntervalSec: cfg.MonitorIntervalSec,
+	}, nil) // nil src = 真实采样
+	h.monCtx, h.monCancel = context.WithCancel(context.Background())
+	h.monitor.Start(h.monCtx)
+
+	// 多 worktree 隔离（v1-S5 D）：受管根目录（可配，缺省派生自事件库目录）。
+	wtRoot := strings.TrimSpace(cfg.WorktreeRoot)
+	if wtRoot == "" {
+		wtRoot = filepath.Join(filepath.Dir(cfg.DBPath), "worktrees")
+	}
+	wm, werr := worktree.NewManager(wtRoot)
+	if werr != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("host: 建 worktree 管理器: %w", werr)
+	}
+	h.worktrees = wm
 
 	return h, nil
 }
@@ -263,6 +300,12 @@ func (h *Hub) Close() error {
 	}
 	if h.ixDone != nil {
 		<-h.ixDone
+	}
+	if h.monCancel != nil {
+		h.monCancel()
+	}
+	if h.monitor != nil {
+		h.monitor.Stop()
 	}
 	if err := h.store.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("host: 关事件库: %w", err))
@@ -445,6 +488,14 @@ func (h *Hub) Watermark() (int64, error) {
 		return 0, errors.New("host: Hub 为 nil")
 	}
 	return h.indexer.Watermark()
+}
+
+// Monitor 返回 hub 的 CPU/内存监控器（K9；宿主内部 / 诊断面）。
+func (h *Hub) Monitor() *Monitor {
+	if h == nil {
+		return nil
+	}
+	return h.monitor
 }
 
 // Health 是 GET /api/health 的形状。
