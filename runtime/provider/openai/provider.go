@@ -77,7 +77,7 @@ var _ core.Provider = (*Provider)(nil)
 // Authorization 头）。这与 core/doc.go 的「兜底」一档同口径：缺参数后系统仍能安全地
 // 做事（发请求，让端点去拒绝），不存在"不放行任何东西"的问题。
 func New(o Options) *Provider {
-	base := strings.TrimRight(strings.TrimSpace(o.BaseURL), "/")
+	base := normalizeBaseURL(o.BaseURL)
 	if base == "" {
 		base = DefaultBaseURL
 	}

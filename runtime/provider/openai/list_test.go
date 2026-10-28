@@ -28,6 +28,15 @@ func TestListModels(t *testing.T) {
 	if !reflect.DeepEqual(ids, []string{"model-b", "model-a"}) {
 		t.Fatalf("ids = %v（空 id 应跳过）", ids)
 	}
+
+	// BaseURL 带首尾空白/尾斜杠时归一化口径与 New 一致（同一个 -base-url 两命令同行为）。
+	ids, err = ListModels(context.Background(), Options{BaseURL: "  " + srv.URL + "/  ", APIKey: "test-key", HTTPClient: srv.Client()})
+	if err != nil {
+		t.Fatalf("带空白的 BaseURL 应同样可用: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("ids = %v", ids)
+	}
 }
 
 func TestListModelsError(t *testing.T) {

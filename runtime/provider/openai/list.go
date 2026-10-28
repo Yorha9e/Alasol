@@ -8,12 +8,18 @@ import (
 	"strings"
 )
 
+// normalizeBaseURL 归一化端点根路径：去首尾空白、去尾部 "/"。
+// New 与 ListModels 共用同一口径——同一个 -base-url 值在两个命令上必须行为一致。
+func normalizeBaseURL(u string) string {
+	return strings.TrimRight(strings.TrimSpace(u), "/")
+}
+
 // ListModels 查询 OpenAI 兼容端点的可用模型列表（GET {BaseURL}/models）。
 //
 // 模型名是**端点相关**的：不同网关各说各话，v0 不做内置目录（I5 的内置快照留 v1），
 // 由调用方/用户在线发现。Options 与 Run 同口径（BaseURL 归一化、APIKey 可空）。
 func ListModels(ctx context.Context, o Options) ([]string, error) {
-	base := strings.TrimRight(o.BaseURL, "/")
+	base := normalizeBaseURL(o.BaseURL)
 	if base == "" {
 		base = DefaultBaseURL
 	}
