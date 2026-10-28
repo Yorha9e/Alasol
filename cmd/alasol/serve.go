@@ -38,7 +38,7 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 	return &hubFlags{
 		dbPath:         fs.String("db", "alasol.db", "事件库路径（SQLite）"),
 		addr:           fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
-		model:          fs.String("model", "gpt-4o-mini", "模型名（原样传给 provider）"),
+		model:          fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
 		baseURL:        fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
 		apiKeyEnv:      fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
 		approval:       fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
@@ -53,11 +53,15 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 }
 
 // config 把 flag 值转成 host.Config（唯一装配处）。
-func (f *hubFlags) config() host.Config {
+func (f *hubFlags) config() (host.Config, error) {
+	modelName, err := resolveModel(*f.model)
+	if err != nil {
+		return host.Config{}, err
+	}
 	cfg := host.Config{
 		DBPath:         *f.dbPath,
 		Addr:           *f.addr,
-		Model:          *f.model,
+		Model:          modelName,
 		System:         *f.system,
 		MaxTurns:       *f.maxTurns,
 		ContextBudget:  *f.contextBudget,
@@ -73,7 +77,7 @@ func (f *hubFlags) config() host.Config {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
 		cfg.Provider = testProviderOverride
 	}
-	return cfg
+	return cfg, nil
 }
 
 // testProviderOverride 是**仅供测试**的 provider 注入点（nil = 用真 provider）。
@@ -101,7 +105,12 @@ func serveMain(args []string) int {
 	f := registerHubFlags(fs)
 	_ = fs.Parse(args)
 
-	h, err := host.New(f.config())
+	cfg, err := f.config()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	h, err := host.New(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)
 		return 1

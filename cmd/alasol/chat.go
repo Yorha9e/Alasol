@@ -35,7 +35,12 @@ func chatMain(args []string) int {
 	session := fs.String("session", "", "复用已有 session id（空=新建一个）")
 	_ = fs.Parse(args)
 
-	h, err := host.New(f.config())
+	cfg, err := f.config()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	h, err := host.New(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)
 		return 1
@@ -52,7 +57,7 @@ func chatMain(args []string) int {
 
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Printf("[alasol] chat 就绪：session=%s model=%s approval=%s allow=%v\n",
-		sid, *f.model, *f.approval, splitList(*f.allow))
+		sid, cfg.Model, *f.approval, splitList(*f.allow))
 	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /quit 退出")
 
 	for {

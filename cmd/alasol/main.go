@@ -4,9 +4,12 @@
 // 用法：
 //
 //	alasol run -prompt "读一下 README 并总结" \
-//	          [-model gpt-4o-mini] [-base-url https://api.openai.com/v1] \
+//	          [-model <模型名> | ALASOL_MODEL] [-base-url https://api.openai.com/v1] \
 //	          [-api-key-env OPENAI_API_KEY] [-approval deny-all|always-allow|terminal] \
 //	          [-allow read,write,bash] [-db alasol.db] [-max-turns 20] [-system "..."]
+//
+//	alasol models [-base-url ...] [-api-key-env OPENAI_API_KEY]
+//	          → 列出端点支持的模型名（模型名是端点相关的，没有万能默认值）
 //
 //	alasol resume -session <id> [-db alasol.db] [-verify git|none]
 //	          → 跑 X4 恢复流程（读 checkpoint → fold → 处置 in-flight → session.resumed），
@@ -45,6 +48,8 @@ func main() {
 		code = serveMain(os.Args[2:])
 	case "chat":
 		code = chatMain(os.Args[2:])
+	case "models":
+		code = modelsMain(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		code = 0
@@ -65,7 +70,10 @@ func usage() {
   alasol resume -session <id> [flags]     恢复一个 session（X4 durable：处置 in-flight）
   alasol serve  [flags]                 起常驻 hub：Web UI + WS 事件流 + HTTP API
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx
+  alasol models [flags]                 列出端点支持的模型（发现模型名）
 
+模型名无默认值（模型名是端点相关的）：用 -model 指定或设 ALASOL_MODEL；
+不知道叫什么就先跑 `+"`alasol models`"+`。
 各子命令的 flags 用 `+"`alasol <子命令> -h`"+` 查看。
 `)
 }

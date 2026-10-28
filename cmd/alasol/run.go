@@ -14,7 +14,7 @@ import (
 func runMain(args []string) int {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	prompt := fs.String("prompt", "", "本轮用户提示（必填）")
-	model := fs.String("model", "gpt-4o-mini", "模型名（原样传给 provider）")
+	model := fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）")
 	baseURL := fs.String("base-url", "", "OpenAI 兼容端点（空=官方）")
 	apiKeyEnv := fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名")
 	approval := fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal")
@@ -28,12 +28,17 @@ func runMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "-prompt 不能为空")
 		return 2
 	}
+	modelName, err := resolveModel(*model)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	r, err := newRunner(runnerOpts{
-		Model:           *model,
+		Model:           modelName,
 		BaseURL:         *baseURL,
 		APIKey:          os.Getenv(*apiKeyEnv), // 凭据只从 env 取，不进 argv
 		Approval:        *approval,
