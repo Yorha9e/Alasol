@@ -8,6 +8,7 @@ import (
 
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/discovery"
+	"github.com/Yorha9e/alasol/core/loop"
 )
 
 // DefaultAddr 是 HTTP/WS 的默认监听地址（N5b：只监听 loopback）。
@@ -71,6 +72,12 @@ type Config struct {
 	IndexerBatch int
 	// MaxSessionRows /api/sessions 的行数上限（<=0 = DefaultMaxSessionRows）。
 	MaxSessionRows int
+	// 在线表注入（K14/K15）：hub 起动时的初始值。0/"" = 用 loop 默认（N=50 / 每行 ≤100 token /
+	// summary）。运行期可经 GET/POST /api/online-table/config 动态调整（不重启，下一轮生效）。
+	OnlineTableRows       int
+	OnlineTableLineTokens int
+	OnlineTableLevel      string
+	OnlineTableWindow     int
 }
 
 // validate 校验并归一化配置。
@@ -102,6 +109,23 @@ func (c *Config) validate() error {
 	}
 	if c.MaxSessionRows <= 0 {
 		c.MaxSessionRows = DefaultMaxSessionRows
+	}
+	// 在线表注入（K14/K15）起动配置：负值拒绝；level 只支持 summary | n | full。
+	if c.OnlineTableRows < 0 {
+		return fmt.Errorf("host: Config.OnlineTableRows 不能为负（得到 %d；0 = 默认 %d）", c.OnlineTableRows, loop.DefaultOnlineTableRows)
+	}
+	if c.OnlineTableLineTokens < 0 {
+		return fmt.Errorf("host: Config.OnlineTableLineTokens 不能为负（得到 %d；0 = 默认 %d）", c.OnlineTableLineTokens, loop.DefaultLineTokenBudget)
+	}
+	if c.OnlineTableWindow < 0 {
+		return fmt.Errorf("host: Config.OnlineTableWindow 不能为负（得到 %d；0 = 默认 %d）", c.OnlineTableWindow, loop.DefaultWindowLines)
+	}
+	if lvl := strings.TrimSpace(c.OnlineTableLevel); lvl != "" {
+		switch lvl {
+		case loop.LevelSummary, loop.LevelN, loop.LevelFull:
+		default:
+			return fmt.Errorf("host: Config.OnlineTableLevel 只支持 summary | n | full（得到 %q）", c.OnlineTableLevel)
+		}
 	}
 	// RunID 拼成 workflow:<run_id> 后必须是个合法 gate id（S9：不合则拒，不修复）。
 	if runID := strings.TrimSpace(c.RunID); runID != "" &&
@@ -153,4 +177,24 @@ func isLoopbackHost(host string) bool {
 		return true
 	}
 	return false
+}
+
+// onlineTableOverrides 把 Config 的在线表初始值折成 loop.OnlineTableUpdate（K15：hub 起动时可配）。
+//
+// 0/"" = 不给对应字段 → Update 不动它 → 保持 loop 默认（"缺省走配置面"口径）。非零/非空才覆盖。
+func (c *Config) onlineTableOverrides() loop.OnlineTableUpdate {
+	var u loop.OnlineTableUpdate
+	if c.OnlineTableRows > 0 {
+		u.MaxRows = &c.OnlineTableRows
+	}
+	if c.OnlineTableLineTokens > 0 {
+		u.LineTokenBudget = &c.OnlineTableLineTokens
+	}
+	if lvl := strings.TrimSpace(c.OnlineTableLevel); lvl != "" {
+		u.Level = &lvl
+	}
+	if c.OnlineTableWindow > 0 {
+		u.WindowLines = &c.OnlineTableWindow
+	}
+	return u
 }

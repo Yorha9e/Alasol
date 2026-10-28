@@ -32,6 +32,11 @@ var httpLog = slog.Default()
 //	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
 //	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
 //
+// 在线表注入配置（K14/K15：运行期动态管理，改完下一轮生效、不重启）：
+//
+//	GET  /api/online-table/config → OnlineTableView（当前生效的 N / 每行 token 预算 / 暴露等级 / 窗口行数）
+//	POST /api/online-table/config → OnlineTableView（部分更新；400 = 参数非法）
+//
 // agentlink（K18 五件套，core/agentlink 是库形态——协议绑定全在本层）：
 //
 //	GET  /api/presence?session_id=        → PresenceReport（谁在线/在干什么/属于哪些 gate）
@@ -61,6 +66,10 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
 	mux.HandleFunc("GET /api/peers", h.servePeers)
 	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
+
+	// 在线表注入配置（K14/K15：运行期动态管理，不重启）。
+	mux.HandleFunc("GET /api/online-table/config", h.serveOnlineTableConfig)
+	mux.HandleFunc("POST /api/online-table/config", h.serveOnlineTableConfig)
 
 	// agentlink（K18）。
 	mux.HandleFunc("GET /api/presence", h.serveAgentlinkPresence)

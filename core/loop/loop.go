@@ -109,6 +109,12 @@ type Config struct {
 	// 自动 checkpoint 是**尽力而为**：落盘失败不中止 Run（Run 的事件本身已 durable，缺 checkpoint
 	// 只意味着 resume 退到全量重建）。
 	CheckpointEvery int
+	// OnlineTable 在线表注入的活配置（K14/K15；nil = 关闭在线表注入——默认，向后兼容）。
+	// 与 OnlineTableSource **同时非 nil** 才注入；它是 hub 建一个、所有 loop 共享的对象，
+	// 运行期经它调整参数（不重启，下一轮生效）。
+	OnlineTable *OnlineTableConfig
+	// OnlineTableSource 在线表数据源（K11：self + gate 相交的对端主 agent；nil = 关闭注入）。
+	OnlineTableSource OnlineTableSource
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -139,6 +145,12 @@ type Loop struct {
 	// store / checkpointEvery 支撑阶段 8 durable：手动/自动 checkpoint 与 resume 重放的执行侧。
 	store           core.Store
 	checkpointEvery int
+
+	// onlineConfig / onlineSource 支撑 v1-S4 在线表注入（K14/K15）。两者同时非 nil 才注入
+	// （见 onlineTableForTurn）；nil = 关闭——老装配（cmd run/resume、单测）不受影响。
+	// onlineConfig 是**共享活配置**（hub 建一个传给所有 loop，运行期可调）。
+	onlineConfig *OnlineTableConfig
+	onlineSource OnlineTableSource
 }
 
 // Result 是一次 Run 的产出。
@@ -225,6 +237,8 @@ func New(cfg Config) (*Loop, error) {
 		contextBudget:   budget,
 		store:           cfg.Store,
 		checkpointEvery: cfg.CheckpointEvery,
+		onlineConfig:    cfg.OnlineTable,
+		onlineSource:    cfg.OnlineTableSource,
 	}, nil
 }
 
@@ -303,13 +317,16 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		}
 		res.Turns = turn
 
-		// 组这一轮的请求（可见工具过滤后的结果，R5/H4）。
-		req := l.request(msgs)
+		// 在线表（K14/K15）：每轮新鲜渲染（秒级变动），仅主 agent。nil = 本轮不注入。
+		ot := l.onlineTableForTurn(ctx)
+
+		// 组这一轮的请求（可见工具过滤后的结果，R5/H4；在线表追加以最末尾，Q4/Q3）。
+		req := l.request(msgs, ot)
 
 		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
 		// 此刻装配已定型（req 就是模型将看到的全部），记录"这一轮给模型看了什么"；
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
-		res.Events += l.publishContextAssembled(ctx, turn, req)
+		res.Events += l.publishContextAssembled(ctx, turn, req, ot)
 
 		mr, err := l.provider.Run(ctx, req, l.emit)
 		if err != nil {
@@ -393,11 +410,21 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 // H4 可见集过滤：裸工具名被策略 deny → 移出模型可见集（模型看不到 = 不会去调用）。
 // 这里只做**可见性**过滤；执行侧仍独立判定（M9：判定发生在调用时刻，判定只约束
 // 发起时刻——可见集过滤不放宽任何执行侧检查）。
-func (l *Loop) request(history []core.Message) core.ModelRequest {
+//
+// ot 非空（在线表注入）时，把在线表消息**拷贝后追加到最末尾**（Q4/Q3：history 之后）。
+// 拷贝是必须的——online table 只进本轮请求，不能写进调用方 history 的底层数组（下一轮还要
+// 往 msgs 追加 assistant/工具消息）。ot 为 nil 时零拷贝（老路径一字不变）。
+func (l *Loop) request(history []core.Message, ot *onlineTable) core.ModelRequest {
+	msgs := history
+	if ot != nil {
+		msgs = make([]core.Message, len(history), len(history)+1)
+		copy(msgs, history)
+		msgs = append(msgs, ot.message)
+	}
 	return core.ModelRequest{
 		Model:    l.model,
 		System:   l.system,
-		Messages: history,
+		Messages: msgs,
 		Tools:    l.visibleTools(),
 	}
 }

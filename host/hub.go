@@ -50,6 +50,11 @@ type Hub struct {
 	// 发现表（K10）：core 内存活状态 + 拉式扫描喂它的事件流（host/discovery.go）。
 	disc     *discovery.Table
 	discFeed *discoveryFeed
+	// onlineConfig / onlineSource 支撑 v1-S4 在线表注入（K14/K15）。onlineConfig 是 hub 共享的
+	// 活配置（运行期经 /api/online-table/config 调，所有 loop 下一轮读它立即生效）；onlineSource
+	// 把发现表的可见面折成 loop.OnlineTableSource（self + gate 相交的对端主 agent，K11）。
+	onlineConfig *loop.OnlineTableConfig
+	onlineSource *discoveryOnlineSource
 	// link 是 K18 交流能力五件套（core/agentlink）：发现表 + store 读 + bus/store 写
 	// 三件事都在 host/agentlink.go 注入。与 disc 同生命周期（无自身状态，无需关闭）。
 	link *agentlink.Link
@@ -170,6 +175,13 @@ func New(cfg Config) (*Hub, error) {
 	b := bus.New(st)
 	disc := discovery.New()
 	discFeed := newDiscoveryFeed(st, disc)
+	// 在线表配置（K14/K15）：默认值（N=50 / 每行 ≤100 token / summary）落进活配置对象，
+	// Config 里的覆盖项经 Update 生效（0/"" = 保持默认）。数据源 = 发现表可见面。
+	onlineCfg := loop.NewOnlineTableConfig()
+	if err := onlineCfg.Update(cfg.onlineTableOverrides()); err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("host: 在线表配置: %w", err)
+	}
 	cwd := strings.TrimSpace(cfg.CWD)
 	if cwd == "" {
 		// 缺省用进程 cwd（alasol serve 在哪个目录起，就默认那是哪个 repo）。
@@ -180,23 +192,25 @@ func New(cfg Config) (*Hub, error) {
 		}
 	}
 	h := &Hub{
-		cfg:        cfg,
-		store:      st,
-		bus:        b,
-		indexer:    ix,
-		reg:        reg,
-		engine:     eng,
-		provider:   prov,
-		approver:   ap,
-		proj:       newProjection(st),
-		disc:       disc,
-		discFeed:   discFeed,
-		cwd:        cwd,
-		ws:         transport.NewServer(b),
-		loops:      make(map[contracts.Ulid]*loop.Loop),
-		specs:      make(map[contracts.Ulid]SessionSpec),
-		mainAgents: make(map[contracts.Ulid]contracts.Ulid),
-		autoGates:  make(map[contracts.Ulid]bool),
+		cfg:          cfg,
+		store:        st,
+		bus:          b,
+		indexer:      ix,
+		reg:          reg,
+		engine:       eng,
+		provider:     prov,
+		approver:     ap,
+		proj:         newProjection(st),
+		disc:         disc,
+		discFeed:     discFeed,
+		cwd:          cwd,
+		ws:           transport.NewServer(b),
+		loops:        make(map[contracts.Ulid]*loop.Loop),
+		specs:        make(map[contracts.Ulid]SessionSpec),
+		mainAgents:   make(map[contracts.Ulid]contracts.Ulid),
+		autoGates:    make(map[contracts.Ulid]bool),
+		onlineConfig: onlineCfg,
+		onlineSource: &discoveryOnlineSource{table: disc, feed: discFeed},
 	}
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
@@ -334,6 +348,10 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		System:        h.cfg.System,
 		MaxTurns:      h.cfg.MaxTurns,
 		ContextBudget: h.cfg.ContextBudget,
+		// 在线表注入（K14/K15）：主 agent 的 prompt 末尾恒带在线表；配置运行期可调。
+		// subagent 的 loop 不传这两项（nil = 不注入，K11：只有主 agent 参与水平可见性）。
+		OnlineTable:       h.onlineConfig,
+		OnlineTableSource: h.onlineSource,
 	})
 	if err != nil {
 		h.mu.Unlock()

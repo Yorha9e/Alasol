@@ -213,8 +213,8 @@
 | K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环。**落地（2026-10-28 v1-S2）**：水平维 = `discovery.VisiblePeers`（对端主 agent ∩ gates 相交 ∩ 存活），别 session subagent 不泄漏（负例测试） | ✅ |
 | K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效）。**落地（2026-10-28 v1-S2）**：`gate.joined` durable 事件（`gate_id` + `source` 枚举 auto_repo/auto_workflow/explicit；**无 gate.left**——离开=session 结束，join 历史只增可审计）；**成员"活"语义** = 折叠 join 历史 ∩ 存活 session；自动 `repo:<repo_id>`（复用 identity 的 worktree 聚合）/`workflow:<run_id>`（留钩子，工作流 v3）+ 显式 `JoinGate`；幂等 = 确定性 Event.ID（(session,gate,source) 导出 26 字符 Crockford）+ store ON CONFLICT 去重 + host per-session 锁（实现：core/discovery + host/discovery.go） | ✅ |
 | K13 | **role = 部门标签** | role 近似"部门"（backend / frontend / infra）而非"角色扮演"，**由父 agent 在 spawn 时指定**。与 `agent_type` 正交：`agent_type` = 能力模板（能干什么），`role` = 部门（负责哪块）。role 自由文本、可重复。落地：`agents.Node.Role` 字段 + `agent.spawned` 事件带 `role`，由父在 `Tree.Spawn(..., role, ...)` 指定，与 agent_type 正交（实现：core/agents/tree.go） | ✅ |
-| K14 | **暴露等级 = 注入长度** | ✅ **拍板（2026-10-28 用户）**：窗口长度语义不变（summary/n/full）；**默认 summary**，n 按需升、full 需显式；随 K15 一起可配。实现在 v1 | ✅ |
-| K15 | **在线表注入** | ✅ **拍板（2026-10-28 用户）**：默认 **N=50 行、每行 summary ≤100 token、按 gate 过滤**；**全部参数可配 + 支持动态管理（运行期调整，不写死——用户明确要求）**；注入位置恒在 prompt 末尾（Q4）。实现在 v1 | ✅ |
+| K14 | **暴露等级 = 注入长度** | ✅ **拍板（2026-10-28 用户）**：窗口长度语义不变（summary/n/full）；**默认 summary**，n 按需升、full 需显式；随 K15 一起可配。**落地（2026-10-28 v1-S4）**：三级渲染（summary 受每行 token 预算截断（rune 安全）、n 带窗口行数、full 全 id 不截断），长度随等级单调增长；默认 summary、full 需显式 | ✅ |
+| K15 | **在线表注入** | ✅ **拍板（2026-10-28 用户）**：默认 **N=50 行、每行 summary ≤100 token、按 gate 过滤**；**全部参数可配 + 支持动态管理（运行期调整，不写死——用户明确要求）**；注入位置恒在 prompt 末尾（Q4）。**落地（2026-10-28 v1-S4）**：`core/loop/onlinetable.go` 配置面（三数值参数统一 0=默认/负数拒/超上界拒）+ 运行期 `GET/POST /api/online-table/config` 不重启生效 + CLI flag；gate 过滤复用 `discovery.VisiblePeers`（K11：别 session subagent 不出现）；注入=本轮请求尾部消息（不入持久历史）+ `context.assembled` 落 `online_table` part | ✅ |
 | K16 | **深度限制 = 类型可达性（> 计数器）** | 主设计是**类型可达性**：`agent_type.can_spawn` 声明"我能派哪些类型"→ 第 4 层在类型层面就不可达。**数字计数器只是兜底**（`max_agent_depth` 可配置，默认两级委派）。每层成本线性叠加在三条链上：**summary 链**（深度 3 的 summary 是深度 2 的摘要 → 二次失真，同"多次压缩导致目标偏移"是同一个病）、**权限链**（每层 ∩ 父级 → 深度 3 时已很窄，再深一层纯开销）、**审计链**（责任追溯层数）。落地：`AgentType.CanSpawn` + `TypeRegistry.Register` 时 can_spawn 环检测（有向无环），数字深度（maxDepth 默认 3）兜底；只读型 CanSpawn 为空 → 更深层不可达（实现：core/agents/type.go + tree.go） | ✅ |
 | K17 | **spawn 三道闸门** | 全部**运行时强制**（不靠提示词）：① **深度** `child.depth ≤ max_agent_depth` ② **类型** `child.type ∈ parent.can_spawn` ③ **权限** `child.permission ⊆ parent.permission ∩ policy_ceiling`。类型闸门让 `can_spawn` 有向无环，注册时校验。落地：`Tree.Spawn` 三闸门全运行时强制，闸门③经 perm.go 三维 read/write/exec 只收窄（未知级 fail-close 拒）；任一道拒则落 tool.call.failed、不建节点（实现：core/agents/tree.go + perm.go） | ✅ |
 | K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议**。**落地（2026-10-28 v1-S3）**：`core/agentlink` 五件套（E8 通用组件区；core 不做 IO——EventWindowReader/EventSink 宿主注入）；Broadcast/Handoff 事件化 `agentlink.broadcast`/`agentlink.handoff`（拉模型投递，幂等键含发送方 + store 去重 + 回读归属校验）；**subtree 射程 = 目标子树 ∩ 发送方一跳可见集（父+直系子）**——K27 显式逐跳、不做传递闭包（"子树"命名大于实际射程，要全树广播须另开口子，不得放宽可见集）；Inquiry = 摘要 + 事件窗口 + refs 核验（token 锚定防子串伪造，含空格路径整串核验；K24 端到端成立）；查询面全带 caller 按 K11 裁剪（实现：core/agentlink + host/agentlink.go） | ✅ |
@@ -360,7 +360,7 @@
 | S13 | 路径规范化 | ✅ **口径拍板（2026-10-28 用户）**：`hash(cwd)` 前必须 **解析符号链接（EvalSymlinks）→ Windows 转小写 → 统一分隔符 → 去尾斜杠**；`project_id = hash(canonical_cwd)`。**落地（2026-10-28 v1-S1）**：runtime/identity；Windows 的 EvalSymlinks 不解析 junction 且遇 junction 报错 → 落地为逐组件 `os.Readlink`（junction/symlink 一视同仁 + 环路保护），语义等同口径；入口先 `filepath.Abs`（相对路径写法不漂移） | ✅ |
 | S14 | repo_id 独立 | ✅ **口径拍板（2026-10-28 用户）**：`repo_id = hash(canonical_git_root)`，worktree 隔离下多个 cwd **按 git root 聚合**（资产图按 repo 级）。**落地（2026-10-28 v1-S1）**：worktree 的 `.git` 文件读 `gitdir:` 回溯主仓根，实测多 worktree 同 repo_id、异 project_id | ✅ |
 | S16 | **命名空间补全** | ✅ 08 的命名空间表补入：`causation_id`（F3）、`gate_id`（K12）、`workflow:<run_id>`、`sum:` 引用（ContextSnapshot）、`parent_agent_id`（K26） | ✅ |
-| S15 | 展示前缀 | 日志/UI 用 `session_id[:8]`，**比较一律用完整值** | · |
+| S15 | 展示前缀 | 日志/UI 用 `session_id[:8]`，**比较一律用完整值**。**注（2026-10-28 v1-S4）**：在线表短 id 取**随机尾段** 8 字符——ULID 前 8 字符整个落在毫秒时间戳段内，同批铸造逐字节相同（展示不可区分，评审 p2）；[:8] 前缀仅适用于日志类容错场景 | · |
 
 ## Q. Prompt 组装与注入源
 
@@ -369,7 +369,7 @@
 | Q1 | 编排时机 | **最后做**——先确定"所有需要注入的内容"及其**稳定性分级**，再定 prompt 顺序。实现与提案有出入：v0 注入源只落 system/tools/history 三源（`context.assembled` 的 base/tools/history），编排时机与稳定性分级排序未做（在线表注入属 v1），待确认 | ★ |
 | Q2 | 注入源清单 | system/基础提示 · 工具 schema · agent_type 与权限声明 · 项目规则（AGENTS.md）· goal ledger · 历史事件 · **在线表/在线状态** · 当前阶段与 role。实现与提案有出入：v0 只落 system/工具 schema/历史事件三源（context.go 的 base/tools/history），项目规则/ledger/在线表/阶段与 role 未注入，待确认 | ★ |
 | Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾**。实现与提案有出入：v0 无多源注入的稳定性分级排序（只有 base/tools/history 三项粗粒度，顺序即注册序），待确认 | ★ |
-| Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效。v0 未做——v1（在线表注入末尾）再定 | ★ |
+| Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效。**落地（2026-10-28 v1-S4）**：在线表恒为 provider 消息序列最后一段（含工具调用轮之后），只进本轮请求、不入持久历史（防 fold 污染与累积） | ✅ |
 | Q5 | 暴露等级收敛 | ✅ 随 K14 拍板（2026-10-28 用户）：默认 `summary`，按需升 `n`，`full` 需显式 | ✅ |
 | Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻。**落地（2026-10-28 v1-S3）**：`InquiryResult` = SummaryEntry[] + EventWindow + RefCheck[]；同 session 默认投影到调用方可见集（K11），跨 session 整 session（对端视角，K24 核验依赖）；HTTP 默认 limit=200 + truncated 信号 | ✅ |
 | Q7 | **summary 污点继承** | ✅ subagent 的 summary 是回主 agent 的**唯一通道** → 若 subagent 读到被注入的内容，summary 就是攻击载荷出口。**summary 强制带 `taint`**（继承来源事件的最高污点级），主 agent 对 tainted summary **按不可信数据处理**（与 H13 同源） | ✅ |
@@ -438,7 +438,6 @@
 | Q1 | 编排时机 | ★ |
 | Q2 | 注入源清单 | ★ |
 | Q3 | 稳定 → 变动排序 | ★ |
-| Q4 | 缓存友好 | ★ |
 | R8 | 能力池叠加 | ★ |
 | V4 | 依赖缓存策略 | ★ |
 | V6 | review-tip 失效检测 | ★ |
@@ -460,9 +459,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **139** 条 · ★ 待议 **52** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
+**合计**：✅ 已定 **140** 条 · ★ 待议 **51** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）。2026-10-28 v1-S4 落地回填：**Q4 ★→✅**（在线表恒在 prompt 末尾），✅ 139 → **140**、★ 52 → **51**；K14/K15 补落地注记；S15 补短 id 尾段注（前缀同毫秒碰撞）。评审循环 2 轮（p2 短 id 碰撞 + 3 p3 → clean）；修复由主 agent 亲手完成并自证（reviewer 模型账户余额耗尽 402 期间），critic 复查确认 clean
 
 ---
 

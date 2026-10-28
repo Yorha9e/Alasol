@@ -18,41 +18,49 @@ import (
 
 // hubFlags 是 serve / chat 共有的装配参数（都走 host.Hub 这个唯一组合根）。
 type hubFlags struct {
-	dbPath         *string
-	addr           *string
-	model          *string
-	baseURL        *string
-	apiKeyEnv      *string
-	approval       *string
-	allow          *string
-	ask            *string
-	maxTurns       *int
-	contextBudget  *int64
-	system         *string
-	indexerBatch   *int
-	maxSessionRows *int
-	cwd            *string
-	runID          *string
+	dbPath           *string
+	addr             *string
+	model            *string
+	baseURL          *string
+	apiKeyEnv        *string
+	approval         *string
+	allow            *string
+	ask              *string
+	maxTurns         *int
+	contextBudget    *int64
+	system           *string
+	indexerBatch     *int
+	maxSessionRows   *int
+	cwd              *string
+	runID            *string
+	onlineRows       *int
+	onlineLineTokens *int
+	onlineLevel      *string
+	onlineWindow     *int
 }
 
 // registerHubFlags 把共有 flag 注册到 fs（serve 额外有 -addr，chat 也有但可忽略）。
 func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 	return &hubFlags{
-		dbPath:         fs.String("db", "alasol.db", "事件库路径（SQLite）"),
-		addr:           fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
-		model:          fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
-		baseURL:        fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
-		apiKeyEnv:      fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
-		approval:       fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
-		allow:          fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
-		ask:            fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
-		maxTurns:       fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
-		contextBudget:  fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
-		system:         fs.String("system", "", "系统提示"),
-		indexerBatch:   fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
-		maxSessionRows: fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
-		cwd:            fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
-		runID:          fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
+		dbPath:           fs.String("db", "alasol.db", "事件库路径（SQLite）"),
+		addr:             fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
+		model:            fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
+		baseURL:          fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
+		apiKeyEnv:        fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
+		approval:         fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
+		allow:            fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
+		ask:              fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
+		maxTurns:         fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
+		contextBudget:    fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
+		system:           fs.String("system", "", "系统提示"),
+		indexerBatch:     fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
+		maxSessionRows:   fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
+		cwd:              fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
+		runID:            fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
+		onlineRows:       fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
+		onlineLineTokens: fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
+		onlineLevel:      fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
+		onlineWindow:     fs.Int("online-window", 0, "在线表 level=n 每行窗口行数（0=默认 5，K14）"),
 	}
 }
 
@@ -78,6 +86,11 @@ func (f *hubFlags) config() (host.Config, error) {
 		MaxSessionRows: *f.maxSessionRows,
 		CWD:            strings.TrimSpace(*f.cwd),
 		RunID:          strings.TrimSpace(*f.runID),
+
+		OnlineTableRows:       *f.onlineRows,
+		OnlineTableLineTokens: *f.onlineLineTokens,
+		OnlineTableLevel:      strings.TrimSpace(*f.onlineLevel),
+		OnlineTableWindow:     *f.onlineWindow,
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
@@ -172,6 +185,7 @@ func printBanner(addr string) {
 	fmt.Printf("  上下文   http://%s/api/context/{session_id}\n", addr)
 	fmt.Printf("  可见性   http://%s/api/peers?session_id=...（K11 水平可见性）\n", addr)
 	fmt.Printf("  加 gate  curl -X POST http://%s/api/gates/join -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
+	fmt.Printf("  在线表配置 http://%s/api/online-table/config（GET 读 / POST 运行期调，K15 不重启）\n", addr)
 	fmt.Printf("  健康     http://%s/api/health\n", addr)
 	fmt.Printf("  只监听 loopback（N5b）；Ctrl-C 退出\n")
 }
