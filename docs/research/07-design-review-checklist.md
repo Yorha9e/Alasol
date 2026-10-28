@@ -81,7 +81,7 @@
 
 | ID | 决策项 | 我的主张 | 备选 | 状态 |
 |---|---|---|---|---|
-| F1 | 一切皆事件 | 模型输出/工具调用/策略判定/压缩/审批 全是事件 | — | · |
+| F1 | 一切皆事件 | 模型输出/工具调用/策略判定/压缩/审批 全是事件。**user.prompt/model.turn 亦入流**（2026-10-28 v1-S1 补缺口：对话内容进事件流，旁路观测不计 Result.Events；实现：core/loop/events.go + runtime/replay.go FoldConversation）。压缩随 v2 落地同受本条约束 | — | ✅ |
 | F2 | 因果关系 | 扁平事件 + `Event.CausationID` 因果指针（completed/failed 指向同一次调用的 intent），**不引入 span 模型**。单 session 内提交序≈因果序（G25 session 亲和写），扁平指针足够追溯，span 树的额外复杂度在 v0 无对应收益（实现：contracts/event.go CausationID） | 完整 span 树 | ✅ |
 | F3 | 事件字段 | `kind` / `seq` / `ts` / `session_id` / `agent_id` / `causation_id` / `payload` | — | · |
 | F4 | loop 形态 | v0 控制流 + 完整事件记录：`core/loop` 是同步控制流状态机，但每轮落 `context.assembled`、每次工具调用落 intent/completed/failed 三段，事件流完整可回放；v1 再事件化（契约不变，纯增量）。先控制流是因为写路径形状（三段事件、X1 的"intent 先落盘"）比驱动模型更关键，控制流更易保证该不变式（实现：core/loop） | 直接事件驱动 | ✅ |
@@ -194,7 +194,7 @@
 | J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算。v0 未做——v2（深度压缩：级联候选解）再定；C 案的 goal ledger 已在 v0 事件化落地（J19/X6）备用 | ★ |
 | J19 | goal ledger 提案 | **目标、约束、已完成项、待解项**放在**上下文之外的独立持久存储**，由 agent 在关键点显式更新。压缩任一阶段只读账本 + 目标阶段全文 → 不需要级联；同时根治"目标偏移"。落地：`ledger.updated` durable 事件（全量快照），当前态 = 索引器 `ledger_state` 投影（LWW，seq 守卫），在上下文之外，X6 控制写放大（实现：core/durable/ledger.go + runtime/indexer） | ✅ |
 | J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」**。v0 未做——v2（深度压缩）再定 | ★ |
-| J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩） | ✅ |
+| J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩）。**落点（2026-10-28 v1-S1）**：usage 落 `model.turn` 事件 `ModelTurnUsage`，只进成本统计（实现：core/loop/events.go） | ✅ |
 
 ## K. 进程与多 session
 
@@ -347,7 +347,7 @@
 |---|---|---|---|
 | S1 | 框架 id 格式 | **ULID**（26 字符 Crockford base32）：全局唯一、同秒不撞、字典序=时间序、自带创建时间、文件名/URL 安全、大小写不敏感 | ✅ |
 | S2 | 序号 vs id | `turn_id` / `step_id` 用 **session 内 int64 序号**（天然可比较可排序），不用 ULID | ✅ |
-| S3 | 哈希的用途 | **只做路径分组**（`project_id` = hash(canonical_cwd)、`repo_id` = hash(canonical_git_root)），**不作身份** | ✅ |
+| S3 | 哈希的用途 | **只做路径分组**（`project_id` = hash(canonical_cwd)、`repo_id` = hash(canonical_git_root)），**不作身份**；**短形落定（2026-10-28 v1-S1）**：SHA-256 截短 128bit → Crockford base32 26 字符（复用 ULID 编码器；实现：core/hash.go + runtime/identity） | ✅ |
 | S4 | provider id | **黑盒**：原样存、原样回传；不解析 / 不改写 / 不折叠大小写 / 不做规范化 | ✅ |
 | S5 | 字段隔离 | `Event.id`（框架 ULID）与 `payload.tool_call_id`（provider 不透明串）**永远不同字段**；MCP 的 `sessionId` / `requestId` / `progressToken` **不进我们的命名空间** | ✅ |
 | S6 | JSON 类型 | 所有 id 在 JSON 里**一律 string**（int64/ULID 转 number 会丢精度） | ✅ |
@@ -357,8 +357,8 @@
 | S10 | 变更规则 | resume 保持同 id；fork/clone 生成**新 id + `parent_id`**；归档不改 id | ✅ |
 | S11 | 并发唯一性 | ULID 实现线程安全（时间戳单调 + 随机源加锁 / atomic 计数器）。落地：`core.NewUlid` 线程安全——48bit 毫秒时间戳 + 80bit 随机取自 `crypto/rand`（并发安全无需加锁），降级 `math/rand/v2`（顶层函数同样并发安全）；80bit 随机保证同毫秒内唯一（实现：core/ulid.go） | ✅ |
 | S12 | 校验与契约 | id 入 JSON 前统一校验（字符集/长度/非空/来源标记）；schema 里给每个 id 字段标 `pattern` + `x-id-kind`。落地：`core.ValidUlid` 校验 26 字符 Crockford base32（S9 不合则拒绝不修复），loop/agents/spawn 等入口调用它；schema 侧 id 字段标 `pattern` + `x-id-kind`（实现：core/ulid.go ValidUlid + contracts/schema） | ✅ |
-| S13 | 路径规范化 | ✅ **口径拍板（2026-10-28 用户）**：`hash(cwd)` 前必须 **解析符号链接（EvalSymlinks）→ Windows 转小写 → 统一分隔符 → 去尾斜杠**；`project_id = hash(canonical_cwd)`。实现在 v1（与 S14/K12 同批） | ✅ |
-| S14 | repo_id 独立 | ✅ **口径拍板（2026-10-28 用户）**：`repo_id = hash(canonical_git_root)`，worktree 隔离下多个 cwd **按 git root 聚合**（资产图按 repo 级）。实现在 v1（K12 gate 自动加入依赖它） | ✅ |
+| S13 | 路径规范化 | ✅ **口径拍板（2026-10-28 用户）**：`hash(cwd)` 前必须 **解析符号链接（EvalSymlinks）→ Windows 转小写 → 统一分隔符 → 去尾斜杠**；`project_id = hash(canonical_cwd)`。**落地（2026-10-28 v1-S1）**：runtime/identity；Windows 的 EvalSymlinks 不解析 junction 且遇 junction 报错 → 落地为逐组件 `os.Readlink`（junction/symlink 一视同仁 + 环路保护），语义等同口径；入口先 `filepath.Abs`（相对路径写法不漂移） | ✅ |
+| S14 | repo_id 独立 | ✅ **口径拍板（2026-10-28 用户）**：`repo_id = hash(canonical_git_root)`，worktree 隔离下多个 cwd **按 git root 聚合**（资产图按 repo 级）。**落地（2026-10-28 v1-S1）**：worktree 的 `.git` 文件读 `gitdir:` 回溯主仓根，实测多 worktree 同 repo_id、异 project_id | ✅ |
 | S16 | **命名空间补全** | ✅ 08 的命名空间表补入：`causation_id`（F3）、`gate_id`（K12）、`workflow:<run_id>`、`sum:` 引用（ContextSnapshot）、`parent_agent_id`（K26） | ✅ |
 | S15 | 展示前缀 | 日志/UI 用 `session_id[:8]`，**比较一律用完整值** | · |
 
@@ -464,9 +464,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **134** 条 · ★ 待议 **56** 条 · · 默认通过（我的主张，未逐条确认）**90** 条 · 共 **280** 条
+**合计**：✅ 已定 **135** 条 · ★ 待议 **56** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）
 
 ---
 

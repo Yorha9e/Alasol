@@ -144,6 +144,29 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if len(p.Parts) == 0 {
 				t.Errorf("line %d: context snapshot parts are empty", lineNo)
 			}
+		case "user.prompt":
+			var p UserPromptPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into UserPromptPayload: %v", lineNo, err)
+				break
+			}
+			if p.Text == "" {
+				t.Errorf("line %d: user.prompt text is empty", lineNo)
+			}
+		case "model.turn":
+			var p ModelTurnPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ModelTurnPayload: %v", lineNo, err)
+				break
+			}
+			// usage 只做成本记录（J21）：样本里必须带得上，且 token 数非零。
+			if p.Usage == nil {
+				t.Errorf("line %d: model.turn 应带 usage（token 计量）", lineNo)
+				break
+			}
+			if p.Usage.InputTokens == 0 || p.Usage.OutputTokens == 0 {
+				t.Errorf("line %d: model.turn usage 应带非零 token 数: %+v", lineNo, p.Usage)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -164,7 +187,10 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	}
 	// Every kind with a frozen payload mapping must be covered by the sample
 	// and must decode into its type (x-kind-payload in event.json is the source).
-	for _, kind := range []string{"tool.call.intent", "tool.call.completed", "tool.call.failed", "context.assembled"} {
+	for _, kind := range []string{
+		"tool.call.intent", "tool.call.completed", "tool.call.failed",
+		"context.assembled", "user.prompt", "model.turn",
+	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)
 		}

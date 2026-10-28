@@ -58,7 +58,7 @@ func createFromEvents(ctx context.Context, store core.Store, sessionID contracts
 		payload.InFlight = []contracts.InFlightOp{} // required 字段：空清单落 [] 而非 null
 	}
 
-	agentID := primaryAgentID(events)
+	agentID := PrimaryAgentID(events)
 	ev, err := newDurableEvent(sessionID, agentID, KindCheckpointCreated, nil, payload)
 	if err != nil {
 		return contracts.CheckpointCreatedPayload{}, err

@@ -27,6 +27,22 @@
 // 什么"——上下文可见性的数据源（06 §4.2）。它是观测性事实，落库失败不中止 loop
 // （与 X1 的 intent 写路径刻意区分）。
 //
+// # 对话入事件流（v1-S1，补 F1 缺口）
+//
+// 除三段写路径外，loop 还把**对话内容**落进事件流，使回放/resume 能重建完整对话历史：
+//
+//   - Run 开始落一条 user.prompt（载荷 contracts.UserPromptPayload，text=prompt 原文）；
+//   - 每轮 provider 返回后落一条 model.turn（contracts.ModelTurnPayload，text + usage）。
+//
+// 二者是**旁路观测**：best-effort 落库、**不计入 Result.Events**、不改变任何控制流，与 X1
+// 三段写路径刻意分离（写路径形状一字不动）。usage 只做成本记录（J21），绝不回填 context
+// 快照、不接入任何预算/门禁判断。runtime/replay.go 的 FoldConversation 从这三类事件
+// （user.prompt / model.turn / tool.call.*）fold 出可供 resume 续跑的对话历史。
+//
+// **续跑**：RunWithHistory(ctx, history, prompt) 把既有历史（通常是 FoldConversation 的
+// 产出）排在本次 prompt 之前发给模型——对话进了事件流就能被回放重建，而重建出来的历史
+// 必须能喂回 loop 才叫续跑。Run = RunWithHistory(ctx, nil, prompt)（语义不变）。
+//
 // Provider 出错不是工具调用失败（M1：失败是普通事件）：Run 返回 error 由调用方处理，
 // 同时尽力补一条 durable 的 loop.error 事件供事后审计。ctx 取消立即返回 ctx.Err()。
 //

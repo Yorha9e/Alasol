@@ -36,7 +36,7 @@ type RestoredNode struct {
 type RestoredTree struct {
 	// Nodes 以 agent_id 为键。
 	Nodes map[contracts.Ulid]RestoredNode `json:"nodes"`
-	// Root 是推断出的根 agent（primaryAgentID 的口径；无 agent 事件时为零值）。
+	// Root 是推断出的根 agent（PrimaryAgentID 的口径；无 agent 事件时为零值）。
 	Root contracts.Ulid `json:"root"`
 	// ownership 保留 fold 顺序的归属记录（供 ResolveChild 与审计）。
 	ownership []Ownership
@@ -90,7 +90,7 @@ func foldTree(events []contracts.Event) *RestoredTree {
 			}
 		}
 	}
-	t.Root = primaryAgentID(events)
+	t.Root = PrimaryAgentID(events)
 	return t
 }
 

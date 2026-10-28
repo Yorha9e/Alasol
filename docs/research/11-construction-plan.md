@@ -192,7 +192,7 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **v1-S1 地基补齐** | ① `user.prompt` / `model.turn` 事件入流（补 F1 缺口：对话内容进事件流，resume/回放才完整）② S13/S14 路径规范化 + `project_id`/`repo_id`（EvalSymlinks→小写→统一分隔符→去尾；按 git root 聚合） | 事件流能回放**完整对话**；同 repo 多 worktree（含大小写/junction 用例）聚出同一 repo_id |
+| **v1-S1 地基补齐** | ① `user.prompt` / `model.turn` 事件入流（补 F1 缺口：对话内容进事件流，resume/回放才完整）② S13/S14 路径规范化 + `project_id`/`repo_id`（EvalSymlinks→小写→统一分隔符→去尾；按 git root 聚合） | 事件流能回放**完整对话**；同 repo 多 worktree（含大小写/junction 用例）聚出同一 repo_id | **✅ 完成（2026-10-28，评审循环 clean）**：`runtime/identity` + 对话事件入流 + `FoldConversation`；另闭环 `alasol resume -continue` 续跑（fold→RunWithHistory）。注：EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink（语义等同，详见 07/S13 行内） |
 | **v1-S2 hub 与发现表** | hub daemon（多 session 宿管）+ K10 发现表（事件驱动内存活状态）+ K12 gate（自动 `repo:`/`workflow:` + `join_gate`）+ K11 水平可见性 | 两个 session 经 gate 互见主 agent；发现表崩溃重启后由事件流重建 |
 | **v1-S3 agentlink** | K18 五件套：Presence / Discover / Inquiry / Broadcast / Handoff（库形态，不绑协议） | Inquiry 拉原文可核验 summary 的 refs（端到端） |
 | **v1-S4 在线表注入** | K14/K15：50 行 / ≤100 token / gate 过滤，**全可配 + 运行期动态管理**，恒在 prompt 末尾（Q4） | 主 agent prompt 尾部出现在线表；参数运行期可调且不重启 |

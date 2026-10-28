@@ -145,7 +145,8 @@ func TestAPISessionsContextHealth(t *testing.T) {
 
 	sid := runOneRound(t, h, "读一下目标文件")
 
-	// 在线表：一行，四条事件，最后 kind 是收尾那一轮的 context.assembled。
+	// 在线表：一行，七条事件，最后 kind 是收尾那一轮的 model.turn
+	// （v1-S1 起对话入流：user.prompt + 两轮各 context.assembled/model.turn + intent + completed = 7）。
 	rows = nil
 	if code := getJSON(t, srv.URL+"/api/sessions", &rows); code != http.StatusOK {
 		t.Fatalf("sessions 状态码 = %d", code)
@@ -157,11 +158,11 @@ func TestAPISessionsContextHealth(t *testing.T) {
 	if row.SessionID != string(sid) {
 		t.Fatalf("session_id = %q，want %q", row.SessionID, sid)
 	}
-	if row.EventCount != 4 || row.FirstSeq != 1 || row.LastSeq != 4 {
+	if row.EventCount != 7 || row.FirstSeq != 1 || row.LastSeq != 7 {
 		t.Fatalf("seq/计数不符: %+v", row)
 	}
-	if row.LastKind != "context.assembled" {
-		t.Fatalf("last_kind = %q，want context.assembled", row.LastKind)
+	if row.LastKind != "model.turn" {
+		t.Fatalf("last_kind = %q，want model.turn", row.LastKind)
 	}
 	if row.UpdatedAt == "" || row.Watermark <= 0 {
 		t.Fatalf("updated_at / watermark 缺失: %+v", row)
@@ -499,8 +500,8 @@ func TestTwoHubsShareOneEventLog(t *testing.T) {
 	seen := map[string]bool{}
 	for _, r := range rows {
 		seen[r.SessionID] = true
-		if r.EventCount != 4 {
-			t.Fatalf("session %s event_count = %d，want 4", r.SessionID, r.EventCount)
+		if r.EventCount != 7 {
+			t.Fatalf("session %s event_count = %d，want 7", r.SessionID, r.EventCount)
 		}
 	}
 	if !seen[string(sidA)] || !seen[string(sidB)] {
@@ -558,8 +559,8 @@ func TestReopenPreservesOnlineTableAndSnapshot(t *testing.T) {
 	if code := getJSON(t, srv.URL+"/api/sessions", &rows); code != http.StatusOK || len(rows) != 1 {
 		t.Fatalf("重开后在线表 = %d 行（code=%d）", len(rows), code)
 	}
-	if rows[0].EventCount != 4 {
-		t.Fatalf("重开后 event_count = %d，want 4", rows[0].EventCount)
+	if rows[0].EventCount != 7 {
+		t.Fatalf("重开后 event_count = %d，want 7", rows[0].EventCount)
 	}
 	var snap contracts.ContextSnapshot
 	if code := getJSON(t, srv.URL+"/api/context/"+string(sid), &snap); code != http.StatusOK {

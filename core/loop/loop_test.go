@@ -46,9 +46,9 @@ func (o *orderLog) all() []string {
 
 // storeLabel 把一条入库事件压成时间线上的一格（kind + provider 黑盒 id）。
 //
-// context.assembled 是每轮模型调用前落的一条**观测事件**（core/loop/context.go），
-// 不在写路径时间线上占格——时间线断言的是 X1 的"意图 → 执行 → 结果"顺序，
-// 它的形状由 TestContextAssembledEmittedEveryTurn 单独断言。返回空串 = 不占格。
+// context.assembled / user.prompt / model.turn 是**观测事件**（core/loop/context.go 与
+// events.go 的旁路对话观测），不在写路径时间线上占格——时间线断言的是 X1 的"意图 → 执行 →
+// 结果"顺序，它们的形状由各自的专门测试断言。返回空串 = 不占格。
 func storeLabel(ev contracts.Event) string {
 	switch ev.Kind {
 	case loop.KindToolCallIntent:
@@ -64,10 +64,21 @@ func storeLabel(ev contracts.Event) string {
 		_ = json.Unmarshal(ev.Payload, &p)
 		return "failed:" + string(p.ToolCallID)
 	default:
-		if ev.Kind == loop.KindContextAssembled {
+		if isObservationKind(ev.Kind) {
 			return "" // 观测事件不占写路径时间线
 		}
 		return ev.Kind
+	}
+}
+
+// isObservationKind 判定一个 kind 是否是"观测事件"（不占 X1 写路径时间线）：
+// context.assembled（上下文可见性）+ v1-S1 的旁路对话观测 user.prompt / model.turn。
+func isObservationKind(kind string) bool {
+	switch kind {
+	case loop.KindContextAssembled, loop.KindUserPrompt, loop.KindModelTurn:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -411,12 +422,12 @@ func (h *harness) kinds() []string {
 	return out
 }
 
-// writePathKinds 是 kinds() 的"只看写路径"版：过滤掉每轮一条的 context.assembled
-// 观测事件（core/loop/context.go），让三段写路径的顺序断言保持原有口径。
+// writePathKinds 是 kinds() 的"只看写路径"版：过滤掉观测事件（context.assembled +
+// v1-S1 旁路对话观测 user.prompt / model.turn），让三段写路径的顺序断言保持原有口径。
 func (h *harness) writePathKinds() []string {
 	var out []string
 	for _, ev := range h.events() {
-		if ev.Kind == loop.KindContextAssembled {
+		if isObservationKind(ev.Kind) {
 			continue
 		}
 		out = append(out, ev.Kind)
@@ -424,13 +435,12 @@ func (h *harness) writePathKinds() []string {
 	return out
 }
 
-// writePath 过滤掉每轮一条的 context.assembled 观测事件，只留三段写路径 /
-// loop.error / agent 生命周期事件（context.assembled 的形状由
-// TestContextAssembledEmittedEveryTurn 单独断言）。
+// writePath 过滤掉观测事件（context.assembled / user.prompt / model.turn），只留三段写路径 /
+// loop.error / agent 生命周期事件（观测事件的形状由各自专门测试断言）。
 func writePath(evs []contracts.Event) []contracts.Event {
 	out := make([]contracts.Event, 0, len(evs))
 	for _, ev := range evs {
-		if ev.Kind == loop.KindContextAssembled {
+		if isObservationKind(ev.Kind) {
 			continue
 		}
 		out = append(out, ev)
@@ -1350,8 +1360,8 @@ func TestRepeatedRunsDoNotCollide(t *testing.T) {
 		}
 	}
 	evs := h.events()
-	if len(evs) != 12 {
-		t.Fatalf("三次 Run 应有 12 条事件（每次两轮各一条 context.assembled + intent + completed），得到 %d", len(evs))
+	if len(evs) != 21 {
+		t.Fatalf("三次 Run 应有 21 条事件（每次：user.prompt + 两轮各 context.assembled/model.turn + intent + completed），得到 %d", len(evs))
 	}
 	seenID := map[contracts.Ulid]bool{}
 	seenSeq := map[int64]bool{}

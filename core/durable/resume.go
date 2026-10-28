@@ -167,7 +167,7 @@ func Resume(ctx context.Context, store core.Store, sessionID contracts.Ulid, opt
 	// ⑤ 落 session.resumed（④ 树已 fold 进 report.Tree；真正续跑 turn 由调用方 loop 接手）。
 	agentID := opts.ActingAgentID
 	if agentID == "" {
-		agentID = primaryAgentID(events)
+		agentID = PrimaryAgentID(events)
 	}
 	resumedEv, err := newDurableEvent(sessionID, agentID, KindSessionResumed, nil, contracts.SessionResumedPayload{
 		SessionID:           sessionID,

@@ -201,8 +201,8 @@ func TestReopenPreservesEventsAndContinuesSeq(t *testing.T) {
 	if got, want := []string{evs[0].Kind, evs[1].Kind}, []string{loop.KindToolCallIntent, loop.KindToolCallCompleted}; !equalStrings(got, want) {
 		t.Fatalf("重启后事件序 = %v，want %v", got, want)
 	}
-	if evs[0].Seq == nil || *evs[0].Seq != 2 || evs[1].Seq == nil || *evs[1].Seq != 3 {
-		t.Fatalf("重启后 seq 应保序（每轮先落 context.assembled，故 intent/completed 占 seq 2/3）: %v %v", *evs[0].Seq, *evs[1].Seq)
+	if evs[0].Seq == nil || *evs[0].Seq != 4 || evs[1].Seq == nil || *evs[1].Seq != 5 {
+		t.Fatalf("重启后 seq 应保序（Run 先落 user.prompt，每轮先落 context.assembled + model.turn，故 intent/completed 占 seq 4/5）: %v %v", *evs[0].Seq, *evs[1].Seq)
 	}
 	in := decodeIntent(t, evs[0])
 	if string(in.ToolCallID) != "c1" || string(in.Arguments) != `{"text":"before"}` {
@@ -227,15 +227,15 @@ func TestReopenPreservesEventsAndContinuesSeq(t *testing.T) {
 		t.Fatalf("重启后 Result 不符: %+v", res2)
 	}
 	evs = fs2.all()
-	if len(evs) != 8 {
-		t.Fatalf("重启后总事件数 = %d，want 8", len(evs))
+	if len(evs) != 14 {
+		t.Fatalf("重启后总事件数 = %d，want 14", len(evs))
 	}
-	for i, want := range []int64{1, 2, 3, 4, 5, 6, 7, 8} {
+	for i, want := range []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14} {
 		if evs[i].Seq == nil || *evs[i].Seq != want {
 			t.Fatalf("第 %d 条事件 seq = %v，want %d（不得重用）", i, evs[i].Seq, want)
 		}
 	}
-	// 第二次的 intent/completed 仍是一对，id 原样（seq 6/7：每轮先落 context.assembled）。
+	// 第二次的 intent/completed 仍是一对，id 原样（seq 11/12：Run 先落 user.prompt，每轮先落 context.assembled + model.turn）。
 	last := writePath(evs)[2:]
 	if got := string(decodeIntent(t, last[0]).ToolCallID); got != "c2" {
 		t.Fatalf("重启后 intent id = %q", got)
@@ -314,7 +314,7 @@ func TestConcurrentLoopsNoOversellOrLoss(t *testing.T) {
 		t.Fatalf("并发 Run 出错: %v", errs[0])
 	}
 
-	want := goroutines * perLoop * 4 // 每次 Run 两轮各一条 context.assembled + intent + completed
+	want := goroutines * perLoop * 7 // 每次 Run：user.prompt + 两轮各 context.assembled/model.turn + intent + completed
 	evs := h.events()
 	if len(evs) != want {
 		t.Fatalf("事件数 = %d，want %d（无丢失）", len(evs), want)
@@ -379,7 +379,7 @@ func TestConcurrentExecutorsShareRegistry(t *testing.T) {
 	if n := exec.callN(); n != 6 {
 		t.Fatalf("执行器应被调用 6 次，得到 %d", n)
 	}
-	if n := len(h.events()); n != 24 {
-		t.Fatalf("应有 24 条事件（6 个 loop × 两轮各一条 context.assembled + intent + completed），得到 %d", n)
+	if n := len(h.events()); n != 42 {
+		t.Fatalf("应有 42 条事件（6 个 loop × 每次 Run：user.prompt + 两轮 context.assembled/model.turn + intent + completed），得到 %d", n)
 	}
 }

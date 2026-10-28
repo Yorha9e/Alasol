@@ -147,6 +147,52 @@ func (l *Loop) publishLoopError(ctx context.Context, turn int, phase string, cau
 	return n
 }
 
+// 对话入流观测的 loop.error 阶段名（phase 是开放字符串，此处只新增两个取值）。
+const (
+	phaseUserPrompt = "user.prompt"
+	phaseModelTurn  = "model.turn"
+)
+
+// publishUserPrompt 在 Run 开始时落一条 user.prompt durable 事件（F1：对话内容进事件流）。
+//
+// **旁路观测**（与 X1 三段写路径刻意分离）：best-effort 落库，落不下只在事件流里补一条
+// loop.error 留痕，**不中止 Run、不计入 Result.Events**——它记录"用户说了什么"这一事实，
+// 不是任何执行的前提。causation=nil（对话的根，无上游事件）。
+func (l *Loop) publishUserPrompt(ctx context.Context, prompt string) {
+	ev, err := l.newEvent(KindUserPrompt, nil, contracts.UserPromptPayload{Text: prompt})
+	if err != nil {
+		l.publishLoopError(ctx, 0, phaseUserPrompt, err)
+		return
+	}
+	if _, err := l.publish(ctx, ev); err != nil {
+		l.publishLoopError(ctx, 0, phaseUserPrompt, err)
+	}
+}
+
+// publishModelTurn 在一轮 provider 返回后落一条 model.turn durable 事件（F1），携带本轮文本
+// 与 usage。
+//
+// **旁路观测**：best-effort 落库、不计入 Result.Events、不改变控制流（同 publishUserPrompt）。
+// usage **只做成本记录**（J21）：绝不回填 context 快照（快照=事前估算为正式口径），更不接入
+// 任何预算/门禁判断——这里只是把 provider 上报的 token 数原样搬进事件，供后续成本统计读。
+// causation=nil（模型的响应是 originating 事实，无单一上游事件）。
+func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResult) {
+	ev, err := l.newEvent(KindModelTurn, nil, contracts.ModelTurnPayload{
+		Text: mr.Text,
+		Usage: &contracts.ModelTurnUsage{
+			InputTokens:  mr.Usage.InputTokens,
+			OutputTokens: mr.Usage.OutputTokens,
+		},
+	})
+	if err != nil {
+		l.publishLoopError(ctx, turn, phaseModelTurn, err)
+		return
+	}
+	if _, err := l.publish(ctx, ev); err != nil {
+		l.publishLoopError(ctx, turn, phaseModelTurn, err)
+	}
+}
+
 // policySnapshot 把判定时刻的策略结论序列化成 intent 的 policy_snapshot
 // （M9/陷阱 15：策略在 T0 判定、副作用持续到 Tn，「判定只约束发起时刻」是已知边界，
 // 快照供事后审计）。

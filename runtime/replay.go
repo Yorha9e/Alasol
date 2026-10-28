@@ -48,3 +48,114 @@ func FoldLedger(events []contracts.Event) contracts.LedgerUpdatedPayload {
 
 // kindLedgerUpdated 与 indexer 保持一致；这里 fold 只关心这一种 kind。
 const kindLedgerUpdated = "ledger.updated"
+
+// 对话入流的 kind（v1-S1，F1）：与 core/loop 落的 kind 一致，此处 fold 重建对话历史。
+// 用字符串字面量而非 import core/loop——runtime 不依赖 loop 包，fold 只关心这几种 kind。
+const (
+	kindUserPrompt        = "user.prompt"
+	kindModelTurn         = "model.turn"
+	kindToolCallIntent    = "tool.call.intent"
+	kindToolCallCompleted = "tool.call.completed"
+	kindToolCallFailed    = "tool.call.failed"
+)
+
+// FoldConversation 从事件流 fold 出对话历史（[]core.Message，F1：事件流是唯一事实源）。
+//
+// v1-S1 起，user.prompt / model.turn / tool.call.* 三类事件共同构成完整对话；本函数把它们
+// 拍成 provider 无关的对话历史，**可直接喂给 Loop 续跑**（resume 的对话重建）。传入事件应按
+// seq 升序（如 ReplaySession 的返回值）。重建规则与 core/loop.Run 写历史的顺序对应：
+//
+//	user.prompt         → Message{Role:"user",    Content:text}
+//	model.turn          → Message{Role:"assistant",Content:text}   （工具调用挂在它身上）
+//	tool.call.intent    → 作为 ToolCallReq 追加到**最近一条** assistant 的 ToolCalls
+//	                      （一个 model.turn 后的多个 intent 按序复原该轮多次调用）
+//	tool.call.completed → Message{Role:"tool", Content:结果文本, ToolCallID}
+//	tool.call.failed    → Message{Role:"tool", Content:错误说明, ToolCallID}
+//
+// 容错（D7 宽容）：载荷不可解析的已知 kind 被跳过，不中断 fold（同 FoldLedger）。
+// 多 agent 场景下同一 session 混有多个 agent_id 的对话——调用方应按 agent_id 预过滤
+// （事件本身带 agent_id），本函数只按给定顺序 fold，不替调用方拆分视角。
+func FoldConversation(events []contracts.Event) []core.Message {
+	var msgs []core.Message
+	lastAssistant := -1 // 最近一条 assistant 消息的下标（-1 = 尚无；工具调用挂它身上）
+	for i := range events {
+		ev := &events[i]
+		switch ev.Kind {
+		case kindUserPrompt:
+			var p contracts.UserPromptPayload
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			msgs = append(msgs, core.Message{Role: "user", Content: p.Text})
+			lastAssistant = -1
+		case kindModelTurn:
+			var p contracts.ModelTurnPayload
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			msgs = append(msgs, core.Message{Role: "assistant", Content: p.Text})
+			lastAssistant = len(msgs) - 1
+		case kindToolCallIntent:
+			var p contracts.ToolCallIntentPayload
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			if lastAssistant >= 0 {
+				m := &msgs[lastAssistant]
+				m.ToolCalls = append(m.ToolCalls, core.ToolCallReq{
+					ID:   p.ToolCallID, // provider 黑盒 id 原样（S4）
+					Name: p.ToolName,
+					Args: p.Arguments,
+				})
+			}
+		case kindToolCallCompleted:
+			var p contracts.ToolCallCompletedPayload
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			msgs = append(msgs, core.Message{
+				Role:       "tool",
+				Content:    toolResultText(p.Result),
+				ToolCallID: p.ToolCallID,
+			})
+		case kindToolCallFailed:
+			var p contracts.ToolCallFailedPayload
+			if json.Unmarshal(ev.Payload, &p) != nil {
+				continue
+			}
+			msgs = append(msgs, core.Message{
+				Role:       "tool",
+				Content:    p.Error.Message,
+				ToolCallID: p.ToolCallID,
+			})
+		}
+	}
+	return msgs
+}
+
+// toolResultText 把 ToolResult 拍成文本（text 块拼接、结构化块原样带上）——与 core/loop 回填
+// 给模型的 toolResultText 同口径，使 fold 出的 tool 消息内容与当初写进历史的一致。此处复刻
+// 而非 import core/loop：runtime 不依赖 loop 包，且这是个定义良好的纯变换。
+func toolResultText(res contracts.ToolResult) string {
+	var parts []string
+	for _, p := range res.Content {
+		switch {
+		case p.Text != nil && *p.Text != "":
+			parts = append(parts, *p.Text)
+		case len(p.Data) > 0:
+			parts = append(parts, string(p.Data))
+		}
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	default:
+		out := parts[0]
+		for _, p := range parts[1:] {
+			out += "\n" + p
+		}
+		return out
+	}
+}

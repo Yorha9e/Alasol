@@ -17,8 +17,8 @@
 | `tool_call_id` | **provider** | provider 内 | **不透明字符串** | 一次调用 | **必须原样回传 provider** |
 | `blob_id` | 框架 | 全局 | ULID | 终身 | 大对象引用 |
 | `artifact_id` | 框架 | 全局 | ULID | 终身 | 产物引用 |
-| `project_id` | 框架 | 全局 | `hash(canonical_cwd)` 短 base32 | 路径变更则变 | 目录分组 |
-| `repo_id` | 框架 | 全局 | `hash(canonical_git_root)` | 同上 | 跨 worktree 聚合 |
+| `project_id` | 框架 | 全局 | `hash(canonical_cwd)` 短 base32（SHA-256 截短 128bit→26 字符） | 路径变更则变 | 目录分组 |
+| `repo_id` | 框架 | 全局 | `hash(canonical_git_root)` 短 base32（同上） | 同上 | 跨 worktree 聚合 |
 | `node_nid` | 框架 | 图内 | int64 | 永久 | 图内部节点 id（对外用名字） |
 | `mcp_session_id` | MCP | MCP 会话内 | 协议定义 | — | MCP 协议专用 |
 | `causation_id` | 框架 | 全局 | ULID | 终身 | 事件的因果指针（指向触发它的那个事件） |
@@ -33,7 +33,7 @@
 - **框架 id**：我们自己生成，格式受控，可比较，可排序，可做文件名
 - **provider id**：模型生成的，**完全不透明**，原样存、原样回传
 - **序号**：session / turn 内的递增整数，用于"第几轮""第几步"——**不用 ULID**（序号天然可比较、可排序，省一个索引）
-- **哈希**：只用于路径分组（`project_id` / `repo_id`），**不用作身份**
+- **哈希**：只用于路径分组（`project_id` / `repo_id`），**不用作身份**；短形 = SHA-256 截短 128bit → Crockford base32 26 字符（2026-10-28 v1-S1 落定，复用 ULID 编码器）
 
 ---
 

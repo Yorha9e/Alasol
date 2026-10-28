@@ -230,3 +230,25 @@ type ResumeClaimedPayload struct {
 	// Format: date-time
 	ClaimedAt *string `json:"claimed_at,omitempty"`
 }
+
+// user.prompt —— 用户 prompt 入事件流（F1：对话内容是事实源的一部分，回放/resume 据此重建完整对话历史）。Run 开始时落一条；text 为 prompt 原文。
+type UserPromptPayload struct {
+	// 用户 prompt 原文。
+	Text string `json:"text"`
+}
+
+// token 计量（J21）：只做成本记录，不回填 context 快照（快照=事前估算为正式口径），更不接入任何预算/门禁判断。
+type ModelTurnUsage struct {
+	// 输入 token 数。
+	InputTokens int64 `json:"input_tokens"`
+	// 输出 token 数。
+	OutputTokens int64 `json:"output_tokens"`
+}
+
+// model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。
+type ModelTurnPayload struct {
+	// 模型本轮文本输出。
+	Text string `json:"text"`
+	// token 计量（J21：只做成本记录，provider 不上报 usage 时可缺省）。
+	Usage *ModelTurnUsage `json:"usage,omitempty"`
+}

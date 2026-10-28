@@ -65,7 +65,7 @@ func claimResume(ctx context.Context, store core.Store, sessionID contracts.Ulid
 	}
 
 	attempt := core.NewUlid()
-	ev, err := newDurableEvent(sessionID, primaryAgentID(events), KindSessionResumeClaimed, nil, contracts.ResumeClaimedPayload{
+	ev, err := newDurableEvent(sessionID, PrimaryAgentID(events), KindSessionResumeClaimed, nil, contracts.ResumeClaimedPayload{
 		SessionID: sessionID,
 		AttemptID: attempt,
 		Round:     round,

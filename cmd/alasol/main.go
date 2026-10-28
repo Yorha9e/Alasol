@@ -11,9 +11,12 @@
 //	alasol models [-base-url ...] [-api-key-env OPENAI_API_KEY]
 //	          → 列出端点支持的模型名（模型名是端点相关的，没有万能默认值）
 //
-//	alasol resume -session <id> [-db alasol.db] [-verify git|none]
+//	alasol resume -session <id> [-db alasol.db] [-verify git|none] [-continue "<提示>"]
 //	          → 跑 X4 恢复流程（读 checkpoint → fold → 处置 in-flight → session.resumed），
 //	            打印处置明细（safe 重放 / verify 先核验 / unsafe 转人工）
+//	          → 加 -continue "<提示>"：恢复后再续跑一轮对话（把 fold 出的历史灌回 loop）。
+//	            续跑折叠**整场 session** 的对话、**不区分 agent 视角**（子 agent 的对话也会
+//	            进入上下文；按 agent 过滤是后续增强，尚未实现）
 //
 //	alasol serve [-addr 127.0.0.1:8720] [-db alasol.db] [-model ...] [-allow ...]
 //	          → 起 hub：GET / 是 Web UI、GET /ws 是 NDJSON 事件流、GET /api/* 是在线表/上下文
@@ -67,7 +70,9 @@ func usage() {
 
 用法：
   alasol run    -prompt <text> [flags]   跑一轮真机回路（单次）
-  alasol resume -session <id> [flags]     恢复一个 session（X4 durable：处置 in-flight）
+  alasol resume -session <id> [flags]     恢复一个 session（X4 durable：处置 in-flight；
+                                        -continue "<提示>" 续跑一轮对话：折叠整场 session 的
+                                        对话、不区分 agent 视角）
   alasol serve  [flags]                 起常驻 hub：Web UI + WS 事件流 + HTTP API
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx
   alasol models [flags]                 列出端点支持的模型（发现模型名）

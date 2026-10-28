@@ -193,8 +193,8 @@ func TestChatREPLEndToEnd(t *testing.T) {
 	if !strings.Contains(got, "CLI 读完了") {
 		t.Fatalf("输出里没有模型文本:\n%s", got)
 	}
-	// ② 在线表里有这个 session（事件数 4 = 两轮 context.assembled + intent + completed）。
-	if !strings.Contains(got, "context.assembled") {
+	// ② 在线表里有这个 session（事件数 7 = user.prompt + 两轮 context.assembled/model.turn + intent + completed；last_kind 为收尾轮的 model.turn）。
+	if !strings.Contains(got, "model.turn") {
 		t.Fatalf("/table 输出里没有 last_kind:\n%s", got)
 	}
 	// ③ 上下文构成面板数据：三个 part 都在。

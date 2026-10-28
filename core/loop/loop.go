@@ -18,10 +18,14 @@ import (
 // 避免无限工具调用把会话/预算烧穿（M 系列护栏，防呆默认值）。
 const DefaultMaxTurns = 20
 
-// 事件 kind（core 定义核心子集）：三段写路径 + loop 自身的错误通道。
+// 事件 kind（core 定义核心子集）：三段写路径 + loop 自身的错误通道 + 对话入流观测。
 //
 // loop.error 不是工具调用失败（M1：失败是普通事件，不是特殊通道）——
 // 它只记录"这一轮 loop 自己没能继续往下走"的事实（模型调用失败、intent 落盘失败）。
+//
+// user.prompt / model.turn 是 v1-S1 补 F1 缺口的**旁路观测**（对话内容进事件流，供回放/
+// resume 重建完整对话历史）：best-effort 落库、不占 Result.Events 计数、不改变任何控制流，
+// 与 X1 三段写路径刻意分离（见 events.go 的 publishUserPrompt / publishModelTurn）。
 const (
 	// KindToolCallIntent 三段之①：意图 durable 落盘后才允许执行（X1）。
 	KindToolCallIntent = "tool.call.intent"
@@ -31,6 +35,10 @@ const (
 	KindToolCallFailed = "tool.call.failed"
 	// KindLoopError loop 自身错误的 durable 事件（模型调用失败 / intent 落盘失败）。
 	KindLoopError = "loop.error"
+	// KindUserPrompt 用户 prompt 入事件流（F1：对话内容是事实源的一部分）。Run 开始时一条。
+	KindUserPrompt = "user.prompt"
+	// KindModelTurn 一轮 provider 返回的事实（F1，含 usage 只做成本记录，J21）。每轮一条。
+	KindModelTurn = "model.turn"
 )
 
 // 失败分类码（M4：可重试/致命分类用的开放字符串；这里固化 loop 自己产生的几种）。
@@ -145,6 +153,9 @@ type Result struct {
 	// Events 本 Run 成功落库的 durable 事件数（每轮一条 context.assembled + intent +
 	// completed/failed + loop.error + agent.spawned/completed/failed；
 	// 子 loop 的事件计入父的 spawn 调用）。
+	// **不含**旁路对话观测 user.prompt / model.turn（F1 的对话入流事实，v1-S1）：它们
+	// best-effort 落库、独立于写路径与控制流，故不计入本计数（口径同 maybeCheckpoint 的
+	// checkpoint.created——恢复/对话元数据不是 loop 一轮的写路径产出）。
 	Events int
 	// Summary 子 agent 经 complete 收敛时的结构化汇报（根 agent / 未收敛为 nil）。
 	Summary *contracts.AgentSummary
@@ -242,7 +253,23 @@ func validateUlid(field string, id contracts.Ulid) error {
 // 每轮模型调用前还会落一条 context.assembled durable 事件（载荷 = contracts.ContextSnapshot，
 // 见 core/loop/context.go）：上下文可见性的数据源（06 §4.2）。它是观测性事实，落库失败
 // **不中止** loop（只补 loop.error 留痕）——与 X1 的 intent 写路径刻意区分。
-func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
+//
+// 从既有历史续跑用 RunWithHistory。
+func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
+	return l.RunWithHistory(ctx, nil, prompt)
+}
+
+// RunWithHistory 带**既有历史**跑一次 agent loop（resume 续跑用）。
+//
+// history 是此前的对话历史（如 runtime.FoldConversation 从事件流 fold 出来的对话）：
+// 它会**排在本次 prompt 之前**发给模型，本次对话接着它继续（历史本身不被改写——拷贝一份）。
+//
+// 与 Run 的差别只有一处：起始历史不是空的。控制流、事件写路径（X1 三段写路径一字不动）、
+// 旁路观测（user.prompt / model.turn）全同。
+//
+// 为什么需要它（v1-S1）：对话内容进了事件流（F1）就能被回放重建，但"重建出来的历史"
+// 必须能**喂回 loop** 才叫续跑——否则 FoldConversation 只是素材，不是能力。
+func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, prompt string) (res Result, err error) {
 	if l == nil {
 		return Result{}, errors.New("loop: Loop 为 nil")
 	}
@@ -256,8 +283,14 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 	defer func() { res.Taint = normalizeTaint(st.acc.level) }()
 
 	// 每轮历史都是局部变量：同一 Loop 可被并发 Run 而不互相污染。
-	history := make([]core.Message, 0, 8)
-	history = append(history, core.Message{Role: "user", Content: prompt})
+	// 既有历史先**拷贝**一份（调用方可能复用那个切片 → 不能被本次 Run 改写）。
+	msgs := make([]core.Message, 0, len(history)+8)
+	msgs = append(msgs, history...)
+	msgs = append(msgs, core.Message{Role: "user", Content: prompt})
+
+	// Run 开始：把用户 prompt 落进事件流（F1：对话内容是事实源的一部分，回放/resume 据此
+	// 重建完整对话）。旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。
+	l.publishUserPrompt(ctx, prompt)
 
 	var lastText string
 
@@ -271,7 +304,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 		res.Turns = turn
 
 		// 组这一轮的请求（可见工具过滤后的结果，R5/H4）。
-		req := l.request(history)
+		req := l.request(msgs)
 
 		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
 		// 此刻装配已定型（req 就是模型将看到的全部），记录"这一轮给模型看了什么"；
@@ -291,6 +324,11 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 		}
 		lastText = mr.Text
 
+		// 每轮 provider 返回后落一条 model.turn（F1：模型响应入事件流；含 usage 只做成本记录，J21）。
+		// 旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。在判定本轮是否
+		// 收敛**之前**落，故收敛轮（最终答复）与工具调用轮都各有一条。
+		l.publishModelTurn(ctx, turn, mr)
+
 		// 模型不再发起工具调用 → 收敛，返回最终文本。
 		if len(mr.ToolCalls) == 0 {
 			res.Text = mr.Text
@@ -298,7 +336,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 		}
 
 		// assistant 消息：ToolCallReq 原样入历史（provider id 黑盒，S4）。
-		history = append(history, core.Message{
+		msgs = append(msgs, core.Message{
 			Role:      "assistant",
 			Content:   mr.Text,
 			ToolCalls: mr.ToolCalls,
@@ -313,7 +351,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 					res.Text = lastText
 					return res, err
 				}
-				history = append(history, core.Message{Role: "tool", Content: text, ToolCallID: tc.ID})
+				msgs = append(msgs, core.Message{Role: "tool", Content: text, ToolCallID: tc.ID})
 				if stop != nil {
 					// complete：本（子）loop 就此收敛，Result 带上结构化 summary。
 					res.Summary = stop
@@ -330,7 +368,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (res Result, err error) {
 				return res, err
 			}
 			// 工具结果回填（role="tool"，ToolCallID 原样，S4）。
-			history = append(history, core.Message{
+			msgs = append(msgs, core.Message{
 				Role:       "tool",
 				Content:    text,
 				ToolCallID: tc.ID,

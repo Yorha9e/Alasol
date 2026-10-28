@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -14,6 +15,8 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/runtime"
+	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/verify"
 )
@@ -23,12 +26,29 @@ import (
 // 装配：store → registry(read/write/bash) → loop（仅作 durable.Replayer，不调模型）→ 可选 git Verifier
 // → durable.Resume。重放 replay=safe（及 verify 不通过）的操作会**真正再次执行**对应工具并落结果；
 // verify 先核验外部状态；unsafe 不重放、转人工。报告以单行 JSON 打到 stdout。
+//
+// -continue "<提示>"：恢复流程之后**续跑一轮对话**（v1-S1 的"对话入事件流"闭环）——把
+// 事件流 fold 出的对话历史灌回 loop（core.Loop.RunWithHistory），让模型接着此前的上下文继续。
+// 空 = 只做恢复流程，不调模型（与恢复流程本身的语义一致）。
+//
+// 续跑折叠的是**整场 session** 的对话，**不区分 agent 视角**（FoldConversation 的既有语义）：
+// 多 agent 混合 session 里子 agent 的对话也会进入上下文；按 agent 过滤是后续增强
+// （-agent <ulid>，尚未实现）。续跑事件的 agent_id = 该 session 的**真实主 agent**
+// （durable.PrimaryAgentID 的口径），不产生一次性随机 id 的"幽灵 agent"。
 func resumeMain(args []string) int {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
 	session := fs.String("session", "", "要恢复的 session id（必填，26 字符 ULID）")
 	dbPath := fs.String("db", "alasol.db", "事件库路径（SQLite）")
 	verifyMode := fs.String("verify", "git", "verify 类操作的核验器：git（按 git-commit 锚点核验）| none（全部转人工）")
 	force := fs.Bool("force", false, "接管未释放的旧 resume 认领（确认上一次已崩溃时才用）")
+	continuePrompt := fs.String("continue", "",
+		"恢复后再续跑一轮对话的提示（空=只做恢复流程，不调模型）。"+
+			"注意：续跑折叠的是**整场 session** 的对话，**不区分 agent 视角**——"+
+			"多 agent 混合 session 里子 agent 的对话也会进入上下文；"+
+			"按 agent 过滤（-agent <ulid>）是后续增强，尚未实现。")
+	model := fs.String("model", "", "模型名（续跑时用；缺省回落 env ALASOL_MODEL）")
+	baseURL := fs.String("base-url", "", "OpenAI 兼容端点（续跑时用；空=官方）")
+	apiKeyEnv := fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名（续跑时用）")
 	_ = fs.Parse(args)
 
 	if *session == "" {
@@ -55,16 +75,48 @@ func resumeMain(args []string) int {
 		return 1
 	}
 
-	// loop 仅作 durable.Replayer：重放时按 op.Intent 直接执行工具、落结果事件（不调模型）。
-	// Provider 用 noop（loop.New 要求非 nil；resume 回路永不打模型）。
+	// provider：恢复流程本身只重放工具、不调模型（noop）；要**续跑对话**时才用真 provider。
+	prov := core.Provider(noopProvider{})
+	modelName := "resume"
+	if strings.TrimSpace(*continuePrompt) != "" {
+		modelName, err = resolveModel(*model)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		prov = openai.New(openai.Options{
+			BaseURL: *baseURL,
+			APIKey:  os.Getenv(*apiKeyEnv), // 凭据只从 env 取，不进 argv
+			Stream:  true,
+		})
+		if testProviderOverride != nil {
+			// 测试注入的脚本 provider（不真打模型 API；见 serve.go 的说明）。
+			prov = testProviderOverride
+		}
+	}
+
+	// 续跑事件的归属 = 该 session 的**真实主 agent**（durable.PrimaryAgentID 的口径）。
+	//
+	// 不能用一次性随机 ULID 当占位：续跑产生的 user.prompt / model.turn / context.assembled
+	// 都挂在那个随机 id 下 → 幽灵 agent（审计归属失真，连续两次续跑产生两个幽灵 agent）。
+	// 重放路径不受影响：它按 op 自身的 session/agent 落结果事件。
+	ctx := context.Background()
+	events, err := runtime.ReplaySession(ctx, st, sid)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "回放事件流失败:", err)
+		return 1
+	}
+	agentID := durable.PrimaryAgentID(events)
+
+	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	lp, err := loop.New(loop.Config{
-		Provider:  noopProvider{},
+		Provider:  prov,
 		Bus:       bus.New(st),
 		Registry:  reg,
 		Policy:    policy.New(), // 重放不重跑策略链（M9：T0 已授权）；此引擎不被 Replay 用到
 		SessionID: sid,
-		AgentID:   core.NewUlid(), // 占位：Replay 用 op 自身的 session/agent，不用 loop 的
-		Model:     "resume",
+		AgentID:   agentID, // 真实主 agent（续跑事件的归属）
+		Model:     modelName,
 		Store:     st,
 	})
 	if err != nil {
@@ -84,7 +136,7 @@ func resumeMain(args []string) int {
 		return 2
 	}
 
-	rep, err := durable.Resume(context.Background(), st, sid, opts)
+	rep, err := durable.Resume(ctx, st, sid, opts)
 	if err != nil {
 		// 重放/落盘断裂：报告已处理的部分仍打印到 stderr 供诊断，退出码 1。
 		dumpReport(os.Stderr, rep)
@@ -94,6 +146,26 @@ func resumeMain(args []string) int {
 	}
 	dumpReport(os.Stdout, rep)
 	dumpSummary(os.Stderr, rep)
+
+	// 续跑：把事件流 fold 出的对话历史灌回 loop（v1-S1：对话入事件流 → 可回放 → 可续跑）。
+	if strings.TrimSpace(*continuePrompt) == "" {
+		return 0
+	}
+	// 重读事件流：恢复流程刚落的结果事件（in-flight 的 completed/failed）也要进历史 ✅。
+	events, err = runtime.ReplaySession(ctx, st, sid)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "回放事件流失败:", err)
+		return 1
+	}
+	history := runtime.FoldConversation(events)
+	fmt.Fprintf(os.Stderr, "[resume] 续跑：已 fold 出 %d 条历史消息\n", len(history))
+	res, err := lp.RunWithHistory(ctx, history, *continuePrompt)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "续跑失败:", err)
+		return 1
+	}
+	fmt.Println(res.Text)
+	fmt.Fprintf(os.Stderr, "[resume] 续跑 turns=%d tool_calls=%d events=%d\n", res.Turns, res.ToolCalls, res.Events)
 	return 0
 }
 

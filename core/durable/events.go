@@ -73,11 +73,16 @@ func readSession(ctx context.Context, store core.Store, sessionID contracts.Ulid
 	return events, nil
 }
 
-// primaryAgentID 推导 session 的「主 agent」id：agent.spawned 里作为 parent 出现但从不作为
+// PrimaryAgentID 推导 session 的「主 agent」id：agent.spawned 里作为 parent 出现但从不作为
 // child 出现的 agent（= 树根）；无 spawn 时取最早事件（最小 seq）的 agent_id；空流时给一个新
 // ULID。用于给 session 级的 checkpoint.created / session.resumed 事件填 envelope 必需的 agent_id
 // （这些事件描述的是整个 session，不是某个子 agent）。
-func primaryAgentID(events []contracts.Event) contracts.Ulid {
+//
+// **导出**的原因：续跑（resume -continue）要把 loop 的 AgentID 设成该 session 的真实主
+// agent——否则续跑产生的 user.prompt / model.turn / context.assembled 会挂在一个一次性
+// 随机 ULID 下（幽灵 agent：审计归属失真，连续两次续跑产生两个幽灵 agent）。
+// 口径与本包内部一致（同一份推导，不另起炉灶）。
+func PrimaryAgentID(events []contracts.Event) contracts.Ulid {
 	children := make(map[contracts.Ulid]bool)
 	for i := range events {
 		if events[i].Kind != KindAgentSpawned {
