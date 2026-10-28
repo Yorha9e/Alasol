@@ -44,6 +44,8 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 | `session.resumed` | true | resume 流程完成标记（X4） |
 | `session.resume_claimed` | true | in-flight 原子认领（X5 防并发重放） |
 | `gate.joined` | true | session 加入 gate（K12，v1-S2）：`gate_id` + `source`（auto_repo/auto_workflow/explicit）；无 `gate.left`——离开 = session 结束 |
+| `agentlink.broadcast` | true | 广播消息（K18，v1-S3）：`target`（gate/subtree）+ `text`；拉模型投递，收件方 = 目标 ∩ 发送方可见集（K11/K27） |
+| `agentlink.handoff` | true | 结构化交接（K18，v1-S3）：broadcast + 开放结构 `payload`（工作流自定义，框架不解释） |
 
 写路径铁律（X1）：`intent` **durable 落盘** → 执行 → `result` durable 落盘。**有意图无结果 = 未知结果，不盲目重跑**。
 

@@ -217,7 +217,7 @@
 | K15 | **在线表注入** | ✅ **拍板（2026-10-28 用户）**：默认 **N=50 行、每行 summary ≤100 token、按 gate 过滤**；**全部参数可配 + 支持动态管理（运行期调整，不写死——用户明确要求）**；注入位置恒在 prompt 末尾（Q4）。实现在 v1 | ✅ |
 | K16 | **深度限制 = 类型可达性（> 计数器）** | 主设计是**类型可达性**：`agent_type.can_spawn` 声明"我能派哪些类型"→ 第 4 层在类型层面就不可达。**数字计数器只是兜底**（`max_agent_depth` 可配置，默认两级委派）。每层成本线性叠加在三条链上：**summary 链**（深度 3 的 summary 是深度 2 的摘要 → 二次失真，同"多次压缩导致目标偏移"是同一个病）、**权限链**（每层 ∩ 父级 → 深度 3 时已很窄，再深一层纯开销）、**审计链**（责任追溯层数）。落地：`AgentType.CanSpawn` + `TypeRegistry.Register` 时 can_spawn 环检测（有向无环），数字深度（maxDepth 默认 3）兜底；只读型 CanSpawn 为空 → 更深层不可达（实现：core/agents/type.go + tree.go） | ✅ |
 | K17 | **spawn 三道闸门** | 全部**运行时强制**（不靠提示词）：① **深度** `child.depth ≤ max_agent_depth` ② **类型** `child.type ∈ parent.can_spawn` ③ **权限** `child.permission ⊆ parent.permission ∩ policy_ceiling`。类型闸门让 `can_spawn` 有向无环，注册时校验。落地：`Tree.Spawn` 三闸门全运行时强制，闸门③经 perm.go 三维 read/write/exec 只收窄（未知级 fail-close 拒）；任一道拒则落 tool.call.failed、不建节点（实现：core/agents/tree.go + perm.go） | ✅ |
-| K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议**。v0 未做——v1（agentlink 完整：Presence/Discover/Inquiry/Broadcast/Handoff 五件套）再定 | ★ |
+| K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议**。**落地（2026-10-28 v1-S3）**：`core/agentlink` 五件套（E8 通用组件区；core 不做 IO——EventWindowReader/EventSink 宿主注入）；Broadcast/Handoff 事件化 `agentlink.broadcast`/`agentlink.handoff`（拉模型投递，幂等键含发送方 + store 去重 + 回读归属校验）；**subtree 射程 = 目标子树 ∩ 发送方一跳可见集（父+直系子）**——K27 显式逐跳、不做传递闭包（"子树"命名大于实际射程，要全树广播须另开口子，不得放宽可见集）；Inquiry = 摘要 + 事件窗口 + refs 核验（token 锚定防子串伪造，含空格路径整串核验；K24 端到端成立）；查询面全带 caller 按 K11 裁剪（实现：core/agentlink + host/agentlink.go） | ✅ |
 | K19 | 跨机 | **不做分布式存储 / 分布式发现**。跨机时把 session 暴露成 **ACP agent 端点**，客户端用现成协议接入——不自己发明分布式协议。v0 未做——v4（跨机，session 暴露成 ACP 端点）再定 | ★ |
 | K20 | **层级 3 = 只读型** | **由 type 自行声明**（不硬编码"第 3 层必只读"——某些 workflow 需要可写的 scout）；但**内置的几个 type 默认只读**（`scout`：read/glob/grep）。理由：subagent 是**上下文隔离器**（把大量读取外包出去，避免主 agent 上下文被占满）；只读型的 `can_spawn` 为空 → **第 4 层在类型层面不可达**。v0 未做——v1（层级语义细化）再定；v0 类型系统已支持"只读型"表达（CanSpawn 为空 + 只读 Tools），但无内置只读 type | ★ |
 | K21 | **orchestrator = 一个 type，不是硬编码层级** | "主 agent 下加一个 orchestrator"（它对整个项目 + 自己负责的模块做较完整探索，再分派 subagent）→ 表达为**一个 `coordinator` 类型的 agent_type**（`can_spawn` 指向 worker 类型，权限更高）。**层级数不硬编码**；"4 层"只是某种 type 组合的可达结果。落地：orchestrator 表达为一个 agent_type（其 CanSpawn 指向 worker），root 只是 depth=1，层数由 type 的 can_spawn 组合自然涌现；spawn/complete 按 can_spawn/深度注入，无硬编码"主 agent"概念（实现：core/loop/agenttools.go + core/agents） | ✅ |
@@ -371,7 +371,7 @@
 | Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾**。实现与提案有出入：v0 无多源注入的稳定性分级排序（只有 base/tools/history 三项粗粒度，顺序即注册序），待确认 | ★ |
 | Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效。v0 未做——v1（在线表注入末尾）再定 | ★ |
 | Q5 | 暴露等级收敛 | ✅ 随 K14 拍板（2026-10-28 用户）：默认 `summary`，按需升 `n`，`full` 需显式 | ✅ |
-| Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻。v0 未做——v1（Inquiry 返回：结构化摘要 + 事件窗口）再定 | ★ |
+| Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻。**落地（2026-10-28 v1-S3）**：`InquiryResult` = SummaryEntry[] + EventWindow + RefCheck[]；同 session 默认投影到调用方可见集（K11），跨 session 整 session（对端视角，K24 核验依赖）；HTTP 默认 limit=200 + truncated 信号 | ✅ |
 | Q7 | **summary 污点继承** | ✅ subagent 的 summary 是回主 agent 的**唯一通道** → 若 subagent 读到被注入的内容，summary 就是攻击载荷出口。**summary 强制带 `taint`**（继承来源事件的最高污点级），主 agent 对 tainted summary **按不可信数据处理**（与 H13 同源） | ✅ |
 
 ## X. Durable 与恢复语义（承重墙，2026-10-27 补）
@@ -429,7 +429,6 @@
 | J20 | 压缩触发计入 prompt cache 成本 | ★ |
 | K8 | ExecutionEnv 抽象 | ★ |
 | K9 | goroutine 隔离的代价（必须对冲） | ★ |
-| K18 | 交流能力做成可复用组件 | ★ |
 | K19 | 跨机 | ★ |
 | K20 | 层级 3 = 只读型 | ★ |
 | M6 | 通用重试组件 | ★ |
@@ -440,7 +439,6 @@
 | Q2 | 注入源清单 | ★ |
 | Q3 | 稳定 → 变动排序 | ★ |
 | Q4 | 缓存友好 | ★ |
-| Q6 | Inquiry 返回 | ★ |
 | R8 | 能力池叠加 | ★ |
 | V4 | 依赖缓存策略 | ★ |
 | V6 | review-tip 失效检测 | ★ |
@@ -462,9 +460,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **137** 条 · ★ 待议 **54** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
+**合计**：✅ 已定 **139** 条 · ★ 待议 **52** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）
 
 ---
 

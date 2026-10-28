@@ -269,3 +269,38 @@ type GateJoinedPayload struct {
 	// 本次 join 的来源（审计用：自动还是显式）。
 	Source GateJoinSource `json:"source"`
 }
+
+// agentlink 消息的投递目标类型（K18/K11 的两个正交维度）：gate = 水平维（gate 相交的**对端主 agent**，K11①）；subtree = 垂直维（以指定 agent 为根的**子树**，K11②）。目标只描述「发给谁」，不含任何协议形状（K18：library 形态，不绑协议）。
+type AgentLinkTargetType string
+
+const (
+	AgentLinkTargetTypeGate    AgentLinkTargetType = "gate"
+	AgentLinkTargetTypeSubtree AgentLinkTargetType = "subtree"
+)
+
+// agentlink 消息的投递目标（K18/K11）。两种形态二选一：type=gate 带 gate_id；type=subtree 带 agent_id（子树根，必须是发送方所在 session 的 agent——跨 session 的子树不可见，K11：别 session 的 subagent 完全不可见）。实际收件方 = 目标集合 ∩ 发送方可见集（gate 形态 = 该 gate 活跃成员的主 agent；subtree 形态 = 该子树内发送方的一跳可见集（父 + 直系子）），写时（Recipients/Dropped 审计）与读时（Inbox 过滤）同源。
+type AgentLinkTarget struct {
+	Type AgentLinkTargetType `json:"type"`
+	// type=gate 时的 gate 标识（S16 命名空间，按整串比较，不做前缀解析）。
+	GateID *string `json:"gate_id,omitempty"`
+	// type=subtree 时的子树根 agent id（ULID）。
+	AgentID *Ulid `json:"agent_id,omitempty"`
+}
+
+// agentlink.broadcast —— 向 gate / 子树广播一条消息（K18 Broadcast）。消息即**事实**：durable=true 进事件流（G23/F7 只增），可审计、可重建（折叠回全部广播历史）。**投递是拉模型**（与在线表/发现表同哲学）：写进事件流 + 可见者可查询到，不做推送队列——收件方按 K11 可见性过滤（水平 = gate 相交的对端主 agent；垂直 = 目标子树 ∩ 发送方一跳可见集（父 + 直系子）——K27 显式逐跳、不做传递闭包，兄弟与更深后代不直达）。envelope.session_id / agent_id = 发送方。
+type AgentLinkBroadcastPayload struct {
+	// 投递目标（gate 或 subtree）。
+	Target AgentLinkTarget `json:"target"`
+	// 消息正文（模型可读的自由文本）。
+	Text string `json:"text"`
+}
+
+// agentlink.handoff —— 一次结构化交接（K18 Handoff）：比 broadcast 多带一个**结构化 payload**（开放对象，由工作流自定义形状——agentlink 不解释它，只负责投递/落库/可重建）。durable=true 进事件流（同 broadcast 的拉模型投递与 K11 可见性）。envelope.session_id / agent_id = 发送方。
+type AgentLinkHandoffPayload struct {
+	// 投递目标（gate 或 subtree）。
+	Target AgentLinkTarget `json:"target"`
+	// 交接说明（模型可读的自由文本：做了什么 / 结论 / 下一步）。
+	Text string `json:"text"`
+	// 结构化交接载荷（开放对象，原样保存；工作流自定义，框架不解释）。
+	Payload json.RawMessage `json:"payload,omitempty"`
+}

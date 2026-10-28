@@ -181,6 +181,29 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			default:
 				t.Errorf("line %d: gate.joined source = %q 不在枚举内", lineNo, p.Source)
 			}
+		case "agentlink.broadcast":
+			var p AgentLinkBroadcastPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into AgentLinkBroadcastPayload: %v", lineNo, err)
+				break
+			}
+			checkAgentLinkTarget(t, lineNo, p.Target)
+			if p.Text == "" {
+				t.Errorf("line %d: agentlink.broadcast text 不能为空", lineNo)
+			}
+		case "agentlink.handoff":
+			var p AgentLinkHandoffPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into AgentLinkHandoffPayload: %v", lineNo, err)
+				break
+			}
+			checkAgentLinkTarget(t, lineNo, p.Target)
+			if p.Text == "" {
+				t.Errorf("line %d: agentlink.handoff text 不能为空", lineNo)
+			}
+			if len(p.Payload) == 0 {
+				t.Errorf("line %d: agentlink.handoff 应带结构化 payload", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -204,10 +227,39 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	for _, kind := range []string{
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
+		"agentlink.broadcast", "agentlink.handoff",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)
 		}
+	}
+}
+
+// checkAgentLinkTarget asserts that an agentlink message target is well formed:
+// exactly one of gate_id / agent_id, matching the declared type (K11's two
+// orthogonal dimensions: gate = horizontal, subtree = vertical).
+func checkAgentLinkTarget(t *testing.T, line int, target AgentLinkTarget) {
+	t.Helper()
+	switch target.Type {
+	case AgentLinkTargetTypeGate:
+		if target.GateID == nil || *target.GateID == "" {
+			t.Errorf("line %d: agentlink target type=gate 必须带 gate_id", line)
+		}
+		if target.AgentID != nil {
+			t.Errorf("line %d: agentlink target type=gate 不应带 agent_id", line)
+		}
+	case AgentLinkTargetTypeSubtree:
+		if target.AgentID == nil || *target.AgentID == "" {
+			t.Errorf("line %d: agentlink target type=subtree 必须带 agent_id", line)
+		}
+		if target.GateID != nil {
+			t.Errorf("line %d: agentlink target type=subtree 不应带 gate_id", line)
+		}
+		if target.AgentID != nil {
+			checkULID(t, line, "target.agent_id", string(*target.AgentID))
+		}
+	default:
+		t.Errorf("line %d: agentlink target type = %q 不在枚举内", line, target.Type)
 	}
 }
 

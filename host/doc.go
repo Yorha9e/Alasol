@@ -54,4 +54,29 @@
 // （自动 gate 重算 + 历史重放）。自动 gate 在 session 的 loop 建成时加入：
 // `repo:<repo_id>`（runtime/identity.RepoID，worktree 按 git root 聚合）与
 // `workflow:<run_id>`（有 run_id 才加；工作流引擎在 v3，钩子先留）。
+//
+// # agentlink（K18 五件套）
+//
+// 交流能力落在 **core/agentlink**（E8 通用组件：library 形态、不绑协议、不做 IO），
+// 本包只做装配（host/agentlink.go）：reader 直接传 store（`core.Store.ReadFrom` 与
+// `agentlink.EventWindowReader` 同签名），sink 用"经 bus 发布 + 回读拿 seq"的适配器，
+// 协议面（HTTP）也在这里：
+//
+//	GET  /api/presence?session_id=         → 在线画像 + 水平可见对端（Presence）
+//	GET  /api/discover?session_id=&gate_id=|agent_id= → 按 gate / 按 agent 树查找（Discover）
+//	GET  /api/inquiry?session_id=...       → 结构化摘要 + 事件窗口 + refs 核验（Inquiry/Q6/K24）
+//	GET  /api/inbox?session_id=...         → 拉模型收件箱 + 游标水位（Broadcast/Handoff 的另一半）
+//	POST /api/agentlink/broadcast          → 落一条 `agentlink.broadcast` durable 事件
+//	POST /api/agentlink/handoff            → 落一条 `agentlink.handoff` durable 事件
+//
+// 投递是**拉模型**（与在线表/发现表同哲学）：消息写成 durable 事件（可审计、可重建），
+// 可见性按 K11 在写时算一次（回报给调用方）并在读时再算一次（Inbox 按当前成员关系过滤）。
+// 别 session 的 subagent 完全不可见：水平收件方恒为对端 session 的**主 agent**，
+// 跨 session 的 subtree 目标在写入时就被拒。
+//
+// **查询面一律带调用方身份**（K11 过滤的前提）：`/api/presence` 的 session_id 与
+// `/api/discover` 的 session_id 是**调用方**（必须受本 hub 托管，否则 404）——
+// 没有调用方身份就没有可见性过滤，任意客户端就能枚举任意 gate 的成员与任意 session
+// 的 agent 树。`/api/inquiry` 的 `agent_id` 只是"调用方身份"，窗口投影用
+// `project_agent_id`（缺省 = 调用方的可见集：自己 + 父 + 直系子）。
 package host

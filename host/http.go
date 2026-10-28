@@ -11,6 +11,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/agentlink"
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/ui/web"
 )
@@ -30,6 +31,15 @@ var httpLog = slog.Default()
 //	GET /api/context/{session_id}→ 最新 ContextSnapshot；没有 → 404
 //	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
 //	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
+//
+// agentlink（K18 五件套，core/agentlink 是库形态——协议绑定全在本层）：
+//
+//	GET  /api/presence?session_id=        → PresenceReport（谁在线/在干什么/属于哪些 gate）
+//	GET  /api/discover?session_id=&gate_id=|agent_id= → DiscoverResult（按 gate / 按 agent 树）
+//	GET  /api/inquiry?session_id=...      → InquiryResult（结构化摘要 + 事件窗口 + refs 核验）
+//	GET  /api/inbox?session_id=...        → InboxResult（消息 + 游标水位 + has_more）
+//	POST /api/agentlink/broadcast         → MessageResult（落一条 durable 事件）
+//	POST /api/agentlink/handoff           → MessageResult（同上 + 结构化 payload）
 //
 // 其它方法/路径 → 405 / 404，一律 JSON 错误体（前端统一按 JSON 解）。
 //
@@ -51,6 +61,14 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
 	mux.HandleFunc("GET /api/peers", h.servePeers)
 	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
+
+	// agentlink（K18）。
+	mux.HandleFunc("GET /api/presence", h.serveAgentlinkPresence)
+	mux.HandleFunc("GET /api/discover", h.serveAgentlinkDiscover)
+	mux.HandleFunc("GET /api/inquiry", h.serveAgentlinkInquiry)
+	mux.HandleFunc("GET /api/inbox", h.serveAgentlinkInbox)
+	mux.HandleFunc("POST /api/agentlink/broadcast", h.serveAgentlinkSend(agentlink.KindBroadcast))
+	mux.HandleFunc("POST /api/agentlink/handoff", h.serveAgentlinkSend(agentlink.KindHandoff))
 
 	return mux
 }
@@ -191,11 +209,47 @@ func (h *Hub) serveGateJoin(w http.ResponseWriter, r *http.Request) {
 	writeJSONBody(w, http.StatusOK, view)
 }
 
-// writeHubError 把 Hub 的错误映射成 HTTP 状态码（404 = session 不受托管，其余 500）。
+// writeHubError 把 Hub / agentlink 的错误映射成 HTTP 状态码。
+//
+// 口径：**按错误种类分**，不一律 500——
+//
+//	400  参数/身份/目标不合法（ErrBadIdentity / ErrBadTarget / ErrBadQuery /
+//	     ErrEmptyText / ErrBadPayload / ErrCrossSessionSubtree）：客户端能改；
+//	403  可见性拒绝（ErrNotVisible）：K11 挡住——不是"参数错了"，是"你不该看这个"；
+//	404  目标不存在或不受托管（ErrSessionNotHosted / ErrUnknownSession / ErrUnknownAgent）；
+//	500  其余（真出事了）。
+//
+// 之前一律 500：K11 的拒绝（"你看不见"）被报成"服务器坏了"，客户端无法区分
+// "我参数写错了"与"这消息不该给我看"。
 func writeHubError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrSessionNotHosted) {
+	switch {
+	case errors.Is(err, ErrSessionNotHosted):
 		writeJSONError(w, http.StatusNotFound, "unknown_session",
 			"这个 session 不是本 hub 在托管的 session（先跑一轮 prompt，或它属于别的 hub 进程）")
+		return
+	case errors.Is(err, agentlink.ErrBadIdentity):
+		writeJSONError(w, http.StatusBadRequest, "bad_identity", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrBadTarget):
+		writeJSONError(w, http.StatusBadRequest, "bad_target", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrBadQuery):
+		writeJSONError(w, http.StatusBadRequest, "bad_query", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrEmptyText):
+		writeJSONError(w, http.StatusBadRequest, "empty_text", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrBadPayload):
+		writeJSONError(w, http.StatusBadRequest, "bad_payload", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrCrossSessionSubtree):
+		writeJSONError(w, http.StatusBadRequest, "cross_session_subtree", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrNotVisible):
+		writeJSONError(w, http.StatusForbidden, "not_visible", err.Error())
+		return
+	case errors.Is(err, agentlink.ErrUnknownSession), errors.Is(err, agentlink.ErrUnknownAgent):
+		writeJSONError(w, http.StatusNotFound, "unknown_target", err.Error())
 		return
 	}
 	writeJSONError(w, http.StatusInternalServerError, "hub_failed", err.Error())

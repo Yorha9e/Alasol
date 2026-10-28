@@ -12,6 +12,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/agentlink"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
@@ -49,6 +50,9 @@ type Hub struct {
 	// 发现表（K10）：core 内存活状态 + 拉式扫描喂它的事件流（host/discovery.go）。
 	disc     *discovery.Table
 	discFeed *discoveryFeed
+	// link 是 K18 交流能力五件套（core/agentlink）：发现表 + store 读 + bus/store 写
+	// 三件事都在 host/agentlink.go 注入。与 disc 同生命周期（无自身状态，无需关闭）。
+	link *agentlink.Link
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -206,6 +210,14 @@ func New(cfg Config) (*Hub, error) {
 		_ = h.Close()
 		return nil, fmt.Errorf("host: 播种发现表失败: %w", err)
 	}
+
+	// agentlink（K18）：reader 直接就是 store（core.Store.ReadFrom 与
+	// agentlink.EventWindowReader 同签名——不加适配层）；sink 经 bus 发布 + 回读拿 seq。
+	h.link = agentlink.New(agentlink.Deps{
+		Table:  disc,
+		Reader: st,
+		Sink:   agentlinkSink{bus: b, store: st},
+	})
 
 	// 后台索引器：派生表（sessions / ledger / board / cost_stats）的**唯一写者**。
 	h.ixCtx, h.ixCancel = context.WithCancel(context.Background())
