@@ -186,8 +186,19 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
   - [x] kill -9 后能续跑且**不重复副作用**（真子进程 Kill 测试 + 会话级原子认领防并发重放）
   - [x] `replay:"verify"` 的操作先核验外部状态再决定（Verifier 接口 + git anchor 核验器 + 核验出错转 manual fail-safe）
 
-### v1（不在 v0）
-切片 ①（hub + 多 session 发现表 + gate）/ 多 worktree 隔离 / 完整 TUI / MCP server / 深度压缩 / 评测
+### v1 · 多 session 数据中心（施工切分，2026-10-28 提议）
+
+> 每阶段照旧过退出评审循环（critic→reviewer→clean）+ 提交 `refs 07/…`。上下文系统是**预备单位**（`13-context-system.md`，⏸ 候选）：主调度先跑 append，级联单元按需挂载；v1 的真实多 session 负载同时是它的**验证载体**。
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **v1-S1 地基补齐** | ① `user.prompt` / `model.turn` 事件入流（补 F1 缺口：对话内容进事件流，resume/回放才完整）② S13/S14 路径规范化 + `project_id`/`repo_id`（EvalSymlinks→小写→统一分隔符→去尾；按 git root 聚合） | 事件流能回放**完整对话**；同 repo 多 worktree（含大小写/junction 用例）聚出同一 repo_id |
+| **v1-S2 hub 与发现表** | hub daemon（多 session 宿管）+ K10 发现表（事件驱动内存活状态）+ K12 gate（自动 `repo:`/`workflow:` + `join_gate`）+ K11 水平可见性 | 两个 session 经 gate 互见主 agent；发现表崩溃重启后由事件流重建 |
+| **v1-S3 agentlink** | K18 五件套：Presence / Discover / Inquiry / Broadcast / Handoff（库形态，不绑协议） | Inquiry 拉原文可核验 summary 的 refs（端到端） |
+| **v1-S4 在线表注入** | K14/K15：50 行 / ≤100 token / gate 过滤，**全可配 + 运行期动态管理**，恒在 prompt 末尾（Q4） | 主 agent prompt 尾部出现在线表；参数运行期可调且不重启 |
+| **v1-S5 宿主补全** | 多 worktree 隔离 + 完整 TUI（O6）+ 模型目录（I5）+ H15 TOML 配置（env > 文件）+ K9 hub 监控 + token 成本统计（J21 usage 进成本） | TUI 对话/审批/在线表；配置文件优先级正确；成本统计可查 |
+
+（原清单里的 MCP / 深度压缩 / 评测已在 v3 / v2 / v4 归位，见 `12-roadmap.md`。）
 
 ---
 
