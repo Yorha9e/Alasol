@@ -73,8 +73,8 @@
 
 | 项 | 状态 |
 |---|---|
-| **代码** | **v0 全部完成并终验收 ACCEPTED**（2026-10-27）：阶段 0–8 全部通过退出评审循环（critic clean），v0 酸测试 11 条逐条实测核销（06 §5）；22 包全测试 + race 干净 + codegen 零漂移 + TS 消费端三件套绿；唯一代办：**真模型 API 调用待凭据**（provider 已由 httptest 全覆盖） |
-| **设计** | 收敛完成：`07` 共 **279** 条决策（已定 81 / 待议 108 / 默认通过 90） |
+| **代码** | **v0 全部完成并终验收 ACCEPTED**（2026-10-27）：阶段 0–8 全部通过退出评审循环（critic clean），v0 酸测试 11 条逐条实测核销（06 §5）；22 包全测试 + race 干净 + codegen 零漂移 + TS 消费端三件套绿；唯一代办已闭环：**真模型实测通过**（2026-10-27，用户本地网关 + gpt-4o-mini）——模型自主调用 read 工具，事件流三段完整（`tool.call.intent` 携 provider id 黑盒原样 → 真实执行 → `tool.call.completed` 同 id 带真实 result）→ `context.assembled`。E2E 覆盖三层：httptest（协议）+ 脚本 provider（机制）+ **真模型（端到端）**。**v0 无遗留待办。** |
+| **设计** | 收敛完成：`07` 共 **280** 条决策（已定 82 / 待议 108 / 默认通过 90；I9 模型名解析 2026-10-28 补入） |
 | **文档** | `docs/research/` 12 篇 · `spike/sqlite-drivers/` 一份已跑出结果的实测 |
 | **外部审阅** | 一轮已完成（`10`），7 阻断 / 16 应修 / 9 建议 **全部落档并闭环** |
 | **命名** | 已定：`alasol` · `github.com/Yorha9e/alasol` · 命令 `alasol` · Apache-2.0 · 先私有后公开 |
@@ -149,7 +149,7 @@ ho_b2d2a6ee000d  评审确认 + 四处修法已落档（本 session → 施工 s
 - agent loop 状态机 / 一个真 provider / read·write·bash 工具 / **env 注入 v0 子集**（H21：session + 单次调用两级作用域，**不给模型看任何 env**）
 - **写路径从第一个真实工具调用起就用三段事件**（`intent` → 执行 → `result`，X1）——阶段 8 只补 checkpoint / resume / ownership 的机器，**不回头改写路径**
 - **审批策略**：`deny-all` Approver 为**默认**（验 fail-close）；真机回路用 `always-allow` **显式开启**；**阶段 4 末尾补最小终端审批**（顺带验证 Approval 跨边界契约，让用户能自己跑通真机回路）
-- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean；真模型 API 调用待凭据，机制已由 E2E+httptest 覆盖）：
+- **验收**（2026-10-27 全部通过，退出评审循环 critic 判定 clean；真模型已实测通过——本地网关 + gpt-4o-mini，模型自主调工具、三段事件完整）：
   - [x] 真实仓库里跑通一次工具调用（E2E：真 SQLite + 真工具 + 真落盘 + 三段事件断言）
   - [x] **凭据永不进 prompt / 事件 / 日志**（注入值精确 redact + 凭据分类收口）
   - [x] 事件流含完整 intent→result 三段（X1，每调用恰好一对）

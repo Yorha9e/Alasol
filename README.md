@@ -13,7 +13,7 @@
 | [docs/research/04-handoff-reply-and-language-decision.md](docs/research/04-handoff-reply-and-language-decision.md) | omkc 维护方回函（ho_3b68059bcbfc）对照我们的结论、Go/Node 逐维度选型、三条路径与成本量化、待拍板问题 |
 | [docs/research/05-architecture-pivot.md](docs/research/05-architecture-pivot.md) | **架构转向（现行结论）**：独立产品约束下的语言定案（核心与协调用 Go）、数据中心式协调 / 扩展热插拔 / 存储层重设计三大核心架构 |
 | [docs/research/06-skeleton-design.md](docs/research/06-skeleton-design.md) | **骨架规格（当前施工依据）**：contract-first 分层与依赖方向、12 类契约、16 个扩展点地图、工作流模型（能力包 / 设计哲学 / 部件与验收目标）、上下文策略（含分级压缩）、v0 范围与验收（酸测试）、Go 目录结构 |
-| [docs/research/07-design-review-checklist.md](docs/research/07-design-review-checklist.md) | **设计决策总表（逐条过审用）**：约 100 条编号决策项（目标 / 技术栈 / 分层 / 契约 / 扩展 / 事件 / 存储 / 权限 / env / 工具角色 / 工作流 / 上下文 / 协议 / UI / 工程），每条含主张、备选、状态与 ★ 待议标记 |
+| [docs/research/07-design-review-checklist.md](docs/research/07-design-review-checklist.md) | **设计决策总表（唯一裁决来源）**：279 条编号决策项（目标 / 技术栈 / 分层 / 契约 / 扩展 / 事件 / 存储 / 权限 / env / 工具角色 / 工作流 / 上下文 / 协议 / UI / 工程），每条含主张、备选、状态与 ★ 待议标记 |
 | [docs/research/08-identity-model.md](docs/research/08-identity-model.md) | **身份与 ID 设计**：13 个 id 命名空间表、ULID 选型、字符集纪律、provider id 黑盒规则、MCP 侧标识隔离、10 条"工具投递失败"死法清单 |
 | [docs/research/09-package-boundaries.md](docs/research/09-package-boundaries.md) | **包边界（待审）**：每个包的"为什么存在 / 什么变化会导致它变 / 什么不会导致它变"、依赖硬约束、三个易腐化边界点、审阅清单 |
 | [docs/research/10-design-review-report.md](docs/research/10-design-review-report.md) | **外部审阅报告**：7 阻断 / 16 应修 / 9 建议 + 14 条矛盾速查 + 「只改三处」建议 |
