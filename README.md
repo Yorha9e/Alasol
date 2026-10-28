@@ -13,11 +13,12 @@
 | [docs/research/04-handoff-reply-and-language-decision.md](docs/research/04-handoff-reply-and-language-decision.md) | omkc 维护方回函（ho_3b68059bcbfc）对照我们的结论、Go/Node 逐维度选型、三条路径与成本量化、待拍板问题 |
 | [docs/research/05-architecture-pivot.md](docs/research/05-architecture-pivot.md) | **架构转向（现行结论）**：独立产品约束下的语言定案（核心与协调用 Go）、数据中心式协调 / 扩展热插拔 / 存储层重设计三大核心架构 |
 | [docs/research/06-skeleton-design.md](docs/research/06-skeleton-design.md) | **骨架规格（当前施工依据）**：contract-first 分层与依赖方向、12 类契约、16 个扩展点地图、工作流模型（能力包 / 设计哲学 / 部件与验收目标）、上下文策略（含分级压缩）、v0 范围与验收（酸测试）、Go 目录结构 |
-| [docs/research/07-design-review-checklist.md](docs/research/07-design-review-checklist.md) | **设计决策总表（唯一裁决来源）**：279 条编号决策项（目标 / 技术栈 / 分层 / 契约 / 扩展 / 事件 / 存储 / 权限 / env / 工具角色 / 工作流 / 上下文 / 协议 / UI / 工程），每条含主张、备选、状态与 ★ 待议标记 |
+| [docs/research/07-design-review-checklist.md](docs/research/07-design-review-checklist.md) | **设计决策总表（唯一裁决来源）**：280 条编号决策项（目标 / 技术栈 / 分层 / 契约 / 扩展 / 事件 / 存储 / 权限 / env / 工具角色 / 工作流 / 上下文 / 协议 / UI / 工程），每条含主张、备选、状态与 ★ 待议标记 |
 | [docs/research/08-identity-model.md](docs/research/08-identity-model.md) | **身份与 ID 设计**：13 个 id 命名空间表、ULID 选型、字符集纪律、provider id 黑盒规则、MCP 侧标识隔离、10 条"工具投递失败"死法清单 |
 | [docs/research/09-package-boundaries.md](docs/research/09-package-boundaries.md) | **包边界（待审）**：每个包的"为什么存在 / 什么变化会导致它变 / 什么不会导致它变"、依赖硬约束、三个易腐化边界点、审阅清单 |
 | [docs/research/10-design-review-report.md](docs/research/10-design-review-report.md) | **外部审阅报告**：7 阻断 / 16 应修 / 9 建议 + 14 条矛盾速查 + 「只改三处」建议 |
 | [docs/research/11-construction-plan.md](docs/research/11-construction-plan.md) | **施工计划（施工 session 入口）**：阶段划分与硬验收、20 条施工期陷阱清单、改决策的纪律 |
+| [docs/research/12-roadmap.md](docs/research/12-roadmap.md) | **版本路线图（v1–v4）**：多 session 数据中心 / 深度执行与安全 / 生态互操作 / 规模化评测——每条给 07 决策点引用，动工前收敛 ★ 条目 |
 | [spike/sqlite-drivers/README.md](spike/sqlite-drivers/README.md) | **存储选型 spike（已跑出结果）**：纯 Go SQLite 驱动实测——并发写 / WAL / busy_timeout / 跨进程 / 交叉编译，结论与网络说法纠正 |
 
 > ⚠️ `02` 与 `04` 的选型结论已被 `05` 修订（前两者的前提"复用 pi / omkc 资产"不再成立）。`01`、`03` 仍然有效。
@@ -28,7 +29,7 @@
 
 > **本项目已全量交接**：设计侧工作收尾，后续施工全部在另一 session 进行。
 > 施工入口 → [`docs/research/11-construction-plan.md`](docs/research/11-construction-plan.md)（含**环境与工具链事实**、阶段划分、硬验收、20 条施工期陷阱清单）。
-> **v0 已完成并通过终验收**（2026-10-27，ACCEPTED）：阶段 0–8 全部完成（每阶段通过 critic→reviewer 退出评审循环），v0 酸测试 11 条逐条实测核销。用法：`alasol run/chat/serve/resume`。命名：`alasol` · `github.com/Yorha9e/alasol`。唯一待办：真模型 API 调用待凭据。
+> **v0 已完成并通过终验收**（2026-10-27，ACCEPTED）：阶段 0–8 全部完成（每阶段通过 critic→reviewer 退出评审循环），v0 酸测试 11 条逐条实测核销，**真模型端到端已实测**（本地网关 + gpt-4o-mini，模型自主调工具、三段事件完整）。用法：`alasol run/chat/serve/resume/models`。命名：`alasol` · `github.com/Yorha9e/alasol`。后续版本规划 → [`docs/research/12-roadmap.md`](docs/research/12-roadmap.md)（v1–v4）。
 
 - 目标已收敛：**搭一套可自定义、可拓展的骨架**（ACP 等具体特性后置），在骨架之上向任意方向扩展
 - **骨架验收标准（酸测试）**：把任意一个扩展点的实现整个换掉，core 代码一行不改
