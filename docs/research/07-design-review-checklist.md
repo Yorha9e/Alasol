@@ -209,9 +209,9 @@
 | K7 | 并发控制 | 资源冲突调度（非裸并发）+ 配额 + provider 限流指数退避 | · |
 | K8 | **ExecutionEnv 抽象** | agent 的工具执行环境可插拔：`LocalExecutionEnv`（hub 进程内，v0）→ `SandboxedExecutionEnv`（子进程 + 沙箱，v1）→ `RemoteExecutionEnv`（远端 SSH，v2）。**升级到进程隔离只需换 env 实现，不动 agent 逻辑**。v0 未做 SandboxedExecutionEnv/RemoteExecutionEnv——v2（OS 沙箱）/ v3（远端 SSH）再定（12 路线图）；v0 已有可插拔能力抽象（core Exec/Fs/Net/Proc）+ LocalExecutionEnv（runtime/cap/local）作底座 | ★ |
 | K9 | goroutine 隔离的代价（必须对冲） | OS 级崩溃（OOM / 栈溢出 / cgo 崩溃）会带走整个 hub；死循环 goroutine 抢占其他；内存泄漏拖垮 hub。对冲：turn 超时 + 工具超时 + hub 级 CPU/内存监控告警 + 单 agent panic recover 后记事件并标记失败（不影响其他 agent）。实现与提案有出入：panic 隔离（`executeSafely` recover）+ MaxTurns 截断已做，但 hub 级 CPU/内存监控告警未做，待确认 | ★ |
-| K10 | **发现表（Registry）** | core 的**内存活状态**组件，不是扩展点。属于**容器管理 + subagent 管理**的一部分，不是协议层。事件驱动更新（`agent.started` / `policy.asked` / `workflow.stage.changed` / `agent.finished` → 改内存）。v0 未做——v1（hub 发现表 Registry）再定 | ★ |
-| K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环 | ✅ |
-| K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效）。v0 未做——v1（gate 水平可见性）再定 | ★ |
+| K10 | **发现表（Registry）** | core 的**内存活状态**组件，不是扩展点。属于**容器管理 + subagent 管理**的一部分，不是协议层。事件驱动更新（`agent.started` / `policy.asked` / `workflow.stage.changed` / `agent.finished` → 改内存）。**落地（2026-10-28 v1-S2）**：落 **`core/discovery`**（命名决策：原名"Registry"与扩展注册表 `core/registry`（E3/E5/E6）撞名 → 改 `core/discovery`）；双层语义=事件折叠层（可重建，Apply 幂等）+ 进程本地 live 层（G17b 两分法）；数据流入=**拉式扫描**（跟在线表同口径，防重复计数）；崩溃重启从事件流全量重放重建（真库测试）；来源事件 agent 生命周期已有，`policy.asked`/`workflow.stage.changed` 待 v3 对应 kind 落地后加 case（实现：core/discovery + host/discovery.go） | ✅ |
+| K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环。**落地（2026-10-28 v1-S2）**：水平维 = `discovery.VisiblePeers`（对端主 agent ∩ gates 相交 ∩ 存活），别 session subagent 不泄漏（负例测试） | ✅ |
+| K12 | 自动 / 显式 Gate | session 创建时自动加入：`repo:<repo_id>`、`workflow:<run_id>`；显式 `join_gate(gate_id)`。Gate **定义持久化**、成员关系是活的（session 结束即失效）。**落地（2026-10-28 v1-S2）**：`gate.joined` durable 事件（`gate_id` + `source` 枚举 auto_repo/auto_workflow/explicit；**无 gate.left**——离开=session 结束，join 历史只增可审计）；**成员"活"语义** = 折叠 join 历史 ∩ 存活 session；自动 `repo:<repo_id>`（复用 identity 的 worktree 聚合）/`workflow:<run_id>`（留钩子，工作流 v3）+ 显式 `JoinGate`；幂等 = 确定性 Event.ID（(session,gate,source) 导出 26 字符 Crockford）+ store ON CONFLICT 去重 + host per-session 锁（实现：core/discovery + host/discovery.go） | ✅ |
 | K13 | **role = 部门标签** | role 近似"部门"（backend / frontend / infra）而非"角色扮演"，**由父 agent 在 spawn 时指定**。与 `agent_type` 正交：`agent_type` = 能力模板（能干什么），`role` = 部门（负责哪块）。role 自由文本、可重复。落地：`agents.Node.Role` 字段 + `agent.spawned` 事件带 `role`，由父在 `Tree.Spawn(..., role, ...)` 指定，与 agent_type 正交（实现：core/agents/tree.go） | ✅ |
 | K14 | **暴露等级 = 注入长度** | ✅ **拍板（2026-10-28 用户）**：窗口长度语义不变（summary/n/full）；**默认 summary**，n 按需升、full 需显式；随 K15 一起可配。实现在 v1 | ✅ |
 | K15 | **在线表注入** | ✅ **拍板（2026-10-28 用户）**：默认 **N=50 行、每行 summary ≤100 token、按 gate 过滤**；**全部参数可配 + 支持动态管理（运行期调整，不写死——用户明确要求）**；注入位置恒在 prompt 末尾（Q4）。实现在 v1 | ✅ |
@@ -429,8 +429,6 @@
 | J20 | 压缩触发计入 prompt cache 成本 | ★ |
 | K8 | ExecutionEnv 抽象 | ★ |
 | K9 | goroutine 隔离的代价（必须对冲） | ★ |
-| K10 | 发现表（Registry） | ★ |
-| K12 | 自动 / 显式 Gate | ★ |
 | K18 | 交流能力做成可复用组件 | ★ |
 | K19 | 跨机 | ★ |
 | K20 | 层级 3 = 只读型 | ★ |
@@ -464,9 +462,9 @@
 | W19 | 现成验证用例 | ★ |
 | W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **135** 条 · ★ 待议 **56** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
+**合计**：✅ 已定 **137** 条 · ★ 待议 **54** 条 · · 默认通过（我的主张，未逐条确认）**89** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）
 
 ---
 

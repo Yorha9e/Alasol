@@ -252,3 +252,20 @@ type ModelTurnPayload struct {
 	// token 计量（J21：只做成本记录，provider 不上报 usage 时可缺省）。
 	Usage *ModelTurnUsage `json:"usage,omitempty"`
 }
+
+// gate join 的来源（K12）：auto_repo = session 创建时按 repo_id 自动加入 repo:<repo_id>（S14：worktree 按 git root 聚合）；auto_workflow = 有 run_id 时自动加入 workflow:<run_id>（工作流引擎在 v3，此处只留钩子）；explicit = join_gate 显式加入。
+type GateJoinSource string
+
+const (
+	GateJoinSourceAutoRepo     GateJoinSource = "auto_repo"
+	GateJoinSourceAutoWorkflow GateJoinSource = "auto_workflow"
+	GateJoinSourceExplicit     GateJoinSource = "explicit"
+)
+
+// gate.joined —— 一个 session 加入一个 gate 的事实（K12：自动 repo:/workflow: + 显式 join_gate）。**gate 定义持久化、成员关系是活的**（G17b）：本事件只记 join 历史（F7 只增不删、不改义，没有 gate.left——离开即 session 结束），活跃成员 = 事件折叠出的 join 历史 ∩ 当前存活 session（session 生命周期 = 进程生命周期，不需要租约/心跳/离线保留）。崩溃重启后老成员全部失活，发现表从事件流重放重建 join 历史；resume 的 session 由宿主重新激活（自动 gate 重算 + 历史重放）。envelope.agent_id = 发起 join 的该 session 主 agent。
+type GateJoinedPayload struct {
+	// gate 标识（S16 命名空间）：repo:<repo_id> / workflow:<run_id> / 显式 join_gate 的非空标识。按整串比较，不做前缀解析。
+	GateID string `json:"gate_id"`
+	// 本次 join 的来源（审计用：自动还是显式）。
+	Source GateJoinSource `json:"source"`
+}

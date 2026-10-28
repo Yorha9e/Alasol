@@ -38,4 +38,20 @@
 //
 // 拉式（scan）而不是推式（bus 订阅）：扫描有持久水位、可重放、幂等；
 // 订阅会和扫描**重复计数**（同一事件两条路都到），而重复计数比漏计数更难发现。
+//
+// # 发现表（K10）与 gate（K12）
+//
+// 发现表落在 **core/discovery**（纯状态机，不做 IO），由本包拉式喂事件（host/discovery.go，
+// 与上面在线表同口径：扫描而非订阅，理由相同）。它回答"谁在线 / 在干什么 / 属于哪些 gate"，
+// 并实现 K11 的水平可见性（只有 session 的**主 agent**之间按 gate 相交互见）：
+//
+//	GET  /api/peers?session_id=... → 该 session 的可见对端（主 agent）
+//	POST /api/gates/join           → 显式 join_gate（幂等）
+//
+// gate 成员关系是**活**的（G17b：session 生命周期 = 进程生命周期，无租约无心跳），
+// join 事实则作为 durable 事件 `gate.joined` 进事件流（F7 只增）→ 崩溃重启后老成员
+// 全部失活，join 历史由事件流重放重建；resume 的 session 由 hub 重新激活
+// （自动 gate 重算 + 历史重放）。自动 gate 在 session 的 loop 建成时加入：
+// `repo:<repo_id>`（runtime/identity.RepoID，worktree 按 git root 聚合）与
+// `workflow:<run_id>`（有 run_id 才加；工作流引擎在 v3，钩子先留）。
 package host

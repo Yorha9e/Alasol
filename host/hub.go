@@ -13,6 +13,7 @@ import (
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/bus"
+	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
@@ -25,9 +26,9 @@ import (
 	"github.com/Yorha9e/alasol/runtime/transport"
 )
 
-// Hub 是装配好的常驻服务：事件流 + 在线表 + 上下文快照 + Web UI + WS。
+// Hub 是装配好的常驻服务：事件流 + 在线表 + 上下文快照 + 发现表（K10）+ Web UI + WS。
 //
-// 生命周期：New（开库 / 起索引器 / 播种投影）→ Handler（HTTP 服务）→ Close
+// 生命周期：New（开库 / 起索引器 / 播种投影与发现表）→ Handler（HTTP 服务）→ Close
 // （停索引器 → 关库）。Close 幂等。
 //
 // 并发：RunPrompt 可被并发调用（不同 session 各一个 Loop，loop 本身无可变状态；
@@ -45,20 +46,36 @@ type Hub struct {
 	proj     *projection
 	ws       *transport.Server
 
+	// 发现表（K10）：core 内存活状态 + 拉式扫描喂它的事件流（host/discovery.go）。
+	disc     *discovery.Table
+	discFeed *discoveryFeed
+	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
+	// 的输入。per-session 覆盖见 specs。
+	cwd string
+
 	// ixCtx 是后台索引器的生命周期（Close 时取消）。
 	ixCtx    context.Context
 	ixCancel context.CancelFunc
 	ixDone   chan struct{}
 
-	mu     sync.Mutex
-	loops  map[contracts.Ulid]*loop.Loop
-	closed bool
+	mu sync.Mutex
+	// loops：session → Loop（一个 session 一个 loop）。
+	loops map[contracts.Ulid]*loop.Loop
+	// specs：session → 归属（CreateSession 登记；自动 gate 的输入）。
+	specs map[contracts.Ulid]SessionSpec
+	// mainAgents：session → 主 agent id（loop 建成时登记；gate.joined 的 envelope 要用）。
+	mainAgents map[contracts.Ulid]contracts.Ulid
+	// autoGates：session → 自动 gate 是否已加入（**成功才记**，失败下次 Run 重试）。
+	autoGates map[contracts.Ulid]bool
+	// joinLocks：session → join 互斥锁（per-session；见 joinMutex）。
+	joinLocks map[contracts.Ulid]*sync.Mutex
+	closed    bool
 }
 
 // New 装配一个 Hub。
 //
 // 顺序：开事件库 → 建索引器（确保投影表）→ bus → 策略/注册表/工具 → provider/approver
-// → 传输服务端 → 播种内存投影 → 起后台索引器。
+// → 传输服务端 → 播种内存投影与发现表 → 起后台索引器。
 func New(cfg Config) (*Hub, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -147,24 +164,47 @@ func New(cfg Config) (*Hub, error) {
 	}
 
 	b := bus.New(st)
+	disc := discovery.New()
+	discFeed := newDiscoveryFeed(st, disc)
+	cwd := strings.TrimSpace(cfg.CWD)
+	if cwd == "" {
+		// 缺省用进程 cwd（alasol serve 在哪个目录起，就默认那是哪个 repo）。
+		if wd, werr := os.Getwd(); werr == nil {
+			cwd = wd
+		} else {
+			hubLog.Warn("host: 取进程工作目录失败，hub 级默认 repo gate 不可用", "err", werr.Error())
+		}
+	}
 	h := &Hub{
-		cfg:      cfg,
-		store:    st,
-		bus:      b,
-		indexer:  ix,
-		reg:      reg,
-		engine:   eng,
-		provider: prov,
-		approver: ap,
-		proj:     newProjection(st),
-		ws:       transport.NewServer(b),
-		loops:    make(map[contracts.Ulid]*loop.Loop),
+		cfg:        cfg,
+		store:      st,
+		bus:        b,
+		indexer:    ix,
+		reg:        reg,
+		engine:     eng,
+		provider:   prov,
+		approver:   ap,
+		proj:       newProjection(st),
+		disc:       disc,
+		discFeed:   discFeed,
+		cwd:        cwd,
+		ws:         transport.NewServer(b),
+		loops:      make(map[contracts.Ulid]*loop.Loop),
+		specs:      make(map[contracts.Ulid]SessionSpec),
+		mainAgents: make(map[contracts.Ulid]contracts.Ulid),
+		autoGates:  make(map[contracts.Ulid]bool),
 	}
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
 	if _, err := h.proj.catchUp(context.Background()); err != nil {
 		_ = h.Close()
 		return nil, fmt.Errorf("host: 播种投影失败: %w", err)
+	}
+	// 播种发现表：join 历史 / agent 树投影从事件流重建（K10/G17b）。**老 session 不会
+	// 因此变回存活**——活状态是进程本地的，重启后全部失活（这是设计，不是遗漏）。
+	if _, err := h.discFeed.catchUp(context.Background()); err != nil {
+		_ = h.Close()
+		return nil, fmt.Errorf("host: 播种发现表失败: %w", err)
 	}
 
 	// 后台索引器：派生表（sessions / ledger / board / cost_stats）的**唯一写者**。
@@ -207,7 +247,8 @@ func (h *Hub) Close() error {
 // RunPrompt 起（或复用）一个 session 的 agent loop 并跑一轮。
 //
 // sessionID 为空 → 新建一个（返回的 Result 里拿不到新 id，调用方要 id 就用
-// NewSession() 先取一个）。prompt 为空 → 拒绝（空 prompt 等于浪费一次模型调用）。
+// NewSession() / CreateSession() 先取一个）。prompt 为空 → 拒绝（空 prompt 等于浪费一次
+// 模型调用）。sessionID 未登记归属 → 自动 gate 用 hub 级默认（Config.CWD / RunID）。
 func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt string) (loop.Result, error) {
 	if h == nil {
 		return loop.Result{}, errors.New("host: Hub 为 nil")
@@ -215,16 +256,21 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 	if strings.TrimSpace(prompt) == "" {
 		return loop.Result{}, errors.New("host: prompt 不能为空")
 	}
-	lp, err := h.loopFor(sessionID)
+	lp, err := h.loopFor(ctx, sessionID)
 	if err != nil {
 		return loop.Result{}, err
 	}
 	res, err := lp.Run(ctx, prompt)
-	// 跑完立刻把新事件并进投影：/api/context 不必等下一次请求的增量扫描。
+	// 跑完立刻把新事件并进投影 + 发现表：/api/context 与 /api/peers 不必等下一次请求的
+	// 增量扫描。
 	if _, cerr := h.proj.catchUp(ctx); cerr != nil {
 		// 投影失败不影响 Run 的结果（在线表晚一会刷新），但不该被完全吞掉：
 		// 水位没前进 → 下一次 API 请求的 catchUp 会重试同一区间。
 		hubLog.Warn("host: Run 后投影 catch-up 失败（下次 API 请求会重试）",
+			"session_id", string(sessionID), "err", cerr.Error())
+	}
+	if _, cerr := h.discFeed.catchUp(ctx); cerr != nil {
+		hubLog.Warn("host: Run 后发现表 catch-up 失败（下次 API 请求会重试）",
 			"session_id", string(sessionID), "err", cerr.Error())
 	}
 	return res, err
@@ -234,14 +280,35 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 //
 // 一个 session 一个 Loop：System/Model/AgentID 固定，历史由每次 Run 的局部变量带
 // （loop 无可变状态 → 同一 Loop 可并发 Run，见 loop 包 doc）。
-func (h *Hub) loopFor(sessionID contracts.Ulid) (*loop.Loop, error) {
+//
+// 建成时顺做两件 K10/K12 的事：① 发现表 Activate（本进程持有该 session——活状态，
+// 无租约无心跳，G17b）；② 加入自动 gate（repo:/workflow:）。② 只在**首次**建成时做，
+// 且失败不记账（下次 Run 重试）——加不上 gate 只会让该 session 暂不可见（fail-close：
+// 失败让可见性变小，不是变大），不该因此拒绝跑这一轮。
+func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop, error) {
 	if sessionID == "" {
-		return nil, errors.New("host: sessionID 必填（空 = 用 NewSession() 先取一个）")
+		return nil, errors.New("host: sessionID 必填（空 = 用 NewSession()/CreateSession() 先取一个）")
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if lp, ok := h.loops[sessionID]; ok {
+		h.mu.Unlock()
 		return lp, nil
+	}
+	agentID, ok := h.disc.PrimaryAgent(sessionID)
+	if !ok {
+		// 新 session（事件流里还没有它）→ 新主 agent。续跑的 session 复用原来的 id
+		// （与 durable.PrimaryAgentID 同口径），不造"幽灵 agent"。
+		//
+		// 取之前先把事件流扫到最新：session 原属**另一个 hub 进程**时（共享事件库），
+		// 本地水位可能还没追上它的历史，那就该先扫——否则会退化成新 id。
+		if _, serr := h.discFeed.catchUp(ctx); serr != nil {
+			hubLog.Warn("host: 取主 agent 前扫事件流失败（退化成一个新 agent id）",
+				"session_id", string(sessionID), "err", serr.Error())
+		}
+		agentID, ok = h.disc.PrimaryAgent(sessionID)
+		if !ok {
+			agentID = core.NewUlid()
+		}
 	}
 	lp, err := loop.New(loop.Config{
 		Provider:      h.provider,
@@ -250,20 +317,40 @@ func (h *Hub) loopFor(sessionID contracts.Ulid) (*loop.Loop, error) {
 		Policy:        h.engine,
 		Approver:      h.approver,
 		SessionID:     sessionID,
-		AgentID:       core.NewUlid(),
+		AgentID:       agentID,
 		Model:         h.cfg.Model,
 		System:        h.cfg.System,
 		MaxTurns:      h.cfg.MaxTurns,
 		ContextBudget: h.cfg.ContextBudget,
 	})
 	if err != nil {
+		h.mu.Unlock()
 		return nil, fmt.Errorf("host: 为 session %s 建 loop: %w", sessionID, err)
 	}
 	h.loops[sessionID] = lp
+	h.mainAgents[sessionID] = agentID
+	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
+	autoDone := h.autoGates[sessionID]
+	h.mu.Unlock()
+
+	h.disc.Activate(sessionID)
+	if !autoDone {
+		if jerr := h.joinAutoGates(ctx, sessionID, agentID, spec); jerr != nil {
+			hubLog.Warn("host: 自动 gate 加入失败（该 session 暂不可见，下次 Run 重试）",
+				"session_id", string(sessionID), "err", jerr.Error())
+		} else {
+			h.mu.Lock()
+			h.autoGates[sessionID] = true
+			h.mu.Unlock()
+		}
+	}
 	return lp, nil
 }
 
 // NewSession 生成一个新的 session id（调用方先拿 id 再 RunPrompt，便于 UI/CLI 展示）。
+//
+// 不登记工作目录 → 自动 gate 用 hub 级默认。要按 session 指定归属（多 worktree）用
+// CreateSession。
 func NewSession() contracts.Ulid { return core.NewUlid() }
 
 // Addr 返回归一化后的监听地址（Config.Addr 的解析结果，供 serve 打印与监听）。

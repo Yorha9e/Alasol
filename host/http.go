@@ -2,13 +2,16 @@ package host
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/ui/web"
 )
 
@@ -25,8 +28,13 @@ var httpLog = slog.Default()
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行）
 //	GET /api/context/{session_id}→ 最新 ContextSnapshot；没有 → 404
+//	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
+//	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
 //
 // 其它方法/路径 → 405 / 404，一律 JSON 错误体（前端统一按 JSON 解）。
+//
+// 发现表的其余查询面（Agents / Agent / Gates …）**故意不暴露**：K11 的水平可见性只到
+// "对端 session 的主 agent"，跨 session 的 agent 清单是宿主内部视图（见 Hub.Discovery）。
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 
@@ -41,6 +49,8 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", h.serveHealth)
 	mux.HandleFunc("GET /api/sessions", h.serveSessions)
 	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
+	mux.HandleFunc("GET /api/peers", h.servePeers)
+	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
 
 	return mux
 }
@@ -118,6 +128,77 @@ func parseSessionID(raw string) (contracts.Ulid, error) {
 		return "", fmt.Errorf("session_id 不是合法 ULID（26 字符 Crockford base32）: %q", raw)
 	}
 	return id, nil
+}
+
+// servePeers 服务 GET /api/peers?session_id=<ulid>（K11 水平可见性）。
+//
+// 200 → PeersView（peers 可能是空数组 = 没有相交 gate 的存活对端）；
+// 400 → session_id 不合法；404 → 该 session 不是本 hub 在托管的。
+func (h *Hub) servePeers(w http.ResponseWriter, r *http.Request) {
+	sid, err := parseSessionID(r.URL.Query().Get("session_id"))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
+		return
+	}
+	view, err := h.Peers(r.Context(), sid)
+	if err != nil {
+		writeHubError(w, err)
+		return
+	}
+	if view.Peers == nil {
+		view.Peers = []discovery.PeerRow{}
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// maxGateJoinBody 限制 POST /api/gates/join 的请求体大小（loopback 上也别裸奔）。
+const maxGateJoinBody = 4 << 10
+
+// serveGateJoin 服务 POST /api/gates/join（K12 显式 join_gate；幂等）。
+//
+// 请求体：{"session_id":"<ulid>","gate_id":"repo:xxx"|"workflow:xxx"|任意合法标识}。
+// 200 → 加入后的 PeersView（已在线内时直接返回当前可见面，不重复落事件）；
+// 400 → 体不是 JSON / session_id 不合法 / gate_id 不合法；404 → session 不受本 hub 托管。
+func (h *Hub) serveGateJoin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"session_id"`
+		GateID    string `json:"gate_id"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxGateJoinBody))
+	if err := dec.Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
+		return
+	}
+	sid, err := parseSessionID(body.SessionID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
+		return
+	}
+	// 入参校验放 HTTP 层：不合法 → 400（不是 500），与 host.Peers 的 session_id 校验同口径。
+	if _, ok := discovery.NormalizeGateID(body.GateID); !ok {
+		writeJSONError(w, http.StatusBadRequest, "bad_gate_id",
+			fmt.Sprintf("gate_id 不合法（空 / 超过 %d 字符 / 含空白或控制字符）: %q", discovery.MaxGateIDLen, body.GateID))
+		return
+	}
+	view, err := h.JoinGate(r.Context(), sid, body.GateID)
+	if err != nil {
+		writeHubError(w, err)
+		return
+	}
+	if view.Peers == nil {
+		view.Peers = []discovery.PeerRow{}
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// writeHubError 把 Hub 的错误映射成 HTTP 状态码（404 = session 不受托管，其余 500）。
+func writeHubError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrSessionNotHosted) {
+		writeJSONError(w, http.StatusNotFound, "unknown_session",
+			"这个 session 不是本 hub 在托管的 session（先跑一轮 prompt，或它属于别的 hub 进程）")
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, "hub_failed", err.Error())
 }
 
 // writeJSONBody 写一个 JSON 响应体。

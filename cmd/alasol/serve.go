@@ -31,6 +31,8 @@ type hubFlags struct {
 	system         *string
 	indexerBatch   *int
 	maxSessionRows *int
+	cwd            *string
+	runID          *string
 }
 
 // registerHubFlags 把共有 flag 注册到 fs（serve 额外有 -addr，chat 也有但可忽略）。
@@ -49,6 +51,8 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		system:         fs.String("system", "", "系统提示"),
 		indexerBatch:   fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
 		maxSessionRows: fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
+		cwd:            fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
+		runID:          fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
 	}
 }
 
@@ -72,6 +76,8 @@ func (f *hubFlags) config() (host.Config, error) {
 		APIKeyEnv:      *f.apiKeyEnv,
 		IndexerBatch:   *f.indexerBatch,
 		MaxSessionRows: *f.maxSessionRows,
+		CWD:            strings.TrimSpace(*f.cwd),
+		RunID:          strings.TrimSpace(*f.runID),
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
@@ -164,6 +170,8 @@ func printBanner(addr string) {
 	fmt.Printf("  事件流   ws://%s/ws（NDJSON）\n", addr)
 	fmt.Printf("  在线表   http://%s/api/sessions\n", addr)
 	fmt.Printf("  上下文   http://%s/api/context/{session_id}\n", addr)
+	fmt.Printf("  可见性   http://%s/api/peers?session_id=...（K11 水平可见性）\n", addr)
+	fmt.Printf("  加 gate  curl -X POST http://%s/api/gates/join -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
 	fmt.Printf("  健康     http://%s/api/health\n", addr)
 	fmt.Printf("  只监听 loopback（N5b）；Ctrl-C 退出\n")
 }

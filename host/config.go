@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/discovery"
 )
 
 // DefaultAddr 是 HTTP/WS 的默认监听地址（N5b：只监听 loopback）。
@@ -56,6 +57,12 @@ type Config struct {
 	// 只传变量名：值由 host 在装配时从 env 取出直接交给 provider，
 	// 永不进 argv / 事件 / 日志（H12/H19）。
 	APIKeyEnv string
+	// CWD 是 hub 级默认工作目录：自动 gate repo:<repo_id> 按它算（K12/S14）。
+	// 空 = 用进程 cwd。per-session 覆盖用 Hub.CreateSession(SessionSpec{CWD: ...})。
+	CWD string
+	// RunID 是 hub 级默认工作流运行 id（K12：有则自动加入 workflow:<run_id>）。
+	// 空 = 不加 workflow gate。工作流引擎在 v3，这里只留钩子。
+	RunID string
 	// Provider 覆盖（测试注入脚本 provider；nil = openai 真实实现）。
 	Provider core.Provider
 	// Approver 覆盖（测试注入；nil = 按 Approval 选）。
@@ -95,6 +102,12 @@ func (c *Config) validate() error {
 	}
 	if c.MaxSessionRows <= 0 {
 		c.MaxSessionRows = DefaultMaxSessionRows
+	}
+	// RunID 拼成 workflow:<run_id> 后必须是个合法 gate id（S9：不合则拒，不修复）。
+	if runID := strings.TrimSpace(c.RunID); runID != "" &&
+		!discovery.ValidGateID(discovery.WorkflowGate(runID)) {
+		return fmt.Errorf("host: Config.RunID %q 不合法（含空白/控制字符，或拼成 workflow gate 后超过 %d 字符）",
+			c.RunID, discovery.MaxGateIDLen)
 	}
 	return nil
 }

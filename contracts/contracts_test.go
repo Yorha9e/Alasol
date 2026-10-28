@@ -167,6 +167,20 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Usage.InputTokens == 0 || p.Usage.OutputTokens == 0 {
 				t.Errorf("line %d: model.turn usage 应带非零 token 数: %+v", lineNo, p.Usage)
 			}
+		case "gate.joined":
+			var p GateJoinedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into GateJoinedPayload: %v", lineNo, err)
+				break
+			}
+			if p.GateID == "" {
+				t.Errorf("line %d: gate.joined gate_id 不能为空", lineNo)
+			}
+			switch p.Source {
+			case GateJoinSourceAutoRepo, GateJoinSourceAutoWorkflow, GateJoinSourceExplicit:
+			default:
+				t.Errorf("line %d: gate.joined source = %q 不在枚举内", lineNo, p.Source)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -189,7 +203,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	// and must decode into its type (x-kind-payload in event.json is the source).
 	for _, kind := range []string{
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
-		"context.assembled", "user.prompt", "model.turn",
+		"context.assembled", "user.prompt", "model.turn", "gate.joined",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)

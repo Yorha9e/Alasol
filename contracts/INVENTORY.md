@@ -24,19 +24,30 @@
 
 ## 2. 事件 core kind 子集（随 Event 契约定稿）
 
-kind 是开放字符串（D6），core 定义核心子集。**已定稿 payload 形状的**：
+kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已定稿全集**（与 `schema/event.json` 的 `x-kind-payload` 同步，2026-10-28 v1-S2 补全此前漏账）：
 
 | kind | durable | 说明 |
 |---|---|---|
+| `user.prompt` | true | **对话入流**（F1，v1-S1）：用户提示原文；Run 开始落（旁路观测，不计 Result.Events） |
+| `model.turn` | true | **对话入流**（F1，v1-S1）：模型回复 + `ModelTurnUsage`（usage **只进成本统计**，J21——不回填快照） |
 | `tool.call.intent` | true | **三段事件之①**（X1）：tool_call_id / 参数 / idempotent / replay 标记 / 外部可核验锚点（如 commit sha） |
 | `tool.call.completed` | true | **三段事件之③a**（X1）：结果（Tool 返回值契约） |
 | `tool.call.failed` | true | **三段事件之③b**（X1）：失败（错误为普通事件，M1/M8） |
 | `ledger.updated` | true | **goal ledger 全量快照**（`LedgerUpdatedPayload`，G8/G23）：goals / constraints / completed / pending 四张清单**全文**；整帧 LWW（seq 大者胜），当前态 = 索引器投影（ledger 不是独立可变存储，事件流是唯一事实源） |
 | `board.written` | true | **共享黑板键写入**（`BoardWrittenPayload`，K22/G23）：键 + 原始 JSON 值 + 作者；`tombstone=true` = 删除该键（**墓碑行**语义：保留行、值为 NULL、读取时视为不存在；旧墓碑盖不掉新值、旧值复活不了已删键） |
+| `agent.spawned` | true | subagent 诞生（`spawn_request_id` 幂等键 X5、`role` K13） |
+| `agent.completed` | true | subagent 收敛：结构化 summary 是回主 agent 的**唯一通道**（K24；taint 继承 Q7） |
+| `agent.failed` | true | subagent 失败（异常向上冒泡 K23） |
+| `gate.checked` | true | CI 门禁检查结果（receipt 四要素校验 V2；`elapsed_ms` V5） |
+| `context.assembled` | true | 每轮模型调用前的上下文快照（G12，载荷 = ContextSnapshot 契约） |
+| `checkpoint.created` | true | durable checkpoint 四要素（X3） |
+| `session.resumed` | true | resume 流程完成标记（X4） |
+| `session.resume_claimed` | true | in-flight 原子认领（X5 防并发重放） |
+| `gate.joined` | true | session 加入 gate（K12，v1-S2）：`gate_id` + `source`（auto_repo/auto_workflow/explicit）；无 `gate.left`——离开 = session 结束 |
 
 写路径铁律（X1）：`intent` **durable 落盘** → 执行 → `result` durable 落盘。**有意图无结果 = 未知结果，不盲目重跑**。
 
-其余 core kind（`context.assembled` / `policy.decided` / `checkpoint.created` / `session.resumed` 等）随对应阶段补 payload schema，envelope 复用 `event.json`。
+其余 core kind（`policy.decided` 等）随对应阶段补 payload schema，envelope 复用 `event.json`；kind→payload 全量映射以 `schema/event.json` 的 `x-kind-payload` 为准（D21：源头一处）。
 
 ## 3. 生成与编码约定（schema 与 codegen 共同遵守）
 

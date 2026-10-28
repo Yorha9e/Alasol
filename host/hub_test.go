@@ -13,7 +13,9 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/host"
+	"github.com/Yorha9e/alasol/runtime/identity"
 	"github.com/Yorha9e/alasol/runtime/transport"
 )
 
@@ -47,7 +49,20 @@ func (s *scriptedProvider) Run(ctx context.Context, req core.ModelRequest, emit 
 }
 
 // newTestHub 装配一个 Hub：临时事件库 + 脚本 provider + 放行 read 工具。
+//
+// 默认工作目录指向**自建的临时 git 仓库**（tempRepoOrDir）：hub 级默认工作目录为空时
+// 会退回进程 cwd，而"进程 cwd 在不在 git 仓库内"取决于跑测试的环境（拷到没有 .git
+// 的目录里就会变），那会让"自动 gate → 多一条 gate.joined → 事件数 8"的断言随机红。
+// 自建仓库后，事件条数只取决于测试自己造的东西。
 func newTestHub(t *testing.T, muts ...func(*host.Config)) *host.Hub {
+	t.Helper()
+	h, _ := newTestHubWithCWD(t, muts...)
+	return h
+}
+
+// newTestHubWithCWD 同 newTestHub，但**同时返回生效的工作目录**（mut 覆盖过 CWD 时
+// 返回覆盖后的值）——断言要按这个目录算期望事件条数（wantEventCount）。
+func newTestHubWithCWD(t *testing.T, muts ...func(*host.Config)) (*host.Hub, string) {
 	t.Helper()
 	cfg := host.Config{
 		DBPath:   filepath.Join(t.TempDir(), "events.db"),
@@ -55,6 +70,7 @@ func newTestHub(t *testing.T, muts ...func(*host.Config)) *host.Hub {
 		System:   "test-system",
 		MaxTurns: 4,
 		Allow:    []string{"read"},
+		CWD:      tempRepoOrDir(t),
 	}
 	for _, mut := range muts {
 		if mut != nil {
@@ -66,13 +82,44 @@ func newTestHub(t *testing.T, muts ...func(*host.Config)) *host.Hub {
 		t.Fatalf("host.New: %v", err)
 	}
 	t.Cleanup(func() { _ = h.Close() })
-	return h
+	return h, cfg.CWD
 }
 
 // withProvider 把脚本 provider 注入 Config（args 是首轮工具调用的参数）。
 func withProvider(args string) func(*host.Config) {
 	return func(c *host.Config) {
 		c.Provider = &scriptedProvider{args: args}
+	}
+}
+
+// assertAutoGate 断言"自动 repo gate 在 / 不在"——事件条数那条断言的另一半：多出来的
+// 那一条就是 gate.joined（K12 自动 gate）。只看条数的话，"少了一条"和"多了一条"
+// 分不清；这里把"gate 在不在"也钉住。
+//
+// 走 GateMembers（而不是 Peers）：GateMembers 内部会先 catchUp（把事件流扫进发现表），
+// 但**不要求**本 hub 托管该 session——重开/换实例的用例里 session 归别的 hub 管。
+func assertAutoGate(t *testing.T, h *host.Hub, sid contracts.Ulid, cwd string) {
+	t.Helper()
+	repoID := ""
+	if cwd != "" {
+		if id, err := identity.RepoID(cwd); err == nil && id != "" {
+			repoID = id
+		}
+	}
+	want := repoID != ""
+	got := false
+	if repoID != "" {
+		if _, err := h.GateMembers(context.Background(), discovery.RepoGate(repoID)); err != nil {
+			t.Fatalf("GateMembers: %v", err)
+		}
+		for _, g := range h.Discovery().GatesOf(sid) {
+			if g == discovery.RepoGate(repoID) {
+				got = true
+			}
+		}
+	}
+	if got != want {
+		t.Fatalf("自动 repo gate 存在性 = %v，want %v（gates=%v）", got, want, h.Discovery().GatesOf(sid))
 	}
 }
 
@@ -126,7 +173,7 @@ func TestAPISessionsContextHealth(t *testing.T) {
 	if err := os.WriteFile(target, []byte("alasol host api"), 0o600); err != nil {
 		t.Fatalf("写目标文件: %v", err)
 	}
-	h := newTestHub(t, withProvider(`{"path":"`+filepath.ToSlash(target)+`"}`))
+	h, cwd := newTestHubWithCWD(t, withProvider(`{"path":"`+filepath.ToSlash(target)+`"}`))
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
@@ -145,8 +192,10 @@ func TestAPISessionsContextHealth(t *testing.T) {
 
 	sid := runOneRound(t, h, "读一下目标文件")
 
-	// 在线表：一行，七条事件，最后 kind 是收尾那一轮的 model.turn
-	// （v1-S1 起对话入流：user.prompt + 两轮各 context.assembled/model.turn + intent + completed = 7）。
+	// 在线表：一行，事件条数 = 7 条基础 + 1 条自动 gate.joined（K12 自动 gate；
+	// 工作目录算不出 repo_id 时没有那一条 → 7 条），最后 kind 是收尾那一轮的 model.turn
+	// （v1-S1 起对话入流：user.prompt + 两轮各 context.assembled/model.turn + intent + completed；
+	// v1-S2 起 loop 建成时先落一条 gate.joined）。
 	rows = nil
 	if code := getJSON(t, srv.URL+"/api/sessions", &rows); code != http.StatusOK {
 		t.Fatalf("sessions 状态码 = %d", code)
@@ -158,9 +207,11 @@ func TestAPISessionsContextHealth(t *testing.T) {
 	if row.SessionID != string(sid) {
 		t.Fatalf("session_id = %q，want %q", row.SessionID, sid)
 	}
-	if row.EventCount != 7 || row.FirstSeq != 1 || row.LastSeq != 7 {
-		t.Fatalf("seq/计数不符: %+v", row)
+	want := wantEventCount(t, cwd)
+	if row.EventCount != int64(want) || row.FirstSeq != 1 || row.LastSeq != int64(want) {
+		t.Fatalf("seq/计数不符: %+v（want event_count=%d）", row, want)
 	}
+	assertAutoGate(t, h, sid, cwd)
 	if row.LastKind != "model.turn" {
 		t.Fatalf("last_kind = %q，want model.turn", row.LastKind)
 	}
@@ -477,9 +528,11 @@ func TestTwoHubsShareOneEventLog(t *testing.T) {
 	if err := os.WriteFile(target, []byte("shared"), 0o600); err != nil {
 		t.Fatalf("写目标文件: %v", err)
 	}
+	cwd := tempRepoOrDir(t)
 	newHub := func() *host.Hub {
 		return newTestHub(t, withProvider(`{"path":"`+filepath.ToSlash(target)+`"}`), func(c *host.Config) {
 			c.DBPath = db
+			c.CWD = cwd
 		})
 	}
 
@@ -497,13 +550,18 @@ func TestTwoHubsShareOneEventLog(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("在线表应有 2 个 session，得到 %d: %+v", len(rows), rows)
 	}
+	// 7 = user.prompt + 两轮各 context.assembled/model.turn + intent + completed；
+	// 再 +1 = 自动 gate.joined（v1-S2 自动 gate，工作目录算不出 repo_id 时没有）。
+	want := wantEventCount(t, cwd)
 	seen := map[string]bool{}
 	for _, r := range rows {
 		seen[r.SessionID] = true
-		if r.EventCount != 7 {
-			t.Fatalf("session %s event_count = %d，want 7", r.SessionID, r.EventCount)
+		if r.EventCount != int64(want) {
+			t.Fatalf("session %s event_count = %d，want %d", r.SessionID, r.EventCount, want)
 		}
 	}
+	assertAutoGate(t, c, sidA, cwd)
+	assertAutoGate(t, c, sidB, cwd)
 	if !seen[string(sidA)] || !seen[string(sidB)] {
 		t.Fatalf("在线表缺 session：A=%v B=%v", seen[string(sidA)], seen[string(sidB)])
 	}
@@ -525,6 +583,7 @@ func TestReopenPreservesOnlineTableAndSnapshot(t *testing.T) {
 		t.Fatalf("写目标文件: %v", err)
 	}
 
+	cwd := tempRepoOrDir(t)
 	cfg := func() host.Config {
 		return host.Config{
 			DBPath:   db,
@@ -532,6 +591,7 @@ func TestReopenPreservesOnlineTableAndSnapshot(t *testing.T) {
 			System:   "test-system",
 			MaxTurns: 4,
 			Allow:    []string{"read"},
+			CWD:      cwd,
 			Provider: &scriptedProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`},
 		}
 	}
@@ -559,9 +619,11 @@ func TestReopenPreservesOnlineTableAndSnapshot(t *testing.T) {
 	if code := getJSON(t, srv.URL+"/api/sessions", &rows); code != http.StatusOK || len(rows) != 1 {
 		t.Fatalf("重开后在线表 = %d 行（code=%d）", len(rows), code)
 	}
-	if rows[0].EventCount != 7 {
-		t.Fatalf("重开后 event_count = %d，want 7", rows[0].EventCount)
+	want := wantEventCount(t, cwd)
+	if rows[0].EventCount != int64(want) {
+		t.Fatalf("重开后 event_count = %d，want %d", rows[0].EventCount, want)
 	}
+	assertAutoGate(t, h2, sid, cwd)
 	var snap contracts.ContextSnapshot
 	if code := getJSON(t, srv.URL+"/api/context/"+string(sid), &snap); code != http.StatusOK {
 		t.Fatalf("重开后 context 状态码 = %d", code)
