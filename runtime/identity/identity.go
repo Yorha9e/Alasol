@@ -136,6 +136,22 @@ func ProjectID(cwd string) (string, error) {
 //
 // 不在任何 git 仓库内（向上到顶仍无 .git）→ 返回错误（fail-close：宁可无 repo_id 也不乱聚）。
 func RepoID(path string) (string, error) {
+	canonical, err := GitRoot(path)
+	if err != nil {
+		return "", err
+	}
+	return core.ShortHash(canonical), nil
+}
+
+// GitRoot 返回 path 所在**主仓库根**的规范绝对路径（08 §1 的 repo_id 基准，跨 worktree 聚合：
+// 主仓库与它的所有 worktree 归一为同一个根）。
+//
+// 为什么单独导出（不只是 RepoID 的内部实现）：有些落点需要**稳定的主仓库根路径**本身，
+// 不只是它的哈希——典型是"仓库内的持久缓存目录"（runtime/gate 的 cache.dir 相对路径基准）：
+// 快照目录是一次性的（跑完就删），拿它当基准 = 缓存目录每次换地方、永不命中。
+//
+// 不在任何 git 仓库内（向上到顶仍无 .git）→ 返回错误（fail-close）。
+func GitRoot(path string) (string, error) {
 	root, err := gitRoot(path)
 	if err != nil {
 		return "", err
@@ -147,7 +163,7 @@ func RepoID(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return core.ShortHash(canonical), nil
+	return canonical, nil
 }
 
 // gitRoot 从 start 向上找 .git，返回**主仓库根**的绝对路径（已 EvalSymlinks，未小写/未去尾

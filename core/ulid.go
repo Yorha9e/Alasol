@@ -64,6 +64,21 @@ func randomBytes(n int) []byte {
 	return b
 }
 
+// EncodeCrockford26 把 128bit（16 字节）编成 26 字符 Crockford base32（标准 ULID 编码）。
+//
+// 这是 **Crockford 26 编码的单一实现处**（上提）：框架 id（ULID）、project_id/repo_id 短哈希
+// （core.ShortHash）、门禁依赖缓存键（core/gate.CacheKey）全都用它——同一套字符集（排除易混淆
+// 的 I/L/O/U，S1）、同一套位序，别再各自复刻一份（core/durable 曾本地复刻，现统一走上提后的这个）。
+//
+// 输入必须是 16 字节（128 bit）：长度不对是**编程错误**（不是运行期数据），直接 panic，
+// 不做静默截断/补零——那会让不同输入折出同一个 id。
+func EncodeCrockford26(b []byte) string {
+	if len(b) != shortHashBytes {
+		panic("core: EncodeCrockford26 需要 16 字节（128 bit）输入")
+	}
+	return encodeCrockford(b)
+}
+
 // encodeCrockford 把 128bit 大端整数编成 26 字符 Crockford base32（标准 ULID 编码）：
 // 26×5=130bit ≥ 128bit，最高字符只用到 3bit（取值 0–7，与标准 ULID 的首字符约束一致）。
 //

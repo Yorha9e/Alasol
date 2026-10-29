@@ -351,3 +351,57 @@ type ContextCompactedPayload struct {
 	// 可选：产生该摘要的压缩模型名（成本统计按模型分组用；默认主模型、可配，13 §9）。
 	Model *string `json:"model,omitempty"`
 }
+
+// review 结论枚举（V6）。字段形状不绑死"独立 reviewer"概念（V9：我们没有 mission/deps/独立 reviewer，对应物是 agent 树 + 协调人）——reviewer 身份由 envelope.agent_id 承载（agent 树里的角色：协调人/审查 agent），payload 只记结论本身。
+type ReviewConclusion string
+
+const (
+	ReviewConclusionApproved         ReviewConclusion = "approved"
+	ReviewConclusionChangesRequested ReviewConclusion = "changes_requested"
+)
+
+// review.recorded —— 一条分支 review 结论的事实记录（V6：review 后分支 tip 变 → 结论失效 → 要求重审）。durable=true：review 结论进事件流（唯一事实源，D5/F5），事件流天然可检测失效——**被 review 的 tip 就在 payload.tip_commit 里**，合并门禁拿它比对分支当前 tip（git 观测）即可判定失效，无需三点 diff。reviewer 身份**不进 payload**（V9：无独立 reviewer，结论来自 agent 树角色，身份由 envelope.agent_id 承载；字段形状不绑死，方便后续换角色而不改契约）。
+type ReviewRecordedPayload struct {
+	// 被 review 的分支名 / ref。
+	Branch string `json:"branch"`
+	// 被 review 时该分支的 tip commit（V6 失效判定的基准：当前 tip ≠ 此值 → 结论失效）。
+	TipCommit string `json:"tip_commit"`
+	// review 结论（approved / changes_requested）。
+	Conclusion ReviewConclusion `json:"conclusion"`
+	// 可选：review 说明（模型可读）。
+	Note *string `json:"note,omitempty"`
+}
+
+// 对单个未合并分支的撞车预判（V7：合并后冲突预测，用依赖图可达性）。Collides=预判撞车；Basis=撞车依据（`<命中类型>:<节点>`，模型可读）；Available=预测是否可用（影响面**完整可信**：触点全在图里、未截断、方向正确）——Available=false 且 Collides=false 表示"预测不可用"（诚实降级，N2），**不是"无冲突"**。
+type ConflictRisk struct {
+	// 未合并分支 / 任务标识。
+	Branch string `json:"branch"`
+	// 是否预判撞车（非对称判据：同触点 / 一侧触点落在另一侧影响面内）。
+	Collides bool `json:"collides"`
+	// 撞车依据：`<命中类型>:<节点>`（collides=true 时非空）。命中类型分级可辨——**direct**=同触点（确定信号，不依赖图）；**one-side**=一侧触点落在另一侧影响面内（传递信号，依赖可达性结论）。前缀取值见 x-item-prefix（机器可读注记）。
+	Basis []string `json:"basis,omitempty"`
+	// 预测是否可用（影响面完整可信：触点全在图里、未截断、方向正确、查询无错）。false = 无法排除传递撞车（诚实降级）。
+	Available bool `json:"available"`
+	// 可选：不在依赖图里的改动触点（诚实信号：这些触点的传递影响面追不出去 → 不能断言"无交集"）。
+	UnknownRoots []string `json:"unknown_roots,omitempty"`
+	// 可选：影响面被结果上限截断（可能不完整 → 不能断言"无交集"）。
+	Truncated *bool `json:"truncated,omitempty"`
+	// 人类可读说明（撞车依据 / 无交集 / 图不可用）。
+	Reason *string `json:"reason,omitempty"`
+}
+
+// conflict.predicted —— 一次合并后冲突预测的事实记录（V7：合并成功后，对"本次改动 vs 未合并分支"用依赖图可达性预警撞车，比三点 diff 求交集更准）。durable=true 进事件流（F7 只增）。diff 由调用方喂（roots，v2-S2 口径：框架不算 diff），框架只做 core/graph 可达性/影响面比对。**诚实降级（N2）**：图未启用 / 追闭包出错 / 闭包方向不对 / 影响面没追全（触点不在图里或闭包被截断）/ 有未合并分支不可评估时 Available=false 并给 UnavailableReason——明说"预测不可用"而非"无冲突"（重建窗口影响面可能干净为空，消费端分不清"真没影响"与"正在重建"）。
+type ConflictPredictedPayload struct {
+	// 本次合并的分支标识。
+	MergedBranch string `json:"merged_branch"`
+	// **聚合**预测是否可用 = 合并侧可评估 **且** 每个未合并分支都可评估。**不许只读聚合层**：合并侧可评估但某些分支不可评估时，聚合层不得报 available=true（否则只读聚合的消费端会把"可用且 0 撞车"读成"无冲突"）。逐条结论看 risks[].available。
+	Available bool `json:"available"`
+	// available=false 时的诚实说明（图未启用 / 追闭包出错 / 方向不对 / 影响面没追全 / 有未合并分支不可评估）。
+	UnavailableReason *string `json:"unavailable_reason,omitempty"`
+	// **确认命中**（判据命中）的未合并分支数。不可评估的分支**不计入**（它们的传递撞车无法排除，不是"没撞"）——那些分支的条数在 unevaluated 里。
+	Collisions int64 `json:"collisions"`
+	// 可选：**不可评估**的未合并分支数（该分支的传递撞车无法排除）。恒等式：len(risks) = 确认命中数 + 不可评估数（可评估且未命中的分支既不撞车也不计入本字段）。
+	Unevaluated *int64 `json:"unevaluated,omitempty"`
+	// 逐分支的撞车预判明细（**逐条看 risks[].available**——它才是每条分支自己的覆盖度结论）。
+	Risks []ConflictRisk `json:"risks,omitempty"`
+}

@@ -250,6 +250,88 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Usage != nil && p.Model == nil {
 				t.Errorf("line %d: context.compacted 带 usage 时应带 model 名（成本按模型分组）", lineNo)
 			}
+		case "review.recorded":
+			var p ReviewRecordedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ReviewRecordedPayload: %v", lineNo, err)
+				break
+			}
+			// V6：被 review 的分支 + tip 都必须记上（tip 是失效判定基准，缺了就无法检测失效）。
+			if p.Branch == "" {
+				t.Errorf("line %d: review.recorded branch 不能为空", lineNo)
+			}
+			if p.TipCommit == "" {
+				t.Errorf("line %d: review.recorded tip_commit 不能为空（V6 失效判定基准）", lineNo)
+			}
+			switch p.Conclusion {
+			case ReviewConclusionApproved, ReviewConclusionChangesRequested:
+			default:
+				t.Errorf("line %d: review.recorded conclusion = %q 不在枚举内", lineNo, p.Conclusion)
+			}
+		case "conflict.predicted":
+			var p ConflictPredictedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ConflictPredictedPayload: %v", lineNo, err)
+				break
+			}
+			if p.MergedBranch == "" {
+				t.Errorf("line %d: conflict.predicted merged_branch 不能为空", lineNo)
+			}
+			// 逐分支撞车预判：collides=true 必须带 basis（依据）；Available=false 不可当作"无冲突"（N2 诚实降级）。
+			for i, r := range p.Risks {
+				if r.Branch == "" {
+					t.Errorf("line %d: conflict.predicted risks[%d].branch 不能为空", lineNo, i)
+				}
+				if r.Collides && len(r.Basis) == 0 {
+					t.Errorf("line %d: conflict.predicted risks[%d] collides=true 必须带 basis（撞车依据）", lineNo, i)
+				}
+				// basis 条目必须带命中类型前缀（direct=同触点 / one-side=传递命中）：分级可辨。
+				for _, b := range r.Basis {
+					if !strings.HasPrefix(b, "direct:") && !strings.HasPrefix(b, "one-side:") {
+						t.Errorf("line %d: conflict.predicted risks[%d].basis 条目 %q 缺命中类型前缀（direct:/one-side:）", lineNo, i, b)
+					}
+				}
+				// 覆盖度信号（unknown_roots / truncated）出现时，可用性必须为 false：
+				// 覆盖不足还说"可用"= 假"无冲突"。
+				truncated := r.Truncated != nil && *r.Truncated
+				if (len(r.UnknownRoots) > 0 || truncated) && r.Available {
+					t.Errorf("line %d: conflict.predicted risks[%d] 带覆盖度信号时 available 必须为 false", lineNo, i)
+				}
+				// Available=false 且没撞车 → 理由不得说"无交集"（那是"可用"的结论）。
+				if !r.Available && !r.Collides && r.Reason != nil && strings.Contains(*r.Reason, "无交集") {
+					t.Errorf("line %d: conflict.predicted risks[%d] available=false 时理由不得说\"无交集\"：%q", lineNo, i, *r.Reason)
+				}
+			}
+			// N-1 聚合诚实化：**不许只读聚合层**——available=true 时不得存在
+			// risks[].available=false 的分支（否则只读聚合的消费端会把"可用且 0 撞车"
+			// 读成"无冲突"）；有不可评估分支时聚合层必须 available=false + unevaluated>0。
+			unevaluated := 0
+			for i, r := range p.Risks {
+				if !r.Available {
+					unevaluated++
+					if p.Available {
+						t.Errorf("line %d: conflict.predicted risks[%d] available=false 时聚合层 available 必须为 false", lineNo, i)
+					}
+				}
+			}
+			if unevaluated > 0 {
+				if p.Unevaluated == nil || *p.Unevaluated != int64(unevaluated) {
+					t.Errorf("line %d: conflict.predicted 有 %d 个不可评估分支，unevaluated 应为 %d（得到 %v）", lineNo, unevaluated, unevaluated, p.Unevaluated)
+				}
+			}
+			if p.Available && p.Unevaluated != nil && *p.Unevaluated > 0 {
+				t.Errorf("line %d: conflict.predicted available=true 时 unevaluated 必须为 0/缺省（得到 %d）", lineNo, *p.Unevaluated)
+			}
+			// collisions 只数**确认命中**：不可评估的分支不计入（恒等式）。
+			confirmed := 0
+			for _, r := range p.Risks {
+				if r.Collides {
+					confirmed++
+				}
+			}
+			if p.Collisions != int64(confirmed) {
+				t.Errorf("line %d: conflict.predicted collisions = %d，期望确认命中数 %d", lineNo, p.Collisions, confirmed)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -274,6 +356,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
+		"review.recorded", "conflict.predicted",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)

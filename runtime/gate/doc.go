@@ -13,12 +13,26 @@
 //   - **一次性快照 worktree**（V1）：Snapshot 用 git worktree add --detach 把某个 commit
 //     检出到独立 detached worktree。**未提交改动结构性不进快照**（快照只含 commit 内容），
 //     比 dirty 检查干净；并行跑 N 个门禁 = N 个独立快照，互不干扰。
-//   - **跑不透明命令**（W9/V3/V5）：Run 在快照目录经 shell 跑 Config.Command
+//   - **跑不透明命令**（W9/V3/V5/V4）：Run 在快照目录经 shell 跑 Config.Command
 //     （Windows cmd /c、其他 bash -c——这是全包唯一走 shell 的地方，因为 W9 明确命令是
-//     不透明 shell 字符串）。注入约定 env（CI_WORKTREE / CI_COMMIT / CI_PORT_BASE）让命令
-//     自隔离外部资源（V3 留白）；stdout/stderr 合并捕获，LogTail 只留尾部 ≤64KB，记 ElapsedMS（V5）。
+//     不透明 shell 字符串）。注入约定 env 让命令自隔离外部资源（V3 留白）：
+//     **CI_WORKTREE**（快照目录）/ **CI_COMMIT**（快照 commit）/ **CI_PORT_BASE**（端口基址）/
+//     **CI_CACHE_KEY**（依赖缓存键）/ **CI_CACHE_DIR**（该键对应的缓存目录）；
+//     stdout/stderr 合并捕获，LogTail 只留尾部 ≤64KB，记 ElapsedMS（V5）。
 //   - **Observ edCommit**：命令跑完再 rev-parse HEAD 一次，跑期间 HEAD 若移动会被 core/gate
 //     的四查③抓住（V2）。
+//
+// # 缓存 env 的约定（V4）
+//
+//   - **CI_CACHE_KEY**：内容寻址键（26 字符 Crockford；= 仓库作用域 + 清单内容哈希）；
+//   - **CI_CACHE_DIR**：该键对应的缓存目录（= <cache.dir 或本机默认根>/<key>）。
+//     **该目录可能不存在**——框架只派生路径，**不创建**它（创建与写入是命令自己的事：
+//     命令自暖，首次跑把依赖装进这里，之后命中复用）。命令**必须容忍目录不存在**。
+//     cache.dir 的**相对路径按主仓库根**解析（稳定落点：不是一次性快照目录——那会让缓存
+//     目录每次换地方、随快照删除，缓存永不命中）。副作用：相对路径落在**仓库工作树内部**，
+//     请自行加 .gitignore 或直接配仓库外的绝对路径（推荐）。
+//   - 目录里**只放依赖类产物**（包管理器装出来的东西）：它是**共享只读**目录，跨快照可见、
+//     按键隔离（版本隔离 + 仓库隔离）；放源码/构建产物/密钥等于把它泄出去。
 //
 // # git 纪律（V10 / 陷阱 6 / 陷阱 7）
 //

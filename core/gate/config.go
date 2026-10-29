@@ -12,8 +12,11 @@ import (
 //
 // Command 是**不透明 shell 字符串**：引擎原样交给 shell 执行（runtime/gate），
 // 不解析、不区分 typecheck/lint/测试。命令对引擎是黑盒，准确性的责任在写命令的人。
+//
+// Cache 是**可选**的依赖缓存配置（V4：内容寻址共享只读缓存；F7 只增，缺省时行为不变）。
 type Config struct {
-	Command string `json:"command"`
+	Command string       `json:"command"`
+	Cache   *CacheConfig `json:"cache,omitempty"`
 }
 
 // ErrNotConfigured 表示门禁未配置：仓库根缺少 .alasol/gate.json（W9）。

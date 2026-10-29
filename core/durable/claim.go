@@ -137,37 +137,10 @@ func claimReleased(events []contracts.Event, claim claimEvent) bool {
 // 为什么要确定性：认领靠 store 的**幂等写**去重（Event.ID 冲突 → 只成功一次），
 // 所以并发者必须算出**同一个** id 才能让 store 兜住竞争。而 Event.id 必须是合法
 // ULID（契约 common.json#/$defs/Ulid 的 26 字符 Crockford base32 正则）。
+//
+// 编码器用 core 根包上提的 core.EncodeCrockford26（框架 id、短哈希、门禁缓存键共用同一
+// 实现）——本包不再本地复刻一份（两份实现漂移过一次就够，别来第三份）。
 func deriveClaimULID(sessionID contracts.Ulid, round int64) contracts.Ulid {
 	sum := sha256.Sum256([]byte("alasol:resume-claim:" + string(sessionID) + ":" + strconv.FormatInt(round, 10)))
-	return contracts.Ulid(encodeCrockford26(sum[:16]))
-}
-
-// crockfordAlphabet 是 Crockford base32 字符集（S1/S8：排除易混淆的 I/L/O/U）。
-const crockfordAlphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-
-// encodeCrockford26 把 128bit 编成 26 字符 Crockford base32（标准 ULID 编码）。
-//
-// 与 core 包的同名实现同款（那里未导出）：本包需要**确定性**的 id（认领靠 store 的
-// 幂等写去重），core 又不导出编码器，故在本地复刻一份。
-//
-// 位累积方向：从最低字节开始，**新字节比已累积的位更显著** → 必须左移 nbits 后 OR 进来。
-func encodeCrockford26(b []byte) string {
-	out := make([]byte, 26)
-	var bits uint64
-	var nbits uint
-	idx := 25
-	for i := len(b) - 1; i >= 0; i-- {
-		bits |= uint64(b[i]) << nbits
-		nbits += 8
-		for nbits >= 5 {
-			out[idx] = crockfordAlphabet[bits&0x1f]
-			idx--
-			bits >>= 5
-			nbits -= 5
-		}
-	}
-	if nbits > 0 { // 128 = 25×5 + 3 → 最后 3bit 进首字符
-		out[idx] = crockfordAlphabet[bits&0x1f]
-	}
-	return string(out)
+	return contracts.Ulid(core.EncodeCrockford26(sum[:16]))
 }
