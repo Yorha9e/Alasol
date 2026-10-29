@@ -1429,3 +1429,125 @@ func TestEngineHistoryBudgetFollowsConfiguredInjectionBudgets(t *testing.T) {
 		t.Error("注入区变大后历史区份额应让位（26k < 30k → 必须降级），但阶段仍是 full")
 	}
 }
+
+// fakeValidation 是测试用的"验证通过"信号源：passSeq 之后的范围算有信号。
+type fakeValidation struct {
+	mu      sync.Mutex
+	passSeq int64
+	tip     int64
+	err     error
+	queries int
+}
+
+func (f *fakeValidation) ValidationPassedSince(_ context.Context, afterSeq int64) (bool, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queries++
+	if f.err != nil {
+		return false, afterSeq, f.err
+	}
+	return f.passSeq > afterSeq, f.tip, nil
+}
+
+// v2-S1 硬边界接线（J11）：引擎自己观测"验证通过"信号并打出阶段硬边界。
+// 基线（首个 Assemble）不反应陈旧信号；之后的新信号 → 关当前阶段、开新阶段（hardClosed）。
+func TestValidationSignalDrivesHardBoundary(t *testing.T) {
+	seq := &fakeSeq{tip: 0}
+	fv := &fakeValidation{}
+	e := newTestEngine(t, &fakeSummarizer{}, &fakeEmitter{}, seq, &fakeText{}, nil)
+	e.SetValidationSignal(fv)
+	d := newDriver(t, e, seq)
+	ctx := context.Background()
+
+	// 基线：首个 Assemble 只记当前 tip（=10），不反应已存在的陈旧信号（passSeq=5 ≤ 10）。
+	d.add("阶段一") // seq.tip = 10
+	fv.tip = 10
+	fv.passSeq = 5
+	d.assemble(ctx)
+	if len(e.segments) != 1 {
+		t.Fatalf("基线后应只有 1 个阶段（陈旧信号不反应），得到 %d", len(e.segments))
+	}
+	if fv.queries != 0 {
+		t.Errorf("基线不应查询信号源（只记 tip），得到 %d 次", fv.queries)
+	}
+
+	// 新信号：passSeq=15 > baseline 10 → 打硬边界。
+	d.add("阶段一续") // seq.tip = 20
+	fv.tip = 20
+	fv.passSeq = 15
+	d.assemble(ctx)
+	if len(e.segments) != 2 {
+		t.Fatalf("新验证信号后应开新阶段，得到 %d", len(e.segments))
+	}
+	if !e.segments[0].hardClosed {
+		t.Error("阶段 1 应以硬边界收尾（hardClosed=true）")
+	}
+}
+
+// TestValidationSignalBetweenRunsNotSkipped 是 **v3-S3 修**的回归：验证信号落在**两次
+// Run 之间**（引擎 per-Run 重建）也必须被看到。
+//
+// 背景：tiered 引擎是 per-Run 的（工厂每次 Run 造一个 fresh 引擎）。若游标只活在引擎里，
+// 下一个 Run 的首次 Assemble 会**重新取基线**（"只看本次 Run 开始后的新信号"）→
+// Run1 结束与 Run2 开始之间到达的验证信号**永远不可见**（那一段再没人扫过）。
+// 修法：游标**会话级持久**（ValidationCursor），跨 Run 接力。
+func TestValidationSignalBetweenRunsNotSkipped(t *testing.T) {
+	seq := &fakeSeq{tip: 0}
+	fv := &fakeValidation{}
+	cursor := NewValidationCursor()
+
+	// ── Run1：引擎 A（per-Run 的第一个实例）。
+	e1 := newTestEngine(t, &fakeSummarizer{}, &fakeEmitter{}, seq, &fakeText{}, nil)
+	e1.SetValidationSignal(fv)
+	e1.SetValidationCursor(cursor)
+	d1 := newDriver(t, e1, seq)
+	ctx := context.Background()
+	d1.add("阶段一") // seq.tip = 10
+	fv.tip = 10
+	d1.assemble(ctx) // 基线（游标落到 10）
+
+	// ── Run1 与 Run2 之间：验证信号到达（workflow.milestone passed=true 落事件流）。
+	fv.passSeq = 15
+	fv.tip = 20
+
+	// ── Run2：引擎 B（**新的** per-Run 实例），但游标是同一个（会话级）。
+	e2 := newTestEngine(t, &fakeSummarizer{}, &fakeEmitter{}, seq, &fakeText{}, nil)
+	e2.SetValidationSignal(fv)
+	e2.SetValidationCursor(cursor)
+	d2 := newDriver(t, e2, seq)
+	d2.add("阶段二") // seq.tip = 30
+	d2.assemble(ctx)
+
+	// Run2 必须看到 Run1 与 Run2 之间的验证信号 → 置硬边界标记。
+	// （硬边界在**下一次**装配收尾当前阶段——本轮是引擎 B 的首次装配，阶段刚建。）
+	if !e2.pendingHard {
+		t.Fatal("跨 Run 的验证信号应被看到（引擎应置硬边界标记）：Run2 重新取基线把 Run1 与 Run2 之间的信号跳过了")
+	}
+	d2.assemble(ctx)
+	if len(e2.segments) != 2 {
+		t.Fatalf("硬边界应关掉当前阶段并开新阶段，阶段数 = %d, want 2", len(e2.segments))
+	}
+	if !e2.segments[0].hardClosed {
+		t.Error("阶段 1 应以硬边界收尾（hardClosed=true）")
+	}
+}
+
+// fail-close：信号源查询出错 → **不**打硬边界（不确定就不妄断验证通过）。
+func TestValidationSignalFailClosedOnError(t *testing.T) {
+	seq := &fakeSeq{tip: 0}
+	fv := &fakeValidation{err: errors.New("store 读失败")}
+	e := newTestEngine(t, &fakeSummarizer{}, &fakeEmitter{}, seq, &fakeText{}, nil)
+	e.SetValidationSignal(fv)
+	d := newDriver(t, e, seq)
+	ctx := context.Background()
+
+	d.add("阶段一")
+	fv.tip = 10
+	d.assemble(ctx) // 基线
+	d.add("阶段一续")
+	fv.tip = 20
+	d.assemble(ctx) // 查询出错 → 不硬边界
+	if len(e.segments) != 1 {
+		t.Errorf("信号源出错时不应打硬边界（fail-close），阶段数 = %d", len(e.segments))
+	}
+}

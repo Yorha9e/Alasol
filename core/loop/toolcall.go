@@ -75,7 +75,14 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 
 	// c''. 生效权限收窄（H11/H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予）：
 	// 声明的权限是**上限**，超出即 deny，**不可被全局 allow 规则放宽**。
-	if denied, reason := l.permDenial(tc.Name); denied {
+	//
+	// side 从**解析结果**的描述取（框架工具的副作用档位也算数——p3 修：此前只看注册表，
+	// 框架工具（ledger 是写账本）一律按 SideEffectNone 处理 = 绕过 perm 校验）。
+	side := contracts.SideEffectNone
+	if desc != nil {
+		side = desc.SideEffect
+	}
+	if denied, reason := l.permDenial(tc.Name, side); denied {
 		return l.failToolCall(ctx, &intentID, tc.ID, reason, CodePermDenied, nil, events)
 	}
 
@@ -182,15 +189,15 @@ func (l *Loop) resolveTool(name string, strategyTools map[string]compaction.Fram
 //
 // 工具所需的权限维度由 side_effect + 是否执行类推导（agents.RequiredCapabilities）。
 //
+// side 由调用方从**解析结果**的描述取（desc.SideEffect）：框架工具（recall / stage /
+// ledger）**不在注册表里**——只看注册表会把它们一律当成 SideEffectNone，等于**绕过**
+// perm 校验（ledger 是写账本的 SideEffectWrite，却按"无副作用"放行）。p3 修。
+//
 // 单 agent 模式（没有 agent 树）→ 不受 perm 约束（ok=false）。
-func (l *Loop) permDenial(toolName string) (bool, string) {
+func (l *Loop) permDenial(toolName string, side contracts.SideEffect) (bool, string) {
 	perm, ok := l.effectivePerm()
 	if !ok {
 		return false, "" // 单 agent 模式：无 perm 约束
-	}
-	side := contracts.SideEffectNone
-	if entry, known := l.registry.Get(toolName); known && entry.Tool != nil {
-		side = entry.Tool.SideEffect
 	}
 	needs := agents.RequiredCapabilities(toolName, side)
 	var missing []string

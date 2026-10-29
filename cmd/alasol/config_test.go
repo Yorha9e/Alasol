@@ -383,3 +383,61 @@ command = "y"
 		t.Fatalf("错误信息应点名重复：%v", verr)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 工作流引擎配置面（v3-S3，W1）
+// ---------------------------------------------------------------------------
+
+// TestBuildConfigGoalLedgerPrecedence 钉死 goal_ledger 的**布尔口径**（显式 flag > 文件 >
+// 默认关）：`-goal-ledger=false` 必须能**压过**文件里的 goal_ledger=true。
+//
+// 背景（p3 修）：此前写的是 `*f.goalLedger || fc.GoalLedger`——"||" 只会把 false 变成
+// true，用户在命令行显式关掉的东西压不过配置文件（与 sandbox 同款坑，见
+// sandboxEnabledFlag 的说明）。
+func TestBuildConfigGoalLedgerPrecedence(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := "model = \"m\"\ngoal_ledger = true\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+
+	// ① 只有文件 → 用文件的 true。
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("① 意外错误: %v", err)
+	}
+	if !hc.GoalLedger {
+		t.Error("① 文件的 goal_ledger=true 应生效")
+	}
+
+	// ② 显式 `-goal-ledger=false` → **压过**文件（用户显式关掉就是关掉）。
+	hc2, err := buildConfigFrom(t, "-config", cfgFile, "-goal-ledger=false")
+	if err != nil {
+		t.Fatalf("② 意外错误: %v", err)
+	}
+	if hc2.GoalLedger {
+		t.Error("② 显式 -goal-ledger=false 应压过文件里的 goal_ledger=true")
+	}
+
+	// ③ 显式 `-goal-ledger` → 开。
+	hc3, err := buildConfigFrom(t, "-config", cfgFile, "-goal-ledger=true")
+	if err != nil {
+		t.Fatalf("③ 意外错误: %v", err)
+	}
+	if !hc3.GoalLedger {
+		t.Error("③ 显式 -goal-ledger=true 应生效")
+	}
+
+	// ④ 没有文件配置 → 默认关（零行为变化，酸测试）。
+	noneFile := filepath.Join(t.TempDir(), "none.toml")
+	if err := os.WriteFile(noneFile, []byte("model = \"m\"\n"), 0o600); err != nil {
+		t.Fatalf("写空配置: %v", err)
+	}
+	hc4, err := buildConfigFrom(t, "-config", noneFile)
+	if err != nil {
+		t.Fatalf("④ 意外错误: %v", err)
+	}
+	if hc4.GoalLedger {
+		t.Error("④ 无配置时 goal ledger 应默认关闭")
+	}
+}

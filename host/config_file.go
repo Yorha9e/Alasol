@@ -64,6 +64,10 @@ type FileConfig struct {
 	Sandbox SandboxFileConfig `toml:"sandbox"`
 	// MCP MCP client（v3-S1，N1：client 先；默认关 = 不连任何外部 server）。
 	MCP MCPFileConfig `toml:"mcp"`
+	// WorkflowDir 工作流能力包目录（v3-S3，W13：纯数据 JSON；空 = 只用内建 tower）。
+	WorkflowDir string `toml:"workflow_dir"`
+	// GoalLedger 是否给 session 注入 goal ledger 更新工具（J19/X6；默认 false = 零行为变化）。
+	GoalLedger bool `toml:"goal_ledger"`
 }
 
 // MCPFileConfig 是 MCP client 的文件级配置（v3-S1）。

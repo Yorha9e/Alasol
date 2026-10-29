@@ -99,6 +99,14 @@ func (l Limits) normalize() (Limits, error) {
 // 语句文本（upsert / delete / …）由**实现侧**（runtime/graph）持有并传入；
 // **DDL 不走这条面**——建表由实现自建（见 GraphProjection.EnsureSchema），
 // 免得把"建表 DDL"塞进调用方的事务里（core 契约不该管别人的事务边界）。
+//
+// # N5（Tx 类型化收尾）：**留挂**（v2-S2 挂账，v3-S3 复议仍不接）
+//
+// 曾设想把 Tx 从"裸参数化语句"升级成类型化操作面（UpsertNode/DeleteAll/…）。复议后
+// **不做**：那要把图存储的**全部操作语义**枚举进 core 契约，直接违背 G2b"存储接口不泄漏
+// 引擎特性"——换一个图存储（不同的操作集）时 core 侧反而要改。类型化的收益（编译期防手滑
+// 写错 SQL）远小于它引入的耦合成本。**刻意保留 raw-exec 形状**；手滑风险由实现侧的集中
+// SQL 常量 + 测试覆盖挡住。此为设计取舍的如实留挂，非遗漏。
 type Tx interface {
 	// Exec 执行一条参数化语句（结果用不到就不返回）。
 	Exec(ctx context.Context, query string, args ...any) error

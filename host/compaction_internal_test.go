@@ -34,26 +34,26 @@ func TestContextStrategyFactoryGate(t *testing.T) {
 
 	// "" = append（默认）→ nil 工厂。
 	off := &Hub{cfg: Config{ContextStrategy: ""}}
-	if f, err := off.contextStrategyFactory(sid, aid); f != nil || err != nil {
+	if f, err := off.contextStrategyFactory(sid, aid, off.cfg.ContextStrategy); f != nil || err != nil {
 		t.Fatalf("ContextStrategy 空应返回 nil 工厂：f=%v err=%v", f, err)
 	}
 
 	// tiered + 默认窗口（0=1M）→ 非 nil 工厂。
 	on := &Hub{cfg: Config{ContextStrategy: "tiered"}}
-	f, err := on.contextStrategyFactory(sid, aid)
+	f, err := on.contextStrategyFactory(sid, aid, on.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 应返回非 nil 工厂：f=%v err=%v", f, err)
 	}
 
 	// tiered + 窗口 < 256k 硬约束 → 拒绝（fail-close，不静默降级）。
 	small := &Hub{cfg: Config{ContextStrategy: "tiered", ContextStrategyWindow: 200_000}}
-	if _, err := small.contextStrategyFactory(sid, aid); err == nil {
+	if _, err := small.contextStrategyFactory(sid, aid, small.cfg.ContextStrategy); err == nil {
 		t.Fatal("窗口 < 256k 应拒绝装配并说明")
 	}
 
 	// tiered + 窗口 ≥ 256k → 非 nil 工厂。
 	big := &Hub{cfg: Config{ContextStrategy: "tiered", ContextStrategyWindow: 300_000}}
-	if f, err := big.contextStrategyFactory(sid, aid); err != nil || f == nil {
+	if f, err := big.contextStrategyFactory(sid, aid, big.cfg.ContextStrategy); err != nil || f == nil {
 		t.Fatalf("窗口 300k 应通过：f=%v err=%v", f, err)
 	}
 }
@@ -73,7 +73,7 @@ func TestContextStrategyFactoryProducesEngine(t *testing.T) {
 		bus:      bus.New(st),
 		provider: nopProvider{},
 	}
-	f, err := h.contextStrategyFactory(sid, aid)
+	f, err := h.contextStrategyFactory(sid, aid, h.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 工厂: f=%v err=%v", f, err)
 	}
@@ -190,7 +190,7 @@ func TestContextStrategyFactoryInjectsRules(t *testing.T) {
 		bus:      bus.New(st),
 		provider: nopProvider{},
 	}
-	f, err := h.contextStrategyFactory(sid, aid)
+	f, err := h.contextStrategyFactory(sid, aid, h.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 工厂: f=%v err=%v", f, err)
 	}
@@ -243,7 +243,7 @@ func TestContextStrategyFactoryAppliesParams(t *testing.T) {
 		bus:      bus.New(st),
 		provider: nopProvider{},
 	}
-	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid())
+	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid(), h.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 工厂: f=%v err=%v", f, err)
 	}
@@ -269,7 +269,7 @@ func TestContextStrategyFactoryAppliesParams(t *testing.T) {
 
 func TestContextStrategyFactoryTrimsStrategyValue(t *testing.T) {
 	h := &Hub{cfg: Config{ContextStrategy: " tiered "}}
-	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid())
+	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid(), h.cfg.ContextStrategy)
 	if err != nil {
 		t.Fatalf("装配不应报错: %v", err)
 	}
@@ -412,7 +412,7 @@ func TestContextStrategyFactoryAppliesInjectionBudgets(t *testing.T) {
 		bus:      bus.New(st),
 		provider: nopProvider{},
 	}
-	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid())
+	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid(), h.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 工厂: f=%v err=%v", f, err)
 	}
@@ -466,7 +466,7 @@ func TestContextStrategyFactoryReportsTruncatedInjectionOnce(t *testing.T) {
 		bus:      bus.New(st),
 		provider: nopProvider{},
 	}
-	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid())
+	f, err := h.contextStrategyFactory(core.NewUlid(), core.NewUlid(), h.cfg.ContextStrategy)
 	if err != nil || f == nil {
 		t.Fatalf("tiered 工厂: f=%v err=%v", f, err)
 	}

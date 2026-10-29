@@ -39,12 +39,53 @@ type LedgerWriter struct {
 }
 
 // NewLedgerWriter 构造一个绑定到 (session, agent) 的 ledger 写入器。
+//
+// **基线是空的**：新写入器不知道账本当前长什么样——调用方必须先用 Seed 灌入当前快照
+// （见 LoadLedger），否则会抹掉既有关键字段（ledger.updated 是全量快照 + LWW）。
 func NewLedgerWriter(store core.Store, sessionID, agentID contracts.Ulid) *LedgerWriter {
 	return &LedgerWriter{
 		store:     store,
 		sessionID: sessionID,
 		agentID:   agentID,
 	}
+}
+
+// LoadLedger 读出某 session 当前的 goal ledger 全量快照（折**最后一条** ledger.updated）。
+//
+// # 为什么必须有它（跨 Run 续写的基线）
+//
+// ledger.updated 是**全量快照 + LWW**（G23/G8）：每条事件都带四张清单的全文，后写的覆盖
+// 先写的。若写入器每次 Run 都从**空**账本起步（不加载当前态），那么 Run2 只更新过程字段
+// （completed）时，落盘的快照里 goals/constraints 就是空的 → **把 Run1 写下的关键字段抹掉**
+// （LWW 覆盖，且没有任何报错）。所以每个新写入器都必须先加载当前账本做基线。
+//
+// 口径：折最后一条 ledger.updated（事件流是唯一事实源）；坏载荷跳过（D7 宽容，与
+// foldLedger 同款）。**读失败 → 返回错误**，调用方据此 fail-close：宁可这一轮不写，
+// 也不拿一个空基线去覆盖关键字段。
+//
+// **口径：session 级**（与索引器 ledger_state 投影同口径——那是 per-session 的当前态）。
+// 写入器本身仍是 per-(session,agent)（并发写者隔离），但基线取 session 当前态。
+//
+// 代价：每 Run 扫一遍本 session 的事件流（账本工具是 opt-in，默认关 → 默认零开销）。
+func LoadLedger(ctx context.Context, store core.Store, sessionID contracts.Ulid) (contracts.LedgerUpdatedPayload, error) {
+	if store == nil {
+		return contracts.LedgerUpdatedPayload{}, fmt.Errorf("durable: LoadLedger 需要 store")
+	}
+	events, err := store.ReadFrom(ctx, &sessionID, 1, 0)
+	if err != nil {
+		return contracts.LedgerUpdatedPayload{}, fmt.Errorf("durable: 读 session %s 事件流（取当前账本）: %w", sessionID, err)
+	}
+	return foldLedger(events), nil
+}
+
+// Seed 用给定的当前账本快照做**基线**（跨 Run 续写：见 LoadLedger）。
+//
+// 只改内存基线，不落盘——落盘由后续的 UpdateCritical / Flush 负责（X6 写放大控制不变）。
+func (w *LedgerWriter) Seed(p contracts.LedgerUpdatedPayload) {
+	w.goals = cloneStrings(p.Goals)
+	w.constraints = cloneStrings(p.Constraints)
+	w.completed = cloneStrings(p.Completed)
+	w.pending = cloneStrings(p.Pending)
 }
 
 // UpdateCritical 更新关键字段（目标 / 约束）并**立即**落一条 ledger.updated（X6）。

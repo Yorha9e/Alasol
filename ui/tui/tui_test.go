@@ -344,6 +344,52 @@ func TestViewNonEmptyAllTabs(t *testing.T) {
 	}
 }
 
+// TestChatSubmitActivatesWorkflow（v3-S3 修）：TUI 必须有 **/workflow 激活入口**——
+// chat 有（alasol chat）而 TUI 没有 → 装了包的机器用 `alasol tui -workflow-dir` 装了能力包
+// 却**无法激活**（死功能）。
+//
+// 断言：/workflow tower → 该 session 激活了 tower（哲学进 system prompt）+ **不跑模型**
+// （不进 running 态、不产生对话轮次）；/workflow off → 停用。
+func TestChatSubmitActivatesWorkflow(t *testing.T) {
+	h, err := host.New(host.Config{
+		DBPath:   filepath.Join(t.TempDir(), "tui-wf.db"),
+		Model:    "stub",
+		Provider: stubProvider{},
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	sid := host.NewSession()
+	m := newModel(Options{Hub: h, Session: sid, Approver: NewApprover()})
+
+	// ① /workflow tower → 激活。
+	for _, r := range "/workflow tower" {
+		m.Update(keyRunes(string(r)))
+	}
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("/workflow 不该跑模型（激活只是 session 级状态变更）")
+	}
+	if m.running {
+		t.Fatal("/workflow 不该进 running 态")
+	}
+	aw := h.ActiveWorkflow(sid)
+	if aw == nil || aw.ID() != "tower" {
+		t.Fatalf("/workflow tower 应激活 tower 能力包，得到 %v", aw)
+	}
+
+	// ② /workflow off → 停用。
+	for _, r := range "/workflow off" {
+		m.Update(keyRunes(string(r)))
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if h.ActiveWorkflow(sid) != nil {
+		t.Fatal("/workflow off 应停用工作流")
+	}
+}
+
 // waitPending 轮询等 Approve 把 id 登记进 approver.pending。
 func waitPending(t *testing.T, a *Approver, id contracts.Ulid) {
 	t.Helper()

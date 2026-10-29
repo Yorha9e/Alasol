@@ -54,6 +54,10 @@ type hubFlags struct {
 	graphCore         *string
 	graphEscalate     *int
 
+	// ---- v3-S3 工作流引擎（W1 能力包，非强制）----
+	workflowDir *string
+	goalLedger  *bool
+
 	// ---- v2-S4 沙箱（K8/H9）----
 	sandbox              *bool
 	sandboxWriteDirs     *string
@@ -103,6 +107,12 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		graphMaxResults:   fs.Int("graph-max-results", 0, "多跳遍历结果上限（0=默认 5000，G18）"),
 		graphCore:         fs.String("graph-core", "", "核心接口节点声明（逗号分隔；`*` 结尾=字节前缀，如 core/*,contracts/*；W16）"),
 		graphEscalate:     fs.Int("graph-escalate-reachable", 0, "change_impact 的 escalate 阈值：可达节点数超过它才触发（0=默认 50，W15）"),
+
+		// 工作流引擎（v3-S3，W1 能力包）：目录加载纯数据能力包 + goal ledger 工具开关。
+		workflowDir: fs.String("workflow-dir", "",
+			"工作流能力包目录（v3-S3，W13：纯数据 JSON；空=只用内建 tower）。激活只把哲学注入 system prompt（W3），非强制"),
+		goalLedger: fs.Bool("goal-ledger", false,
+			"给 session 注入 goal ledger 更新工具（J19/X6；默认关=零行为变化。仍受策略链 deny-all 约束）"),
 
 		// 沙箱（v2-S4，K8/H9）：默认关（与 v1 等价）。开了之后 bash 写允许目录之外
 		// 会被 **OS 拒**（Windows: job object + 受限 token + 目录 ACL）。

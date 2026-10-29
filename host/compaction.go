@@ -33,16 +33,17 @@ const contextStrategyTiered = "tiered"
 // 一次 recall 可能拉回几十万 token，把上下文预算一次打穿。
 const defaultRecallReadLimit = 2000
 
-// contextStrategyFactory 按 Config.ContextStrategy 造 per-Run 的策略工厂（nil = 不挂 = append）。
+// contextStrategyFactory 按策略 kind 造 per-Run 的策略工厂（nil = 不挂 = append）。
 //
-// 只有 "tiered" 一个实现（其余/空 = append 兜底）。窗口 W 用 Config.ContextStrategyWindow
-// （0 = 默认 1M）；W < 256k 硬约束不满足时 NewEngine 返回 error → 此处**拒绝装配**并说明
-// （fail-close：不满足设计要求就明说，不静默降级成一个会负预算的策略）。
+// 只有 "tiered" 一个实现（其余/空 = append 兜底）。kind 由调用方收敛后传入（宿主默认
+// Config.ContextStrategy，或激活的工作流声明的 context_strategy，W6）。窗口 W 用
+// Config.ContextStrategyWindow（0 = 默认 1M）；W < 256k 硬约束不满足时 NewEngine 返回 error
+// → 此处**拒绝装配**并说明（fail-close：不满足设计要求就明说，不静默降级成一个会负预算的策略）。
 //
 // 参数面（F10）：W / L1% / L2% 全部来自宿主配置（TOML/CLI → host.Config → compaction.Params），
 // 不写死；规则文本（Config.ContextRules）也在这里注入（稳定前缀的一部分）。
-func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid) (compaction.AssemblerFactory, error) {
-	if strings.TrimSpace(h.cfg.ContextStrategy) != contextStrategyTiered {
+func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid, kind string) (compaction.AssemblerFactory, error) {
+	if strings.TrimSpace(kind) != contextStrategyTiered {
 		return nil, nil // append（默认）
 	}
 	params := h.cfg.contextStrategyParams()
@@ -51,6 +52,11 @@ func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid) (compact
 	if _, err := compaction.NewEngine(params, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
+	// 验证信号游标（v3-S3 修）：**session 级**持久一份，跨 Run 接力。
+	// tiered 引擎是 per-Run 的（每次 Run 造一个 fresh 引擎）——游标若只活在引擎里，
+	// 落在两次 Run 之间的验证信号（workflow.milestone passed=true 等）**永远看不见**
+	//（下一个 Run 会重新取基线，那一段再没人扫）。见 compaction.ValidationCursor。
+	cursor := h.validationCursorFor(sessionID)
 	return func() compaction.Assembler {
 		engine, err := compaction.NewEngine(
 			params,
@@ -68,6 +74,11 @@ func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid) (compact
 		if rules != "" {
 			engine.SetRules(rules)
 		}
+		// 硬边界接线（v2-S1 挂账，J11）：让引擎自己观测事件流里的"验证通过"信号
+		// （gate.checked passed=true）并打出阶段硬边界——宿主/loop 不必穿透到 per-Run 引擎。
+		engine.SetValidationSignal(validationSignalSource{store: h.store, sessionID: sessionID})
+		// 验证游标接上**会话级**载体（v3-S3 修）：跨 Run 接力，Run 之间到达的验证信号不再丢。
+		engine.SetValidationCursor(cursor)
 		// 注入区被截断 → **留痕**（退化必须可见：静默砍掉规则等于悄悄丢上下文）。
 		// 工厂是 per-Run 的 → 告警**只报一次**（否则每轮一条，噪声淹没真问题）。
 		if r, cs := engine.InjectionTruncated(); r || cs {
@@ -82,6 +93,27 @@ func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid) (compact
 		}
 		return engine
 	}, nil
+}
+
+// validationCursorFor 取（或建）某 session 的验证信号游标（v3-S3 修：跨 Run 接力）。
+//
+// 口径：游标是**会话级**状态（不是 core 全局状态——W12 同款纪律：归属 session），
+// 一个 session 一份，跨 Run 复用；引擎是 per-Run 的，游标在引擎之外才活得下来。
+//
+// 独立锁：装配路径（loopFor）可能持有 h.mu 时调到本函数——不另设锁会自锁。
+func (h *Hub) validationCursorFor(sessionID contracts.Ulid) *compaction.ValidationCursor {
+	h.validationMu.Lock()
+	defer h.validationMu.Unlock()
+	if h.validationCursors == nil {
+		// 兜底：Hub 结构体**字面量**构造（内部测试）时 map 为 nil——懒建，别 panic。
+		h.validationCursors = make(map[contracts.Ulid]*compaction.ValidationCursor)
+	}
+	c, ok := h.validationCursors[sessionID]
+	if !ok {
+		c = compaction.NewValidationCursor()
+		h.validationCursors[sessionID] = c
+	}
+	return c
 }
 
 // storeSeqSource 从事件库增量读当前 session 的最大 seq（engine 记录阶段 seq 区间用）。
@@ -234,4 +266,59 @@ func (e busEmitter) EmitCompacted(ctx context.Context, p contracts.ContextCompac
 		Payload:   raw,
 	}
 	return e.bus.Publish(ctx, ev)
+}
+
+// validationSignalSource 从事件流读"验证通过"信号（v2-S1 硬边界接线的生产驱动，J11）。
+//
+// 口径：事件流里出现 gate.checked 且 passed=true = 框架确认的**验证通过点**（13 §3/J11）。
+// 引擎每个 Assemble 调 ValidationPassedSince（带游标，只扫新事件）；找到 → 打阶段硬边界。
+// 读失败 → 返回 err（引擎据此**不**打硬边界，fail-close：不确定就不妄断验证通过）。
+type validationSignalSource struct {
+	store     core.Store
+	sessionID contracts.Ulid
+}
+
+func (s validationSignalSource) ValidationPassedSince(ctx context.Context, afterSeq int64) (bool, int64, error) {
+	events, err := s.store.ReadFrom(ctx, &s.sessionID, afterSeq+1, 0)
+	if err != nil {
+		return false, afterSeq, err
+	}
+	found := false
+	tip := afterSeq
+	for _, ev := range events {
+		if ev.Seq != nil && *ev.Seq > tip {
+			tip = *ev.Seq
+		}
+		if isValidationPassedEvent(ev) {
+			found = true
+		}
+	}
+	return found, tip, nil
+}
+
+// isValidationPassedEvent 判定一个事件是不是"验证通过"信号。
+//
+// 当前口径（两类，都表示框架确认的验证通过点，13 §3/J11）：
+//   - gate.checked 且 passed=true（门禁 receipt 通过）；
+//   - workflow.milestone 且 passed=true（工作流里程碑通过——W19：tower 的 critic→reviewer
+//     收敛点，与 v2-S1 阶段硬边界联动）。
+//
+// 坏载荷 → 不当通过信号（fail-close：解不开就不妄断验证通过）。
+func isValidationPassedEvent(ev contracts.Event) bool {
+	switch ev.Kind {
+	case "gate.checked":
+		var p contracts.GateCheckedPayload
+		if json.Unmarshal(ev.Payload, &p) != nil {
+			return false
+		}
+		return p.Passed
+	case "workflow.milestone":
+		var p contracts.WorkflowMilestonePayload
+		if json.Unmarshal(ev.Payload, &p) != nil {
+			return false
+		}
+		return p.Passed
+	default:
+		return false
+	}
 }

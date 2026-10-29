@@ -89,6 +89,14 @@ func (h *Hub) Handler() http.Handler {
 	// 图投影（v2-S2，G2f 可选投影）：change_impact 影响面报告（G21/W16）。
 	// 未启用时 503（明说"没开"，不返回空影响面——"没有影响面"对 escalate 是危险答案）。
 	mux.HandleFunc("GET /api/graph/impact", h.serveGraphImpact)
+	// 图投影重建（v3-S3，N2 运维入口）：崩溃遗留的重建窗口（rebuilding=1）会让影响面/
+	// 冲突预测一直不可用；启动期会自动恢复一次，这个端点供人工重试。
+	mux.HandleFunc("POST /api/graph/rebuild", h.serveGraphRebuild)
+
+	// 合并门禁（v3-S3 清 V6/V7 挂账）：review 记录 + 合并前查放行 + 合并后冲突预测。
+	mux.HandleFunc("POST /api/merge/review", h.serveMergeReview)
+	mux.HandleFunc("POST /api/merge/check", h.serveMergeCheck)
+	mux.HandleFunc("POST /api/merge/predict", h.serveMergePredict)
 
 	// 多 worktree 隔离（v1-S5 D）：创建 / 列表 / 删除。
 	mux.HandleFunc("GET /api/worktrees", h.serveWorktreesList)

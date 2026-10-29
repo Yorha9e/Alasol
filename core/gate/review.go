@@ -181,10 +181,7 @@ func LatestReview(events []contracts.Event, branch string) (Review, bool) {
 //     changes_requested 由调用方另判，本函数只回答"要不要重审"这一件事）。
 func ReReviewRequired(events []contracts.Event, branch, currentTip string) bool {
 	r, ok := LatestReview(events, branch)
-	if !ok {
-		return true
-	}
-	return r.Stale(currentTip)
+	return ReReviewRequiredReview(r, ok, currentTip)
 }
 
 // Approved 是合并门禁的**组合谓词**（V6）：给定事件流、分支、当前 tip，该分支是否
@@ -202,11 +199,33 @@ func ReReviewRequired(events []contracts.Event, branch, currentTip string) bool 
 //     （fail-close：那正是 V6 要防的"推了一行却蒙过门禁"）。
 func Approved(events []contracts.Event, branch, currentTip string) bool {
 	r, ok := LatestReview(events, branch)
-	if !ok {
+	return ApprovedReview(r, ok, currentTip)
+}
+
+// ApprovedReview 是 Approved 的**单条结论**版（调用方已 fold 出该分支的最新结论时用）。
+//
+// 为什么要这一版：合并门禁的读面会**缓存** fold 出来的结论（长会话里全量读事件流是 O(n)），
+// 缓存命中时手里只有一条 Review——判定语义必须与 Approved **逐条一致**，故把语义收在
+// core 里（Approved / ReReviewRequired 都委托给这两个单条版），宿主不自己拼判定。
+//
+// 语义（与 Approved 完全一致）：有记录 ∧ 结论 = approved ∧ 未失效（tip 未变）。
+func ApprovedReview(r Review, has bool, currentTip string) bool {
+	if !has {
 		return false
 	}
 	if r.Conclusion != contracts.ReviewConclusionApproved {
 		return false
 	}
 	return !r.Stale(currentTip)
+}
+
+// ReReviewRequiredReview 是 ReReviewRequired 的**单条结论**版（见 ApprovedReview 的说明）。
+//
+// 语义（与 ReReviewRequired 完全一致）：没记录 → 要求重审；记录了但 tip 变了（或观测不到
+// tip）→ 结论失效 → 要求重审。
+func ReReviewRequiredReview(r Review, has bool, currentTip string) bool {
+	if !has {
+		return true
+	}
+	return r.Stale(currentTip)
 }

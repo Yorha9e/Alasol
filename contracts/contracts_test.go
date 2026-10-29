@@ -361,6 +361,32 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Question == "" {
 				t.Errorf("line %d: btw.forked question 不能为空（/btw 问题原文）", lineNo)
 			}
+		case "workflow.activated":
+			var p WorkflowActivatedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into WorkflowActivatedPayload: %v", lineNo, err)
+				break
+			}
+			// v3-S3 工作流引擎（W1/W3）：能力包 id + 注入的哲学原文两要素齐全才可审计。
+			if p.WorkflowID == "" {
+				t.Errorf("line %d: workflow.activated workflow_id 不能为空", lineNo)
+			}
+			if p.Philosophy == "" {
+				t.Errorf("line %d: workflow.activated philosophy 不能为空（W3：注入 system prompt 供主 agent 选择的哲学原文）", lineNo)
+			}
+		case "workflow.milestone":
+			var p WorkflowMilestonePayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into WorkflowMilestonePayload: %v", lineNo, err)
+				break
+			}
+			// v3-S3 工作流引擎（W14 MilestoneHandler）：能力包 id + 里程碑名 + 通过结论三要素齐全。
+			if p.WorkflowID == "" {
+				t.Errorf("line %d: workflow.milestone workflow_id 不能为空", lineNo)
+			}
+			if p.Milestone == "" {
+				t.Errorf("line %d: workflow.milestone milestone 不能为空（里程碑名）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -386,7 +412,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
 		"review.recorded", "conflict.predicted", "hub.alert",
-		"btw.forked",
+		"btw.forked", "workflow.activated", "workflow.milestone",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)

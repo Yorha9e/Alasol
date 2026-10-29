@@ -253,7 +253,7 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 		Model:         h.cfg.Model,
 		System:        h.cfg.System,
 		MaxTurns:      h.cfg.MaxTurns,
-		ContextBudget: h.contextBudget(),
+		ContextBudget: h.contextBudgetFor(h.cfg.ContextStrategy),
 	})
 	if err != nil {
 		btw := BtwResult{

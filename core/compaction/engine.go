@@ -114,6 +114,16 @@ type Engine struct {
 	lastTip         int64           // 上次见到的 seq tip
 	warned          map[string]bool // budget_warning 去重（阶段+档位，F15）
 	pendingSplits   []splitRecord   // 待发的 split 事件（摘要算完后才知道 tokens_after）
+
+	// validation 是"验证通过"信号源（v2-S1 硬边界接线的生产驱动，J11；nil = 不接线）。
+	// validationInit / lastValidationSeq 是它的游标：首个 Assemble 基线到当前 tip（只看
+	// 本次 Run 开始后的新信号，不反应陈旧事件），之后只扫 (lastValidationSeq, tip]。
+	// validationCursor 是**会话级**游标载体（v3-S3 修）：引擎是 per-Run 的，若游标随引擎
+	// 消失，落在两次 Run 之间的验证信号永远看不见（详见 ValidationCursor 的说明）。
+	validation        ValidationSignalSource
+	validationInit    bool
+	lastValidationSeq int64
+	validationCursor  *ValidationCursor
 }
 
 // splitRecord 是一次 split 兜底的记录（事件在摘要物化后才发，tokens_after 按切后实际算，F26）。
@@ -238,6 +248,91 @@ func (e *Engine) MarkValidationPassed() {
 	e.mu.Unlock()
 }
 
+// SetValidationSignal 接上"验证通过"信号源（v2-S1 硬边界接线的生产驱动，J11）。
+//
+// 接上后，引擎每次 Assemble 自己查"自上一边界以来有没有验证通过事件"（如 gate.checked
+// passed=true），有就打硬边界（等价于 MarkValidationPassed）——宿主/loop 因此不必穿透到
+// per-Run 引擎实例。nil = 不接线（默认，零行为变化：硬边界只由显式 MarkValidationPassed
+// 或 stage 工具触发）。**首个 Assemble 基线到当前 tip**：只看本次 Run 开始后的新信号，
+// 不反应陈旧的历史验证事件。
+func (e *Engine) SetValidationSignal(src ValidationSignalSource) {
+	e.mu.Lock()
+	e.validation = src
+	e.validationInit = false
+	e.lastValidationSeq = 0
+	e.mu.Unlock()
+}
+
+// SetValidationCursor 接上**会话级**验证游标（v3-S3 修：跨 Run 不丢信号）。
+//
+// 引擎是 per-Run 的（工厂每次 Run 造一个 fresh 引擎）——若游标只活在引擎里，下一个 Run
+// 会重新取基线（"只看本次 Run 开始后的新信号"），**落在两次 Run 之间**的验证信号
+// （如 Run1 结束与 Run2 开始之间到达的 workflow.milestone passed=true）**永远不可见**。
+//
+// 宿主为每个 session 持一个 ValidationCursor（会话级持久），装配引擎时传进来 → 引擎从
+// 该游标继续扫，并把推进后的位置写回（下一个 Run 接着扫）。
+//
+// 口径：
+//   - 游标**已定位过**（Initialized）→ 引擎从该位置继续（不再重新取基线）；
+//   - 游标**未定位过**（新建的）→ 引擎保持现行口径：首次 Assemble 取基线（不反应陈旧
+//     的历史验证事件），并把基线写回游标（下一个 Run 从那里继续）。
+//
+// nil = 不接（行为与不接时逐字节等价：游标只在引擎内部）。
+func (e *Engine) SetValidationCursor(c *ValidationCursor) {
+	e.mu.Lock()
+	e.validationCursor = c
+	if c != nil && c.Initialized() {
+		// 会话级游标已有位置 → 直接从那里继续（不重新取基线）。
+		e.lastValidationSeq = c.Seq()
+		e.validationInit = true
+	}
+	e.mu.Unlock()
+}
+
+// consumeValidationPassed 查"验证通过"信号，返回是否该打硬边界（IO 出状态锁，J21 同款纪律）。
+//
+// 首个调用只做**基线**（记当前 tip，不反应历史）；之后扫 (lastValidationSeq, tip]，找到
+// 验证通过事件 → 返回 true（调用方置 pendingHard）。查询出错 → 不置（fail-close：不确定
+// 就不妄断验证通过），但仍推进游标防卡住。
+func (e *Engine) consumeValidationPassed(ctx context.Context) bool {
+	e.mu.Lock()
+	src := e.validation
+	init := e.validationInit
+	cursor := e.validationCursor
+	e.mu.Unlock()
+	if src == nil {
+		return false
+	}
+	if !init {
+		// 基线：记录本次 Run 起始 tip，只看之后的新信号（用 SeqSource 取 tip，不扫全部事件）。
+		var tip int64
+		if e.seq != nil {
+			tip, _ = e.seq.Tip(ctx)
+		}
+		e.mu.Lock()
+		e.lastValidationSeq = tip
+		e.validationInit = true
+		e.mu.Unlock()
+		// **基线也要写回会话级游标**（v3-S3 修）：否则下一个 Run 又会重新取基线 →
+		// 落在两次 Run 之间的验证信号永远看不见（游标是跨 Run 的唯一接力棒）。
+		cursor.Advance(tip)
+		return false
+	}
+	e.mu.Lock()
+	after := e.lastValidationSeq
+	e.mu.Unlock()
+	found, newTip, err := src.ValidationPassedSince(ctx, after)
+	e.mu.Lock()
+	if newTip > e.lastValidationSeq {
+		e.lastValidationSeq = newTip
+	}
+	hard := err == nil && found
+	e.mu.Unlock()
+	// 推进会话级游标（下一个 Run 从这里继续扫；只前进，不后退）。
+	cursor.Advance(newTip)
+	return hard
+}
+
 // 编译期证明：*Engine 就是 Assembler，且实现了两个可选扩展接口。
 var (
 	_ Assembler            = (*Engine)(nil)
@@ -256,6 +351,14 @@ func (e *Engine) Assemble(ctx context.Context, history []core.Message, turn int)
 
 	// ① goal ledger 快照（IO：出状态锁；注入区两半 + 级联输入共用同一份快照）。
 	lp, hasLedger := e.fetchLedger(ctx)
+
+	// ①' "验证通过"信号（v2-S1 硬边界接线，J11；IO 出状态锁）。有信号 → 本轮打硬边界
+	// （等价 MarkValidationPassed：框架确认的验证通过点收尾当前阶段）。
+	if e.consumeValidationPassed(ctx) {
+		e.mu.Lock()
+		e.pendingHard = true
+		e.mu.Unlock()
+	}
 
 	e.mu.Lock()
 	tip := e.updateTip(ctx)

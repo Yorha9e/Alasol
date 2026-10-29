@@ -11,6 +11,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/compaction"
+	"github.com/Yorha9e/alasol/core/durable"
 	"github.com/Yorha9e/alasol/core/policy"
 )
 
@@ -76,6 +77,9 @@ type runState struct {
 	// strategyTools 是 assembler 注入的框架工具（recall / stage；per-Run）。由 visibleTools
 	// 注入可见集、resolveTool 优先解析执行。
 	strategyTools map[string]compaction.FrameworkTool
+	// ledger 是本次 Run 的 goal ledger 写入器（J19/X6；nil = 未开 GoalLedger 或无 store）。
+	// per-Run 持有（LedgerWriter 非并发安全，一个 session 一个 turn 内单写者）。
+	ledger *durable.LedgerWriter
 }
 
 // taintAcc 累积一次 Run 的最高污点级（"" = 未观测 = clean）。

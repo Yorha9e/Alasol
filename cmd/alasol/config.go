@@ -127,6 +127,13 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		GraphCoreNodes:         graphCoreNodes(f, fc),
 		GraphEscalateReachable: pickInt(*f.graphEscalate, fc.Graph.EscalateReachable),
 
+		// 工作流引擎（v3-S3，W1 能力包）：目录显式 flag > 文件；goal-ledger 走**布尔口径**
+		//（显式 flag > 文件 > 默认关）——`-goal-ledger=false` 必须能压过文件里的
+		// goal_ledger=true（"||" 只会把 false 变成 true，与 sandbox 同款坑，见
+		// sandboxEnabledFlag）。
+		WorkflowDir: workflowDirValue(f, fc),
+		GoalLedger:  pickBoolFlag(f.explicitlySet("goal-ledger"), *f.goalLedger, fc.GoalLedger),
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),
@@ -236,6 +243,17 @@ func graphEnabled(f *hubFlags, fc *host.FileConfig) bool {
 		return *f.graph
 	}
 	return fc.Graph.Enabled
+}
+
+// workflowDirValue 解析工作流能力包目录（v3-S3，W1）：显式 flag > 文件。空 = 只用内建包。
+func workflowDirValue(f *hubFlags, fc *host.FileConfig) string {
+	if v := strings.TrimSpace(*f.workflowDir); v != "" {
+		return v
+	}
+	if fc != nil {
+		return strings.TrimSpace(fc.WorkflowDir)
+	}
+	return ""
 }
 
 // graphCoreNodes 解析核心接口节点声明（v2-S2）：显式 flag（逗号分隔）> 文件（列表）。

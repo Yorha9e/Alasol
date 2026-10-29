@@ -439,6 +439,10 @@ func unionSorted(a, b []string) []string {
 	return out
 }
 
+// KindConflictPredicted 是合并后冲突预测落库的事件 kind（durable=true；V7）。
+// 与 core/gate.KindReviewRecorded 同款口径：core 定义 kind 常量，装配层包 envelope + 落库。
+const KindConflictPredicted = "conflict.predicted"
+
 // ConflictPredictedEvent 把冲突预测报告映射成 conflict.predicted 事件的 payload（V7）。
 // 与 core/gate.CheckedEvent 同款：只产 payload，包 envelope / 落库在装配层。
 //

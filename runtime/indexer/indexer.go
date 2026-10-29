@@ -237,22 +237,19 @@ func (ix *Indexer) Run(ctx context.Context) error {
 // 清空与归零在同一事务内原子完成；重放走 Step（同一把锁内），崩溃后可再次
 // Rebuild 或续跑。
 //
-// # 重建窗口：影响面可能"干净地为空"（fail-open 窗口，N2）
+// # 重建窗口：影响面可能"干净地为空"（fail-open 窗口，N2）——**v3-S3 已设防**
 //
 // Rebuild 的清空与重放**不是原子的**：清空先提交（投影变空），重放再逐批补回。
 // 窗口内读侧会看到**空/半满**的投影 → change_impact 给出一份
 // "Direct=[]、Escalate=false、无错误无告警"的报告——消费端**无法分辨**
 // "真没影响" 与 "正在重建"（少报影响面 → escalate 闸门被蒙）。
 //
-// 现状与取舍（写清楚免得后人以为它已被设防）：
-//
-//   - Rebuild **没有生产调用方**（本刀只有 API，无 CLI/UI 入口）→ 窗口当前不会
-//     被触发，暂不设防（设防要加"重建中"标记：graph_meta 一列、写面多两个动作、
-//     读侧 fail-close 报错——属于接口形状改动，留 v3 接线时一并处理）。
-//   - 读侧已有的两道护栏：同进程重建会发 Committed()（闭包缓存必失效，不会拿
-//     旧闭包当新答案）；读侧 Sync 发现**重建代**变了就整体重载（不会用旧图答题）。
-//   - **v3 把 change_impact 喂给 escalate 闸门之前，必须补这条口径**：
-//     消费端要么在重建期间拒绝采信影响面，要么框架先补上"重建中"标记。
+// 处置（v3-S3 补 N2 挂账）：Clear 置 graph_meta.rebuilding=1、重放追平后 finishRebuild
+// 置 0；读侧引擎据 rebuilding **fail-close 报 ErrRebuilding**（Reachable/Impact），
+// 消费端（escalate 闸门 / V7 冲突预测）明确看到"预测不可用"而非"无冲突"。两道既有护栏
+// 仍在：同进程重建发 Committed()（闭包缓存必失效）；读侧 Sync 发现**重建代**变了就整体
+// 重载（不用旧图答题）。崩溃遗留的 rebuilding=1 是 fail-close 安全侧，恢复靠重跑一次
+// 成功的 Rebuild。
 func (ix *Indexer) Rebuild(ctx context.Context) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -292,9 +289,41 @@ func (ix *Indexer) Rebuild(ctx context.Context) error {
 			return err
 		}
 		if n == 0 {
-			return nil
+			// 重放追平 → 清"重建中"标记（N2）：读侧引擎据此恢复正常作答（Reachable/Impact
+			// 不再 fail-close）。崩溃遗留的 rebuilding=1 是 fail-close 安全侧，恢复靠重跑 Rebuild。
+			return ix.finishRebuild(ctx)
 		}
 	}
+}
+
+// finishRebuild 在 Rebuild 重放追平后清"重建中"标记（N2，v3-S3 补）：一个独立小事务把
+// graph_meta.rebuilding 置 0，并通知读侧失效闭包缓存（下一次查询拿到完整重放的图）。
+//
+// 写面不认 MarkRebuilt（老实现 / 无图投影）→ 不设防（保持既有行为）。用接口断言而非
+// import runtime/graph：保持"索引器只认 core/graph 形状、不 import runtime/graph"的依赖方向。
+func (ix *Indexer) finishRebuild(ctx context.Context) error {
+	if ix.graph == nil {
+		return nil
+	}
+	rm, ok := ix.graph.(interface {
+		MarkRebuilt(context.Context, coregraph.Tx) error
+	})
+	if !ok {
+		return nil
+	}
+	tx, err := ix.w.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("indexer: rebuild finish begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := rm.MarkRebuilt(ctx, graphTx{tx: tx}); err != nil {
+		return fmt.Errorf("indexer: rebuild 清重建中标记: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("indexer: rebuild finish commit: %w", err)
+	}
+	ix.graph.Committed()
+	return nil
 }
 
 // applyBatch 在一个事务内应用整批投影，并把水位推进到最后一条的 seq（G24①：

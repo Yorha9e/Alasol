@@ -184,6 +184,19 @@ type Config struct {
 	//     **永不进事件 / 日志 / 错误文案**（H12/H19）。host.Config 本身不得被
 	//     整体日志化；要打印用 MCP.Redacted()。
 	MCP mcp.Config
+
+	// ---- v3-S3 工作流引擎（W1 能力包，非强制）----
+	//
+	// WorkflowDir 是工作流**能力包**目录（W13：纯数据 JSON，可被任何语言写/组合/追加）。
+	// 目录下每个 `*.json` 是一个 contracts.Workflow；空 = 只用内建包（tower）。内建包总在。
+	//
+	// **能力包不是流程**（W1/W2）：装载/激活只把能力包的哲学文本注入 system prompt 供主
+	// agent 选择（W3），框架**不校验**编排序列（W21）。不挂任何工作流 = 零行为变化（酸测试）。
+	WorkflowDir string
+	// GoalLedger 是否给 session 的 loop 注入 goal ledger 更新工具（J19/X6；默认 false =
+	// 零行为变化，酸测试）。true 时 agent 可在关键点更新 goal ledger（关键字段立即落盘、
+	// 过程字段 turn 末合并）。仍受策略链（deny-all 默认）与 agent 类型白名单约束。
+	GoalLedger bool
 }
 
 // validate 校验并归一化配置。

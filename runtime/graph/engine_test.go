@@ -849,3 +849,125 @@ func TestNeighborsLimitAndTruncated(t *testing.T) {
 		t.Errorf("默认 Limit = %d, want %d", def.Limit, coregraph.DefaultNeighborLimit)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// N2：重建窗口 fail-close（v3-S3 补齐挂账）
+// ---------------------------------------------------------------------------
+
+// setRebuilding 直接置 graph_meta.rebuilding（测试模拟"索引器正在重建"的窗口）。
+func setRebuilding(t *testing.T, db *sql.DB, v int) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `UPDATE graph_meta SET rebuilding = ? WHERE id = 1`, v); err != nil {
+		t.Fatalf("set rebuilding=%d: %v", v, err)
+	}
+}
+
+// TestRebuildWindowFailClose：rebuilding=1 时 Reachable/Impact **fail-close** 报
+// ErrRebuilding（绝不把"图不可用/半图"当成"无冲突/无影响"）；rebuilding=0 恢复作答。
+func TestRebuildWindowFailClose(t *testing.T) {
+	db := openDB(t)
+	depGraph(t, db, nil)
+	eng, _ := newEngine(t, db, graph.Limits{})
+	ctx := context.Background()
+
+	// 正常（rebuilding=0）：Reachable 有答案。
+	cl, err := eng.Reachable(ctx, graph.ReachQuery{Sources: []string{"core"}, Kind: "imports", Direction: graph.DirectionIn})
+	if err != nil {
+		t.Fatalf("正常 Reachable 应成功: %v", err)
+	}
+	if len(cl.Nodes) == 0 {
+		t.Fatal("正常 Reachable 应有可达节点（core 的入向消费者）")
+	}
+	if eng.Rebuilding() {
+		t.Error("默认不应 rebuilding")
+	}
+
+	// 模拟重建窗口：rebuilding=1 → Reachable fail-close。
+	setRebuilding(t, db, 1)
+	// 先 Sync 一次让引擎读到标记（Sync 是 Reachable 内部会做的，但这里显式触发以覆盖
+	// "上一次 Sync 已知" 与 "本次 Sync 发现" 两条路径）。
+	if err := eng.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if !eng.Rebuilding() {
+		t.Fatal("Sync 后应读到 rebuilding=true")
+	}
+	if _, err := eng.Reachable(ctx, graph.ReachQuery{Sources: []string{"core"}, Kind: "imports", Direction: graph.DirectionIn}); !errors.Is(err, graph.ErrRebuilding) {
+		t.Errorf("rebuilding=1 时 Reachable 应报 ErrRebuilding，得到 %v", err)
+	}
+	if _, err := eng.Impact(ctx, graph.ImpactRequest{Roots: []string{"core"}, Kind: "imports"}); !errors.Is(err, graph.ErrRebuilding) {
+		t.Errorf("rebuilding=1 时 Impact 应报 ErrRebuilding，得到 %v", err)
+	}
+
+	// 重建完成：rebuilding=0 → 恢复作答。
+	setRebuilding(t, db, 0)
+	if err := eng.Sync(ctx); err != nil {
+		t.Fatalf("Sync 2: %v", err)
+	}
+	if eng.Rebuilding() {
+		t.Fatal("rebuilding=0 后 Rebuilding() 应为 false")
+	}
+	cl2, err := eng.Reachable(ctx, graph.ReachQuery{Sources: []string{"core"}, Kind: "imports", Direction: graph.DirectionIn})
+	if err != nil {
+		t.Fatalf("恢复后 Reachable 应成功: %v", err)
+	}
+	if len(cl2.Nodes) != len(cl.Nodes) {
+		t.Errorf("恢复后可达节点数不一致: %d vs %d", len(cl2.Nodes), len(cl.Nodes))
+	}
+}
+
+// readRebuilding 读 graph_meta.rebuilding（测试断言用）。
+func readRebuilding(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var v int
+	if err := db.QueryRowContext(context.Background(), `SELECT rebuilding FROM graph_meta WHERE id = 1`).Scan(&v); err != nil {
+		t.Fatalf("read rebuilding: %v", err)
+	}
+	return v
+}
+
+// TestProjectionClearMarksRebuilding：Projection.Clear 置 rebuilding=1（N2 写面起点），
+// MarkRebuilt 置 0（重放追平后的终点）——索引器 Rebuild 正是这对调用，读侧据此 fail-close。
+func TestProjectionClearMarksRebuilding(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	proj := graph.NewProjection(nil, dbQuerier{db: db})
+	if err := proj.EnsureSchema(ctx); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	// 灌一条边（让投影非空）。
+	seed(t, db, proj, 1, edge("app", "core", "imports"))
+	if v := readRebuilding(t, db); v != 0 {
+		t.Fatalf("初始 rebuilding 应 0，得到 %d", v)
+	}
+
+	// Clear（Rebuild 起点）→ rebuilding=1。
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proj.Clear(ctx, graph.SQLTx(tx)); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if v := readRebuilding(t, db); v != 1 {
+		t.Errorf("Clear 后 rebuilding 应 1（N2），得到 %d", v)
+	}
+
+	// MarkRebuilt（重放追平）→ rebuilding=0。
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := proj.MarkRebuilt(ctx, graph.SQLTx(tx2)); err != nil {
+		t.Fatalf("MarkRebuilt: %v", err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if v := readRebuilding(t, db); v != 0 {
+		t.Errorf("MarkRebuilt 后 rebuilding 应 0，得到 %d", v)
+	}
+}

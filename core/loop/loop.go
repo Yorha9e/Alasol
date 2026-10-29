@@ -12,6 +12,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/compaction"
+	"github.com/Yorha9e/alasol/core/durable"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
 )
@@ -127,6 +128,12 @@ type Config struct {
 	// 一个 Assembler（放进 runState），既不共享状态又让策略跨轮积累。宿主每次调工厂造一个绑定到
 	// 本次依赖（store/provider/bus）的新实例。
 	ContextStrategy compaction.AssemblerFactory
+	// GoalLedger 是否给本 agent 注入 goal ledger 更新工具（J19/X6，v3-S3 清挂账）。
+	// **opt-in，默认 false = 不注入（零行为变化，酸测试）**。true 且配置了 Store 时，loop
+	// 每 Run 造一个 per-(session,agent) 的 durable.LedgerWriter，注入 ledger 框架工具
+	// （模型可见集 + X1 三段写路径），turn 末 Flush（X6：关键字段立即落盘、过程字段合并）。
+	// 注入后仍受策略链裁决（deny-all 默认）与 agent 类型白名单（R5）约束——框架工具非免检。
+	GoalLedger bool
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -168,6 +175,8 @@ type Loop struct {
 	// append，与 v1 逐字节等价）。见 Config.ContextStrategy。每次 Run 经它造一个 fresh
 	// Assembler 放进 runState（策略有状态，不能跨并发 Run 共享）。
 	ctxStrategy compaction.AssemblerFactory
+	// goalLedger 支撑 J19 goal ledger 生产者（opt-in；nil store = 即使开了也不注入）。
+	goalLedger bool
 }
 
 // Result 是一次 Run 的产出。
@@ -257,6 +266,7 @@ func New(cfg Config) (*Loop, error) {
 		onlineConfig:    cfg.OnlineTable,
 		onlineSource:    cfg.OnlineTableSource,
 		ctxStrategy:     cfg.ContextStrategy,
+		goalLedger:      cfg.GoalLedger,
 	}, nil
 }
 
@@ -325,6 +335,27 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		st.strategyTools = tools
 	}
 
+	// J19：goal ledger 生产者（opt-in）。Store 已配 + GoalLedger 开启 → 每 Run 造一个
+	// per-(session,agent) 的 LedgerWriter（X6：关键字段立即落盘、过程字段 turn 末合并），
+	// 注入 ledger 框架工具。nil store = 即使开了也不注入（fail-close：没库就没法持久化账本）。
+	//
+	// **基线必须加载当前账本**（p1 修复）：ledger.updated 是全量快照 + LWW——若写入器从空
+	// 账本起步，Run2 只更新过程字段（completed）时就会把 Run1 写下的 goals/constraints
+	// 覆盖成空（关键字段被静默抹掉）。故此处先 LoadLedger 折出当前快照做基线；
+	// **读不到就不写**（fail-close：宁可这一轮失败，也不拿空基线覆盖关键字段）。
+	if l.goalLedger && l.store != nil {
+		cur, lerr := durable.LoadLedger(ctx, l.store, l.sessionID)
+		if lerr != nil {
+			return res, fmt.Errorf("loop: 读当前 goal ledger 失败（不写账本：宁可不写也不抹掉关键字段）: %w", lerr)
+		}
+		w := durable.NewLedgerWriter(l.store, l.sessionID, l.agentID)
+		w.Seed(cur)
+		st.ledger = w
+		if err := l.addLedgerTool(st); err != nil {
+			return res, err // ledger 工具与既有工具重名 → fail-close
+		}
+	}
+
 	// 每轮历史都是局部变量：同一 Loop 可被并发 Run 而不互相污染。
 	// 既有历史先**拷贝**一份（调用方可能复用那个切片 → 不能被本次 Run 改写）。
 	msgs := make([]core.Message, 0, len(history)+8)
@@ -357,7 +388,7 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		if st.assembler != nil {
 			req, stratParts = l.requestWithStrategy(ctx, msgs, ot, turn, st)
 		} else {
-			req = l.request(msgs, ot)
+			req = l.request(msgs, ot, st)
 		}
 
 		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
@@ -432,6 +463,10 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 阶段 8：turn 末（所有工具调用已解析、无 in-flight）按需自动 checkpoint（X3）。
 		// 尽力而为：落盘失败不中止 Run（Run 的事件已 durable，缺 checkpoint 只让 resume 退到全量重建）。
 		l.maybeCheckpoint(ctx, turn)
+
+		// J19/X6：turn 末把缓冲的过程性 ledger 变更合并落**一条** ledger.updated。
+		// 尽力而为（过程字段非关键，落不下只在事件流补 loop.error 留痕，不中止 Run）。
+		l.flushLedger(ctx, turn, st)
 	}
 
 	// MaxTurns 截断：模型还在要工具但轮数用尽（防呆护栏生效）。
@@ -451,7 +486,10 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 // ot 非空（在线表注入）时，把在线表消息**拷贝后追加到最末尾**（Q4/Q3：history 之后）。
 // 拷贝是必须的——online table 只进本轮请求，不能写进调用方 history 的底层数组（下一轮还要
 // 往 msgs 追加 assistant/工具消息）。ot 为 nil 时零拷贝（老路径一字不变）。
-func (l *Loop) request(history []core.Message, ot *onlineTable) core.ModelRequest {
+//
+// st 携带本次 Run 的框架工具（v2-S1 策略的 recall/stage + v3-S3 J19 的 ledger）——它们也进
+// 模型可见集（nil = 无框架工具，与旧版等价）。
+func (l *Loop) request(history []core.Message, ot *onlineTable, st *runState) core.ModelRequest {
 	msgs := history
 	if ot != nil {
 		msgs = make([]core.Message, len(history), len(history)+1)
@@ -462,7 +500,7 @@ func (l *Loop) request(history []core.Message, ot *onlineTable) core.ModelReques
 		Model:    l.model,
 		System:   l.system,
 		Messages: msgs,
-		Tools:    l.visibleTools(nil), // 无策略 → 无框架工具
+		Tools:    l.visibleTools(strategyToolsOf(st)), // 框架工具（策略 + ledger）
 	}
 }
 

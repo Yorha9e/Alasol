@@ -60,7 +60,7 @@ func chatMain(args []string) int {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Printf("[alasol] chat 就绪：session=%s model=%s approval=%s allow=%v\n",
 		sid, cfg.Model, *f.approval, splitList(*f.allow))
-	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw 旁支询问 · /quit 退出")
+	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw 旁支询问 · /workflow 工作流能力包 · /quit 退出")
 
 	for {
 		fmt.Print("you> ")
@@ -105,6 +105,42 @@ func chatMain(args []string) int {
 				res.ForkSessionID, res.Turns, res.ToolCalls, res.Events, sid)
 			continue
 		}
+		// /workflow [<id>|off]：激活/停用/列出工作流能力包（v3-S3，W3）。激活只把能力包
+		// 哲学文本拼进 system prompt 供主 agent 选择（非强制，W21）；框架不校验编排序列。
+		if arg, isWF := host.ParseWorkflowCommand(line); isWF {
+			switch arg {
+			case "":
+				// 列出可用能力包。
+				pkgs := h.Workflows().List()
+				if len(pkgs) == 0 {
+					fmt.Println("（没有可用的工作流能力包）")
+					continue
+				}
+				fmt.Println("可用工作流能力包：")
+				for _, p := range pkgs {
+					cmd := p.Command()
+					if cmd == "" {
+						cmd = "（显式触发）"
+					}
+					active := ""
+					if h.ActiveWorkflow(sid) != nil && h.ActiveWorkflow(sid).ID() == p.ID() {
+						active = " [已激活]"
+					}
+					fmt.Printf("  %-20s 命令=/%s%s\n", p.ID(), cmd, active)
+				}
+			case "off":
+				h.DeactivateWorkflow(sid)
+				fmt.Println("已停用工作流（回到默认 system prompt）")
+			default:
+				p, werr := h.ActivateWorkflow(ctx, sid, arg)
+				if werr != nil {
+					fmt.Fprintln(os.Stderr, "/workflow 失败:", werr)
+					continue
+				}
+				fmt.Printf("已激活工作流 %q：哲学文本将注入 system prompt 供主 agent 选择（非强制）。\n", p.ID())
+			}
+			continue
+		}
 		switch line {
 		case "/quit", "/exit":
 			return 0
@@ -121,7 +157,19 @@ func chatMain(args []string) int {
 			fmt.Printf("session=%s\n", sid)
 			continue
 		case "/help":
-			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw <问题> 旁支询问 · /session 当前 session · /quit 退出")
+			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw <问题> 旁支询问 · /workflow [<id>|off] 工作流能力包 · /session 当前 session · /quit 退出")
+			continue
+		}
+		// /<命令>：能力包**自己声明**的 slash 触发入口（W3，如 tower 的 /tower）。
+		// 这是 Registry.ByCommand 的生产调用方——声明出来的命令真能敲（不是死字段）；
+		// 事件 workflow.activated 的 command 字段记的就是这个实际触发的命令名。
+		if cmd, isTrigger := h.WorkflowCommandTrigger(line); isTrigger {
+			p, werr := h.ActivateWorkflowByCommand(ctx, sid, cmd)
+			if werr != nil {
+				fmt.Fprintln(os.Stderr, "/"+cmd+" 失败:", werr)
+				continue
+			}
+			fmt.Printf("已激活工作流 %q（命令=/%s）：哲学文本将注入 system prompt 供主 agent 选择（非强制）。\n", p.ID(), cmd)
 			continue
 		}
 		if ctx.Err() != nil {

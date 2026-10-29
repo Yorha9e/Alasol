@@ -229,11 +229,73 @@ func (m *Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.running = true
 			return m, runBtwCmd(m.hub, m.session, question)
 		}
+		// /workflow [<id>|off]：激活/停用/列出工作流能力包（v3-S3，W3）。
+		// 与 CLI（alasol chat）同款口径（host.ParseWorkflowCommand + ActivateWorkflow）：
+		// 激活只把能力包哲学拼进 system prompt 供主 agent 选择（非强制，W21），**不跑模型**
+		// → 同步做完即可（不进 running 态）。
+		if arg, isWF := host.ParseWorkflowCommand(line); isWF {
+			m.chatLog = append(m.chatLog, "you> "+line)
+			m.handleWorkflowCommand(arg)
+			return m, nil
+		}
+		// /<命令>：能力包**自己声明**的 slash 触发入口（W3，如 tower 的 /tower）——
+		// 真实入口（Registry.ByCommand 的生产调用方），不跑模型。
+		if cmd, isTrigger := m.hub.WorkflowCommandTrigger(line); isTrigger {
+			m.chatLog = append(m.chatLog, "you> "+line)
+			p, err := m.hub.ActivateWorkflowByCommand(context.Background(), m.session, cmd)
+			if err != nil {
+				m.chatLog = append(m.chatLog, "[workflow] 激活失败: "+err.Error())
+				return m, nil
+			}
+			m.chatLog = append(m.chatLog, fmt.Sprintf(
+				"[workflow] 已激活 %q（命令=/%s）：哲学文本将注入 system prompt 供主 agent 选择（非强制）", p.ID(), cmd))
+			return m, nil
+		}
 		m.chatLog = append(m.chatLog, "you> "+line)
 		m.running = true
 		return m, runPromptCmd(m.hub, m.session, line)
 	}
 	return m, nil
+}
+
+// handleWorkflowCommand 处理 /workflow [<id>|off]（v3-S3，W3 触发；与 chat 同款口径）。
+//
+// 激活是 **session 级状态变更**（哲学拼进该 session 的 system prompt）+ 记一条
+// workflow.activated 事件——不跑模型、不改对话流程，故同步做完即可。
+func (m *Model) handleWorkflowCommand(arg string) {
+	ctx := context.Background()
+	switch arg {
+	case "":
+		// 列出可用能力包。
+		pkgs := m.hub.Workflows().List()
+		if len(pkgs) == 0 {
+			m.chatLog = append(m.chatLog, dim("[workflow] （没有可用的工作流能力包）"))
+			return
+		}
+		m.chatLog = append(m.chatLog, "可用工作流能力包：")
+		for _, p := range pkgs {
+			cmd := p.Command()
+			if cmd == "" {
+				cmd = "（显式触发）"
+			}
+			active := ""
+			if aw := m.hub.ActiveWorkflow(m.session); aw != nil && aw.ID() == p.ID() {
+				active = " [已激活]"
+			}
+			m.chatLog = append(m.chatLog, fmt.Sprintf("  %-20s 命令=/%s%s", p.ID(), cmd, active))
+		}
+	case "off":
+		m.hub.DeactivateWorkflow(m.session)
+		m.chatLog = append(m.chatLog, "[workflow] 已停用工作流（回到默认 system prompt）")
+	default:
+		p, err := m.hub.ActivateWorkflow(ctx, m.session, arg)
+		if err != nil {
+			m.chatLog = append(m.chatLog, "[workflow] 激活失败: "+err.Error())
+			return
+		}
+		m.chatLog = append(m.chatLog, fmt.Sprintf(
+			"[workflow] 已激活 %q：哲学文本将注入 system prompt 供主 agent 选择（非强制）", p.ID()))
+	}
 }
 
 func (m *Model) handleApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -312,6 +374,8 @@ func (m *Model) viewChat() string {
 	}
 	b.WriteString(prompt + "\n")
 	b.WriteString(dim("[Enter 发送 · F2 审批 · F3 在线表 · Ctrl-C 退出]"))
+	b.WriteString("\n")
+	b.WriteString(dim("命令：/btw <问题> 旁支询问 · /workflow [<id>|off] 工作流能力包"))
 	return b.String()
 }
 

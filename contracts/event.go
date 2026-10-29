@@ -425,3 +425,25 @@ type BtwForkedPayload struct {
 	// 用户的 /btw 问题原文（fork 的 user.prompt 同文；不含任何主 session 此前的对话内容——上下文经折叠历史喂给 loop，不复制进本 payload）。
 	Question string `json:"question"`
 }
+
+// workflow.activated —— 一个 session 激活一个工作流**能力包**的事实记录（v3-S3 工作流引擎，W1/W3/W11）。durable=true 进事件流（F7 只增）：工作流是能力包（哲学 + agent_types + context_strategy + gates/grants），**不是流程、非强制**（W1/W2）——激活只是把能力包的哲学文本注入 system prompt 供主 agent 选择（W3），框架**不校验**编排序列（W21）。偏离/自造流程记入事件流（W11 动态性）。payload 记激活的能力包 id、触发命令与注入的哲学原文（审计：事后可复盘当时注入了什么）。envelope.session_id/agent_id = 激活方的该 session 主 agent。
+type WorkflowActivatedPayload struct {
+	// 被激活的工作流能力包 id（如 build / tower）。
+	WorkflowID string `json:"workflow_id"`
+	// 触发用的 slash 命令名（W3）；缺省 = 显式触发（无 slash 命令）。
+	Command *string `json:"command,omitempty"`
+	// 本次注入 system prompt 的工作哲学原文（W2/W3：供主 agent 选择，非强制序列）。记录它以便审计当时注入了什么。
+	Philosophy string `json:"philosophy"`
+}
+
+// workflow.milestone —— 一次工作流**里程碑**被处理的事实记录（v3-S3 工作流引擎，W14 代码扩展点之一：MilestoneHandler）。durable=true 进事件流（F7 只增）：里程碑 = 框架确认的验证通过点（如合并前仿 CI 检查通过 / critic→reviewer 循环收敛），由工作流包的 MilestoneHandler 处理；passed=true 时可联动阶段硬边界（v2-S1 MarkValidationPassed = 验证通过点的生产路径）。**框架不强制序列**（W2/W21）：里程碑是能力包的部件，主 agent 自决何时触发。envelope.session_id/agent_id = 触发里程碑的该 session 主 agent。
+type WorkflowMilestonePayload struct {
+	// 触发里程碑的工作流能力包 id。
+	WorkflowID string `json:"workflow_id"`
+	// 里程碑名（开放字符串；由 MilestoneHandler.Name() 给出，如 validation.passed / merge.ci）。
+	Milestone string `json:"milestone"`
+	// 里程碑是否通过（true = 验证通过点达成，可联动阶段硬边界）。
+	Passed bool `json:"passed"`
+	// 可选：里程碑处理的人读说明（撞车依据 / 失败原因 / reviewer 结论）。
+	Note *string `json:"note,omitempty"`
+}

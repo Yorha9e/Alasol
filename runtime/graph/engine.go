@@ -51,6 +51,11 @@ var (
 	_ coregraph.Invalidator     = (*Engine)(nil)
 )
 
+// ErrRebuilding 是图投影**正在重建**的哨兵（N2，v3-S3 补）：索引器 Rebuild 的清空与
+// 重放不是原子的，窗口内投影可能"干净地为空"。读侧引擎据此 fail-close 报错，让消费端
+// （escalate 闸门 / V7 冲突预测）明确看到"预测不可用"，**绝不把"图不可用"当成"无冲突"**。
+var ErrRebuilding = errors.New("graph: 图投影正在重建（N2：窗口内影响面可能干净为空）→ 影响面/冲突预测不可用，拒绝作答")
+
 // ---------------------------------------------------------------------------
 // 类型别名：消费方（host / v3）只 import 本包就能用全链路，不必同时 import core/graph
 // ---------------------------------------------------------------------------
@@ -116,6 +121,12 @@ func DefaultThresholds() coregraph.Thresholds { return coregraph.DefaultThreshol
 // graph_meta 的 generation 是**重建代**：索引器 Rebuild 清空投影时 +1，读侧引擎据此
 // 发现"我加载的是上一代"→ 丢掉内存图从 0 重载。没有它的话，Rebuild 后重放出来的边
 // seq 与旧值相同，增量水位 `seq > ?` 永远等不到它们（静默用旧图答新问题）。
+//
+// graph_meta 的 rebuilding 是**重建中标记**（N2 挂账，v3-S3 补）：索引器 Rebuild 的
+// 清空与重放**不是原子的**——窗口内投影可能"干净地为空"（Direct=[]、无错误无告警），
+// 消费端分不清"真没影响"与"正在重建"（少报影响面 → escalate 闸门 / V7 冲突预测被蒙）。
+// rebuilding=1 时读侧引擎 fail-close 报错（ErrRebuilding），**绝不把"图不可用"当成
+// "无冲突/无影响"**。老库经 EnsureSchema 的幂等 ALTER 补上这一列。
 const SchemaSQL = `
 CREATE TABLE IF NOT EXISTS graph_nodes (
   id TEXT PRIMARY KEY COLLATE BINARY
@@ -131,16 +142,24 @@ CREATE INDEX IF NOT EXISTS idx_graph_edges_dst ON graph_edges(dst, kind);
 CREATE INDEX IF NOT EXISTS idx_graph_edges_seq ON graph_edges(seq);
 CREATE TABLE IF NOT EXISTS graph_meta (
   id         INTEGER PRIMARY KEY CHECK (id = 1),
-  generation INTEGER NOT NULL
+  generation INTEGER NOT NULL,
+  rebuilding INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO graph_meta (id, generation) VALUES (1, 0);
 `
 
+// addRebuildingColumnSQL：老库迁移（N2）——给已存在的 graph_meta 补 rebuilding 列。
+// 幂等靠"忽略 duplicate column 错"：新库的 SchemaSQL 已含该列 → ALTER 报 duplicate → 忽略。
+const addRebuildingColumnSQL = `ALTER TABLE graph_meta ADD COLUMN rebuilding INTEGER NOT NULL DEFAULT 0`
+
+// setRebuildingSQL：设置重建中标记（Rebuild 清空时置 1、重放完成后置 0）。
+const setRebuildingSQL = `UPDATE graph_meta SET rebuilding = ? WHERE id = 1`
+
 // bumpGenerationSQL：清空投影时把重建代 +1（Rebuild 用）。
 const bumpGenerationSQL = `UPDATE graph_meta SET generation = generation + 1 WHERE id = 1`
 
-// readGenerationSQL：读当前重建代（Sync 开头的对齐检查）。
-const readGenerationSQL = `SELECT generation FROM graph_meta WHERE id = 1`
+// readGenerationSQL：读当前重建代 + 重建中标记（Sync 开头的对齐检查 + N2 fail-close 依据）。
+const readGenerationSQL = `SELECT generation, rebuilding FROM graph_meta WHERE id = 1`
 
 // upsertNodeSQL：端点节点随之建立（幂等；节点表是 node/edge 持久化形态的一半，G2c）。
 const upsertNodeSQL = `INSERT OR IGNORE INTO graph_nodes (id) VALUES (?)`
@@ -209,6 +228,13 @@ func (p *Projection) EnsureSchema(ctx context.Context) error {
 	if _, err := p.exec.ExecContext(ctx, SchemaSQL); err != nil {
 		return fmt.Errorf("graph: 建图投影表: %w", err)
 	}
+	// 老库迁移（N2）：给已存在的 graph_meta 补 rebuilding 列。幂等靠忽略 "duplicate
+	// column" 错——新库的 SchemaSQL 已含该列，ALTER 会报 duplicate → 忽略即可。
+	if _, err := p.exec.ExecContext(ctx, addRebuildingColumnSQL); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column") {
+			return fmt.Errorf("graph: 迁移 graph_meta.rebuilding 列（N2 重建窗口标记）: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -238,6 +264,10 @@ func (p *Projection) ApplyEdges(ctx context.Context, tx coregraph.Tx, seq int64,
 //
 // 顺带把**重建代 +1**：读侧引擎下次 Sync 发现代数变了就丢掉内存图从 0 重载
 // （否则 Rebuild 后重放出的边 seq 与旧值相同，增量水位永远等不到它们）。
+//
+// **并置 rebuilding=1**（N2）：Rebuild 的清空与重放不是原子的——从这一刻到重放完成，
+// 投影可能"干净地为空"。置位让读侧引擎在此期间 fail-close 报错（ErrRebuilding），
+// 绝不把"图不可用"当成"无冲突/无影响"。重放完成后由索引器调 MarkRebuilt 置 0。
 func (p *Projection) Clear(ctx context.Context, tx coregraph.Tx) error {
 	if err := tx.Exec(ctx, `DELETE FROM graph_edges`); err != nil {
 		return fmt.Errorf("graph: 清空边表: %w", err)
@@ -247,6 +277,20 @@ func (p *Projection) Clear(ctx context.Context, tx coregraph.Tx) error {
 	}
 	if err := tx.Exec(ctx, bumpGenerationSQL); err != nil {
 		return fmt.Errorf("graph: 推进重建代: %w", err)
+	}
+	if err := tx.Exec(ctx, setRebuildingSQL, 1); err != nil {
+		return fmt.Errorf("graph: 置重建中标记（N2）: %w", err)
+	}
+	return nil
+}
+
+// MarkRebuilt 清**重建中标记**（rebuilding=0；索引器 Rebuild 重放完成后调用，N2）。
+//
+// 必须在重放追平后调——早调（还在半满投影时）会让读侧把"部分图"当"完整图"答题。
+// 崩溃遗留的 rebuilding=1 是 fail-close（安全侧）：恢复靠重跑一次成功的 Rebuild。
+func (p *Projection) MarkRebuilt(ctx context.Context, tx coregraph.Tx) error {
+	if err := tx.Exec(ctx, setRebuildingSQL, 0); err != nil {
+		return fmt.Errorf("graph: 清重建中标记（N2）: %w", err)
 	}
 	return nil
 }
@@ -436,6 +480,11 @@ type Engine struct {
 	loadedSeq atomic.Int64
 	loadedRow atomic.Int64
 	syncs     atomic.Int64
+
+	// rebuilding 是持久层 graph_meta 的"重建中"标记（N2，v3-S3 补）：索引器 Rebuild
+	// 清空投影时置 1、重放完成置 0。读侧每次 Sync 刷新它；为 true 时 Reachable fail-close
+	// 报 ErrRebuilding（绝不把"图不可用/半图"当成"无冲突/无影响"）。
+	rebuilding atomic.Bool
 }
 
 // NewEngine 建引擎（limits 0 = 默认上界）。
@@ -494,11 +543,13 @@ func (e *Engine) Sync(ctx context.Context) error {
 
 func (e *Engine) syncLocked(ctx context.Context) error {
 	e.syncs.Add(1)
-	// ① 对齐重建代：索引器 Rebuild 过 → 丢掉内存图从 0 重载（否则旧图会一直答新问题）。
-	gen, err := e.readGeneration(ctx)
+	// ① 对齐重建代 + 读重建中标记：索引器 Rebuild 过 → 丢掉内存图从 0 重载（否则旧图会
+	// 一直答新问题）。rebuilding 标记同步进内存（N2：读侧据此 fail-close）。
+	gen, rebuilding, err := e.readGeneration(ctx)
 	if err != nil {
 		return err
 	}
+	e.rebuilding.Store(rebuilding)
 	if gen != e.generation {
 		e.mem.Reset()
 		e.loadedSeq.Store(0)
@@ -508,15 +559,14 @@ func (e *Engine) syncLocked(ctx context.Context) error {
 		// 语义也变了）→ 走 Invalidate（清条目 + 推进代号，F3 护栏）。
 		e.applyGen.Add(1)
 		e.cache.Invalidate()
-		// **重建窗口的 fail-open 口径**（N2）：索引器 Rebuild 的清空与重放**不是
-		// 原子的**——此刻投影可能是空的或半满的（重放还没跑完）→ 本次加载出来的
-		// 闭包可能"干净地为空"（Direct=[]、Escalate=false、无错误无告警），消费端
-		// 分不清"真没影响"与"正在重建"（少报影响面 → escalate 闸门被蒙）。
-		// 现状：Rebuild **无生产调用方**（本刀只有 API）→ 窗口不会被触发，暂不设防；
-		// 同进程重建靠写面 Clear 后的 Committed() 失效缓存，跨进程靠这里的代数校验
-		// 整体重载（不会拿旧图答题）。**v3 把 change_impact 喂 escalate 闸门之前
-		// 必须补这条口径**：要么消费端在重建期间拒绝采信影响面，要么框架加"重建中"
-		// 标记并 fail-close 报错（那要动 core 接口形状，留 v3 接线时处理）。
+		// **重建窗口的 fail-close 口径**（N2，v3-S3 补齐）：索引器 Rebuild 的清空与重放
+		// **不是原子的**——窗口内投影可能是空的或半满的（重放还没跑完）→ 本次加载出来的
+		// 闭包可能"干净地为空"（Direct=[]、Escalate=false、无错误无告警），消费端分不清
+		// "真没影响"与"正在重建"（少报影响面 → escalate 闸门 / V7 冲突预测被蒙）。
+		// 处置：Projection.Clear 置 rebuilding=1、重放完成 MarkRebuilt 置 0；读侧引擎
+		// 据 rebuilding **fail-close 报错**（ErrRebuilding，见 Reachable），绝不把"图不可用"
+		// 当成"无冲突/无影响"。同进程重建靠 Committed() 失效缓存，跨进程靠这里的代数校验
+		// 整体重载 + rebuilding 标记 fail-close，两头都不拿旧图/半图答题。
 	}
 	// ② 增量加载（流式：按 (seq,rowid) 水位分批拉，逐行 Scan 进内存图，G19 冷启动口径）。
 	applied := 0
@@ -564,16 +614,15 @@ func (e *Engine) syncLocked(ctx context.Context) error {
 	return nil
 }
 
-// readGeneration 读持久层的重建代（表不存在 → 显式报错，与增量加载同口径）。
-func (e *Engine) readGeneration(ctx context.Context) (int64, error) {
-	var gen int64
-	if err := e.q.QueryRowContext(ctx, readGenerationSQL).Scan(&gen); err != nil {
+// readGeneration 读持久层的重建代 + 重建中标记（表不存在 → 显式报错，与增量加载同口径）。
+func (e *Engine) readGeneration(ctx context.Context) (gen int64, rebuilding bool, err error) {
+	if err := e.q.QueryRowContext(ctx, readGenerationSQL).Scan(&gen, &rebuilding); err != nil {
 		if isNoTableErr(err) {
-			return 0, fmt.Errorf("graph: 图投影表不存在（图投影未启用？G2f 可选投影）: %w", err)
+			return 0, false, fmt.Errorf("graph: 图投影表不存在（图投影未启用？G2f 可选投影）: %w", err)
 		}
-		return 0, fmt.Errorf("graph: 读图投影重建代: %w", err)
+		return 0, false, fmt.Errorf("graph: 读图投影重建代: %w", err)
 	}
-	return gen, nil
+	return gen, rebuilding, nil
 }
 
 // loadBatchResult 是一批增量加载的结果（水位推进的依据）。
@@ -704,6 +753,11 @@ func (e *Engine) Reachable(ctx context.Context, q coregraph.ReachQuery) (coregra
 	if err != nil {
 		return coregraph.Closure{}, err
 	}
+	// N2 fail-close：上一次 Sync 已知投影正在重建 → 直接拒绝作答（不拿可能"干净为空"
+	// 的影响面答题）。缓存在重建开始时已被 Invalidate 清掉，这里 Mostly 是兜底。
+	if e.rebuilding.Load() {
+		return coregraph.Closure{}, ErrRebuilding
+	}
 	key := coregraph.ClosureKeyOf(nq)
 	if c, ok := e.cache.Get(key); ok {
 		return c, nil
@@ -712,6 +766,11 @@ func (e *Engine) Reachable(ctx context.Context, q coregraph.ReachQuery) (coregra
 	epoch := e.cache.Epoch()
 	if err := e.Sync(ctx); err != nil {
 		return coregraph.Closure{}, err
+	}
+	// Sync 刷新了 rebuilding 标记：若重建刚开始（上次 Sync 时还是 false）→ 这里抓到，
+	// 仍 fail-close（N2）。
+	if e.rebuilding.Load() {
+		return coregraph.Closure{}, ErrRebuilding
 	}
 	// 内存图代号在同步**之后**取（自己同步进来的边已计入）。
 	applyGen := e.applyGen.Load()
@@ -769,3 +828,32 @@ func (e *Engine) Stats() coregraph.Stats {
 
 // Limits 返回生效的内存上界（0 值已归一成默认）。
 func (e *Engine) Limits() coregraph.Limits { return e.limits }
+
+// Rebuilding 报告图投影是否**正在重建**（N2，v3-S3 补）：true = 索引器 Rebuild 的清空与
+// 重放窗口未闭合，此刻的影响面可能"干净地为空"。宿主/escalate 消费端可据此判断"预测不可用"；
+// Reachable/Impact 在 rebuilding=true 时已直接 fail-close 报 ErrRebuilding。
+func (e *Engine) Rebuilding() bool { return e.rebuilding.Load() }
+
+// RebuildingState 读持久层的"重建中"标记（**只读 graph_meta 一行，不触发加载**）。
+//
+// # 为什么需要它（v3-S3 修 N2 的砖化）
+//
+// rebuilding=1 是索引器 Rebuild **清空之后、重放完成之前**的窗口标记。进程在窗口里被
+// 杀掉（崩溃 / kill -9）→ 标记**永久留在库里**：此后读侧引擎每次 Sync 都读到 rebuilding=1
+// → Reachable/Impact 一直 fail-close 报 ErrRebuilding → 影响面/冲突预测**永久不可用**
+// （砖化）。而 Rebuild 当时没有生产调用方 → 没人恢复它。
+//
+// 宿主（组合根）据此在**启动期**检测并自动重跑一次重建（见 host.New 的恢复逻辑）；
+// 本方法只负责"便宜地读出真相"——不建内存图、不加载边（那才是 Sync 的活）。
+//
+// 表不存在（这个库里从没建过图投影）→ 返回 (false, nil)：没有图投影就没有重建窗口。
+func (e *Engine) RebuildingState(ctx context.Context) (bool, error) {
+	_, rebuilding, err := e.readGeneration(ctx)
+	if err != nil {
+		if isNoTableErr(err) {
+			return false, nil // 没有图投影 → 没有重建窗口
+		}
+		return false, err
+	}
+	return rebuilding, nil
+}

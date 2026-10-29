@@ -22,6 +22,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/workflow"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
@@ -81,6 +82,8 @@ type Hub struct {
 	// hub 保留引用只为 Close 时收尸——stdio server 由本进程拉起，杀树归本进程
 	// （陷阱 5：谁拉起谁收尸）。
 	mcpManager *mcp.Manager
+	// workflows 是 v3-S3 工作流能力包注册表（W1：内建 tower + Config.WorkflowDir 目录加载）。
+	workflows *workflow.Registry
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -103,6 +106,19 @@ type Hub struct {
 	mainAgents map[contracts.Ulid]contracts.Ulid
 	// autoGates：session → 自动 gate 是否已加入（**成功才记**，失败下次 Run 重试）。
 	autoGates map[contracts.Ulid]bool
+	// activeWorkflow：session → 激活的工作流能力包（W12：归属 session，不是 core 全局状态；
+	// v3-S3）。激活只把哲学文本拼进 system prompt（W3），不挂 = 该 session 无键 = 零行为变化。
+	activeWorkflow map[contracts.Ulid]*workflow.Package
+	// validationCursors：session → 验证信号游标（v3-S3 修：跨 Run 不丢验证信号）。
+	// tiered 引擎是 per-Run 的（每次 Run 造一个 fresh 引擎），游标若只活在引擎里，
+	// 落在两次 Run 之间的验证信号（workflow.milestone passed=true 等）永远看不见。
+	// 这里按 session 持久一份，跨 Run 接力（见 host/compaction.go 的装配）。
+	// 独立锁（validationMu）：装配路径可能在持有 h.mu 时调用它——不另设锁会自锁。
+	validationMu      sync.Mutex
+	validationCursors map[contracts.Ulid]*compaction.ValidationCursor
+	// mergeCache：session → review 结论缓存（V6 合并门禁读面；p3 修：全量读事件流是 O(n)，
+	// 缓存靠"探测读"**精确**失效——见 host/mergegate.go 的 reviewsFor）。
+	mergeCache map[contracts.Ulid]*mergeReviewCache
 	// joinLocks：session → join 互斥锁（per-session；见 joinMutex）。
 	joinLocks map[contracts.Ulid]*sync.Mutex
 	// injectWarned：注入区被截断的告警**只报一次**（工厂是 per-Run 的，不去重就是每轮一条）。
@@ -325,30 +341,47 @@ func New(cfg Config) (*Hub, error) {
 	alertSink := newHubAlertSink(st, cfg.DBPath)
 	proj := newProjection(st)
 
-	h := &Hub{
-		cfg:          cfg,
-		store:        st,
-		bus:          b,
-		indexer:      ix,
-		reg:          reg,
-		engine:       eng,
-		provider:     prov,
-		approver:     ap,
-		proj:         proj,
-		disc:         disc,
-		discFeed:     discFeed,
-		cwd:          cwd,
-		ws:           transport.NewServer(b),
-		loops:        make(map[contracts.Ulid]*loop.Loop),
-		specs:        make(map[contracts.Ulid]SessionSpec),
-		mainAgents:   make(map[contracts.Ulid]contracts.Ulid),
-		autoGates:    make(map[contracts.Ulid]bool),
-		onlineConfig: onlineCfg,
-		onlineSource: &discoveryOnlineSource{table: disc, feed: discFeed},
-		graphEngine:  graphEngine,
-		sandbox:      sbEnv,
-		mcpManager:   mcpMgr,
+	// 工作流能力包注册表（v3-S3，W1）：内建 tower + Config.WorkflowDir 目录加载。
+	// 装配期就建（坏能力包 / 重名 → 启动即拒，不拖到激活期）。失败由顶部 defer 收口
+	// （关事件库 / 沙箱 / MCP——此时 h 还没建，直接返回即可）。
+	workflows, wferr := buildWorkflowRegistry(cfg.WorkflowDir)
+	if wferr != nil {
+		return nil, fmt.Errorf("host: 装配工作流注册表: %w", wferr)
 	}
+
+	h := &Hub{
+		cfg:               cfg,
+		store:             st,
+		bus:               b,
+		indexer:           ix,
+		reg:               reg,
+		engine:            eng,
+		provider:          prov,
+		approver:          ap,
+		proj:              proj,
+		disc:              disc,
+		discFeed:          discFeed,
+		cwd:               cwd,
+		ws:                transport.NewServer(b),
+		loops:             make(map[contracts.Ulid]*loop.Loop),
+		specs:             make(map[contracts.Ulid]SessionSpec),
+		mainAgents:        make(map[contracts.Ulid]contracts.Ulid),
+		autoGates:         make(map[contracts.Ulid]bool),
+		activeWorkflow:    make(map[contracts.Ulid]*workflow.Package),
+		validationCursors: make(map[contracts.Ulid]*compaction.ValidationCursor),
+		onlineConfig:      onlineCfg,
+		onlineSource:      &discoveryOnlineSource{table: disc, feed: discFeed},
+		graphEngine:       graphEngine,
+		sandbox:           sbEnv,
+		mcpManager:        mcpMgr,
+		workflows:         workflows,
+	}
+
+	// N2 砖化恢复（v3-S3 修）：崩溃遗留的图投影重建窗口（graph_meta.rebuilding=1）会让
+	// 读侧引擎**永久** fail-close（影响面/冲突预测一直不可用），而 Rebuild 当时没有生产
+	// 调用方 → 没人恢复。启动期检测 + 自动重跑一次重建（中断/恢复都记 hub.alert 事件流）。
+	// 放在后台索引器起来**之前**：此刻没有并发 Step，重建是独占的。
+	h.recoverGraphRebuild(context.Background())
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
 	if _, err := h.proj.catchUp(context.Background()); err != nil {
@@ -544,7 +577,11 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 			agentID = core.NewUlid()
 		}
 	}
-	strategy, err := h.contextStrategyFactory(sessionID, agentID)
+	// 激活的工作流（W12：归属 session；调用方持 h.mu）：有 → 哲学文本进 system prompt（W3），
+	// 且按其声明的 context_strategy 收敛策略 kind（W6）。未激活 = 用宿主默认（零行为变化）。
+	system := h.workflowSystemForLocked(sessionID)
+	strategyKind := h.workflowStrategyKindForLocked(sessionID)
+	strategy, err := h.contextStrategyFactory(sessionID, agentID, strategyKind)
 	if err != nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
@@ -558,15 +595,19 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		SessionID:     sessionID,
 		AgentID:       agentID,
 		Model:         h.cfg.Model,
-		System:        h.cfg.System,
+		System:        system,
 		MaxTurns:      h.cfg.MaxTurns,
-		ContextBudget: h.contextBudget(),
+		ContextBudget: h.contextBudgetFor(strategyKind),
+		Store:         h.store, // goal ledger 生产者（J19/X6）与手动 checkpoint（X3）经它
 		// 在线表注入（K14/K15）：主 agent 的 prompt 末尾恒带在线表；配置运行期可调。
 		// subagent 的 loop 不传这两项（nil = 不注入，K11：只有主 agent 参与水平可见性）。
 		OnlineTable:       h.onlineConfig,
 		OnlineTableSource: h.onlineSource,
 		// 上下文策略（v2-S1；nil = append 默认）。per-Run 工厂，见 contextStrategyFactory。
+		// strategyKind 已按激活的工作流声明的 context_strategy 收敛（W6）。
 		ContextStrategy: strategy,
+		// goal ledger 更新工具（J19/X6；opt-in，默认关 = 零行为变化）。
+		GoalLedger: h.cfg.GoalLedger,
 	})
 	if err != nil {
 		h.mu.Unlock()
@@ -598,16 +639,16 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 // CreateSession。
 func NewSession() contracts.Ulid { return core.NewUlid() }
 
-// contextBudget 是 context.assembled 的 tokens_budget 分母（占比口径，J21）。
+// contextBudgetFor 是 context.assembled 的 tokens_budget 分母（占比口径，J21）。
 //
 // **与上下文策略同源**（F10/F13）：挂 tiered 时窗口 W 就是上下文预算——用 loop 的 200k
 // 默认分母去算 1M 窗口的占用，UI 的占比会显示成几百个百分点（占比失真）。
-// 显式配了 ContextBudget 则以它为准；都没配 → 0 = loop 用默认（append 路径）。
-func (h *Hub) contextBudget() int64 {
+// 显式配了 ContextBudget 则以它为准；kind 非 tiered → 0 = loop 用默认（append 路径）。
+func (h *Hub) contextBudgetFor(kind string) int64 {
 	if h.cfg.ContextBudget > 0 {
 		return h.cfg.ContextBudget
 	}
-	if strings.TrimSpace(h.cfg.ContextStrategy) == contextStrategyTiered {
+	if strings.TrimSpace(kind) == contextStrategyTiered {
 		w := h.cfg.ContextStrategyWindow
 		if w <= 0 {
 			w = compaction.DefaultWindow // tiered 的默认窗口（1M）就是预算分母
