@@ -62,6 +62,7 @@ const (
 	ExecLevelFull      ExecLevel = "full"
 )
 
+// 上下文管理方式（kind + params）。**当前未接线**：仓里没有消费方读这个字段——v2-S1 的可配面走宿主配置面（host.Config / 用户级 TOML 的 context_strategy.kind/window/l1_pct/l2_pct → compaction.Params）。本字段保留契约形状（将来接上时不必改契约），但**别当它已经生效**。
 type ContextStrategy struct {
 	// 内置四种，用户可写扩展（J8）。
 	Kind ContextStrategyKind `json:"kind"`

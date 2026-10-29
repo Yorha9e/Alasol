@@ -15,6 +15,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agentlink"
 	"github.com/Yorha9e/alasol/core/bus"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
@@ -88,7 +89,9 @@ type Hub struct {
 	autoGates map[contracts.Ulid]bool
 	// joinLocks：session → join 互斥锁（per-session；见 joinMutex）。
 	joinLocks map[contracts.Ulid]*sync.Mutex
-	closed    bool
+	// injectWarned：注入区被截断的告警**只报一次**（工厂是 per-Run 的，不去重就是每轮一条）。
+	injectWarned bool
+	closed       bool
 }
 
 // New 装配一个 Hub。
@@ -379,6 +382,11 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 			agentID = core.NewUlid()
 		}
 	}
+	strategy, err := h.contextStrategyFactory(sessionID, agentID)
+	if err != nil {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
+	}
 	lp, err := loop.New(loop.Config{
 		Provider:      h.provider,
 		Bus:           h.bus,
@@ -390,11 +398,13 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		Model:         h.cfg.Model,
 		System:        h.cfg.System,
 		MaxTurns:      h.cfg.MaxTurns,
-		ContextBudget: h.cfg.ContextBudget,
+		ContextBudget: h.contextBudget(),
 		// 在线表注入（K14/K15）：主 agent 的 prompt 末尾恒带在线表；配置运行期可调。
 		// subagent 的 loop 不传这两项（nil = 不注入，K11：只有主 agent 参与水平可见性）。
 		OnlineTable:       h.onlineConfig,
 		OnlineTableSource: h.onlineSource,
+		// 上下文策略（v2-S1；nil = append 默认）。per-Run 工厂，见 contextStrategyFactory。
+		ContextStrategy: strategy,
 	})
 	if err != nil {
 		h.mu.Unlock()
@@ -425,6 +435,25 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 // 不登记工作目录 → 自动 gate 用 hub 级默认。要按 session 指定归属（多 worktree）用
 // CreateSession。
 func NewSession() contracts.Ulid { return core.NewUlid() }
+
+// contextBudget 是 context.assembled 的 tokens_budget 分母（占比口径，J21）。
+//
+// **与上下文策略同源**（F10/F13）：挂 tiered 时窗口 W 就是上下文预算——用 loop 的 200k
+// 默认分母去算 1M 窗口的占用，UI 的占比会显示成几百个百分点（占比失真）。
+// 显式配了 ContextBudget 则以它为准；都没配 → 0 = loop 用默认（append 路径）。
+func (h *Hub) contextBudget() int64 {
+	if h.cfg.ContextBudget > 0 {
+		return h.cfg.ContextBudget
+	}
+	if strings.TrimSpace(h.cfg.ContextStrategy) == contextStrategyTiered {
+		w := h.cfg.ContextStrategyWindow
+		if w <= 0 {
+			w = compaction.DefaultWindow // tiered 的默认窗口（1M）就是预算分母
+		}
+		return w
+	}
+	return 0
+}
 
 // Addr 返回归一化后的监听地址（Config.Addr 的解析结果，供 serve 打印与监听）。
 func (h *Hub) Addr() string {

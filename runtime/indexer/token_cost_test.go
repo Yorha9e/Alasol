@@ -188,3 +188,68 @@ func TestTokenCostBadPayloadIsolated(t *testing.T) {
 		t.Fatalf("坏载荷被隔离后，好事件仍应计入：got in=%d", ts.InputTokens)
 	}
 }
+
+// compactedEv 造一条 context.compacted 事件（v2-S1 压缩动作），带/不带压缩模型 usage。
+func compactedEv(session contracts.Ulid, model string, in, out int64) contracts.Event {
+	p := contracts.ContextCompactedPayload{
+		Stage:        1,
+		Action:       contracts.ContextCompactionActionDowngrade,
+		Tier:         contracts.ContextTierL1,
+		SeqFrom:      1,
+		SeqTo:        20,
+		Ref:          "stage:1@e:1..e:20",
+		TokensBefore: 1000,
+		TokensAfter:  100,
+	}
+	if model != "" {
+		p.Model = &model
+	}
+	if in >= 0 && out >= 0 {
+		p.Usage = &contracts.ModelTurnUsage{InputTokens: in, OutputTokens: out}
+	}
+	b, _ := json.Marshal(p)
+	return ev(core.NewUlid(), "context.compacted", session, string(b))
+}
+
+// TestCompactionCostCounted：压缩模型调用的 usage 也要进成本统计（F16/J21）——
+// 压缩也是一次模型调用，不计 = 成本统计系统性偏低。
+func TestCompactionCostCounted(t *testing.T) {
+	sid := contracts.Ulid("MKYTB8D7445Y81ENY5NKBN0JJ6")
+	events := []contracts.Event{
+		modelTurnEv(sid, "gpt-4o-mini", 100, 20),
+		compactedEv(sid, "gpt-4o-mini", 300, 60),
+	}
+	_, ix := setup(t, "memory", 0, events)
+	drain(t, ix)
+
+	ts, ok, err := ix.ReadTokenStats(context.Background(), sid)
+	if err != nil || !ok {
+		t.Fatalf("ReadTokenStats: ok=%v err=%v", ok, err)
+	}
+	if ts.InputTokens != 400 || ts.OutputTokens != 80 {
+		t.Fatalf("压缩调用 usage 未计入成本：in=%d out=%d（want 400/80）", ts.InputTokens, ts.OutputTokens)
+	}
+	if ts.ModelTurns != 2 {
+		t.Fatalf("ModelTurns = %d，want 2（含一次压缩调用）", ts.ModelTurns)
+	}
+	if got := ts.ByModel["gpt-4o-mini"]; got.InputTokens != 400 || got.Turns != 2 {
+		t.Fatalf("按模型分组错: %+v", got)
+	}
+}
+
+// TestCompactionWithoutUsageNotCounted：没有 usage 的压缩事件不计 token（与 model.turn 同口径）。
+func TestCompactionWithoutUsageNotCounted(t *testing.T) {
+	sid := contracts.Ulid("MKYTB8D7445Y81ENY5NKBN0JJ6")
+	events := []contracts.Event{compactedEv(sid, "", -1, -1)}
+	_, ix := setup(t, "memory", 0, events)
+	drain(t, ix)
+
+	ts, ok, err := ix.ReadTokenStats(context.Background(), sid)
+	if err != nil {
+		t.Fatalf("ReadTokenStats: %v", err)
+	}
+	// 没有 usage → 不计 token（要么没有成本行，要么全 0）。
+	if ok && (ts.InputTokens != 0 || ts.OutputTokens != 0 || ts.ModelTurns != 0) {
+		t.Fatalf("无 usage 的压缩事件不应计 token: %+v", ts)
+	}
+}

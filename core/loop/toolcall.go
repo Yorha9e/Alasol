@@ -9,6 +9,7 @@ import (
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agents"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/policy"
 )
 
@@ -33,8 +34,10 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 		AgentID:   &l.agentID,
 	})
 
-	entry, known := l.registry.Get(tc.Name)
-	desc := entry.Tool // 未注册时是零值 Entry，Tool 为 nil
+	// 工具解析（v2-S1）：策略框架工具（recall / stage）优先，其次注册表；二者都走同一 X1 路径。
+	rt := l.resolveTool(tc.Name, st.strategyTools)
+	desc := rt.desc
+	known := rt.known
 
 	// 参数形状校验（契约边界）：arguments 必须是合法 JSON **对象**。
 	// 不满足时 arguments 置 {}（intent 仍要落盘，但不能落一个违反契约的载荷），
@@ -95,15 +98,15 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	}
 	if desc == nil {
 		// 注册过但 kind 不是 tool（只有 RegisterTool 会带上 Tool 描述）。
-		msg := fmt.Sprintf("fail-close: 工具 %q 已注册（kind=%q）但没有工具描述（Entry.Tool 为 nil）→ 不执行", tc.Name, entry.Meta.Kind)
+		msg := fmt.Sprintf("fail-close: 工具 %q 已注册（kind=%q）但没有工具描述（Entry.Tool 为 nil）→ 不执行", tc.Name, rt.metaKind)
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeToolNotFound, nil, events)
 	}
-	exec, ok := entry.Impl.(core.ToolExecutor)
-	if !ok {
+	if rt.exec == nil {
 		// 装配错误：注册进来的实现不是执行器（RegisterTool 会拦住，这里是纵深防御）。
-		msg := fmt.Sprintf("fail-close: 工具 %q 的注册实现不是 core.ToolExecutor（实际 %T）→ 不执行", tc.Name, entry.Impl)
+		msg := fmt.Sprintf("fail-close: 工具 %q 的注册实现不是 core.ToolExecutor（实际 %T）→ 不执行", tc.Name, rt.impl)
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeExecutorMissing, nil, events)
 	}
+	exec := rt.exec
 
 	// ② 执行：执行 env 只经 ctx 传递（H12/H19：值永不进事件/日志）。
 	execScope, secrets := l.buildExecEnv(ctx, desc)
@@ -142,8 +145,37 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	return toolResultText(res), events, nil
 }
 
-// permDenial 判定工具是否被本 agent 的**生效权限**禁止（H11/H22）。
+// resolvedTool 是一次工具调用的解析结果：策略框架工具优先，其次注册表（v2-S1）。
+type resolvedTool struct {
+	desc     *contracts.Tool // 工具描述（框架工具必有；注册表工具可能为 nil）
+	exec     core.ToolExecutor
+	known    bool
+	metaKind string // 注册表 kind（错误信息用；框架工具 = "tool"）
+	impl     any    // 原始注册实现（错误信息用；框架工具 = 其 Exec）
+}
+
+// resolveTool 解析一个工具：**策略框架工具（recall / stage）优先**，其次注册表。
 //
+// strategyTools 是本次 Run 的策略框架工具（per-Run，见 runState.strategyTools）。框架工具
+// per-Run 持有、不经共享 registry——所以多 session 各挂各的策略时 recall/stage 不会重名冲突。
+// strategyTools 为空（未挂策略）= 直接走 registry，行为与旧版完全一致（酸测试不回归）。
+//
+// **优先级与可见集一致**（F12）：可见集（visibleTools）里同名工具只出现一次，执行侧
+// 也只解析到一个实现。同名在装配期就已 fail-close 拒绝（collectStrategyTools），
+// 所以这里的"框架工具优先"只是**兜底顺序**，不是静默遮蔽。
+func (l *Loop) resolveTool(name string, strategyTools map[string]compaction.FrameworkTool) resolvedTool {
+	if ft, ok := strategyTools[name]; ok {
+		d := ft.Desc
+		return resolvedTool{desc: &d, exec: ft.Exec, known: true, metaKind: "tool", impl: ft.Exec}
+	}
+	entry, known := l.registry.Get(name)
+	var exec core.ToolExecutor
+	if e, ok := entry.Impl.(core.ToolExecutor); ok {
+		exec = e
+	}
+	return resolvedTool{desc: entry.Tool, exec: exec, known: known, metaKind: entry.Meta.Kind, impl: entry.Impl}
+}
+
 // 生效权限 = 请求 ∩ ceiling ∩ 父级授予（树里节点的 perm；闸门③保证子 ⊆ 父）。
 // 这层约束是**强制并入**的：超出即 deny，**不可被全局 allow 规则放宽**
 // ——声明的权限是上限，不是建议（否则"声明 write=none 的子 agent"照样能写）。

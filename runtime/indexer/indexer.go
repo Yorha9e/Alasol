@@ -50,9 +50,10 @@ const pollInterval = 50 * time.Millisecond
 
 // 事件 kind 常量（索引器只对这些 kind 做专属投影；其余忽略但计数，D7）。
 const (
-	kindLedgerUpdated = "ledger.updated"
-	kindBoardWritten  = "board.written"
-	kindModelTurn     = "model.turn"
+	kindLedgerUpdated  = "ledger.updated"
+	kindBoardWritten   = "board.written"
+	kindModelTurn      = "model.turn"
+	kindContextCompact = "context.compacted"
 )
 
 // badPayloadKind 是「坏载荷」的诊断名（**只出现在告警里**，不进 by_kind ——
@@ -293,6 +294,15 @@ func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 			}
 			badPayload = true
 		}
+	case kindContextCompact:
+		// 压缩模型调用的 token 成本（F16/J21）：压缩也是模型调用，成本要进成本统计。
+		// 载荷里没有 usage（老事件/未带 usage）→ 不计 token（同 model.turn 的口径）。
+		if err := applyContextCompacted(ctx, tx, ev); err != nil {
+			if !errors.Is(err, errBadPayload) {
+				return err
+			}
+			badPayload = true
+		}
 	default:
 		// 未知 kind（如 tool.call.intent）：宽容忽略（D7），但已在 sessions 计数。
 	}
@@ -411,6 +421,29 @@ func applyModelTurn(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error 
 	var p contracts.ModelTurnPayload
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
 		return fmt.Errorf("%w: model.turn payload id=%s: %v", errBadPayload, ev.ID, err)
+	}
+	if p.Usage == nil {
+		return nil // 无 usage：不计 token
+	}
+	model := ""
+	if p.Model != nil {
+		model = *p.Model
+	}
+	return bumpTokenCost(ctx, tx, string(ev.SessionID), model, p.Usage.InputTokens, p.Usage.OutputTokens)
+}
+
+// applyContextCompacted 投影 context.compacted 里**压缩模型调用**的 token usage 到
+// cost_tokens（F16/J21）。
+//
+// 为什么压缩调用要计成本：压缩也是一次真实的模型调用（默认走主模型），它的 token 与
+// 主循环的模型调用一样烧钱。不计 = 成本统计系统性偏低（压缩在长程任务里占比不小）。
+//
+// 口径与 model.turn 一致：载荷不可解析 → errBadPayload（隔离，不致命，P1-2）；
+// 无 usage（老事件 / provider 不上报）→ 不计 token。
+func applyContextCompacted(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
+	var p contracts.ContextCompactedPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		return fmt.Errorf("%w: context.compacted payload id=%s: %v", errBadPayload, ev.ID, err)
 	}
 	if p.Usage == nil {
 		return nil // 无 usage：不计 token
@@ -578,7 +611,11 @@ type TokenStats struct {
 	// InputTokens / OutputTokens 是该 session 累计的输入/输出 token（所有 metered turn 之和）。
 	InputTokens  int64
 	OutputTokens int64
-	// ModelTurns 是携带 usage 的 model.turn 条数（metered turn；无 usage 的轮不计）。
+	// ModelTurns 是携带 usage 的**计量模型调用数**（metered call；无 usage 的轮不计）。
+	//
+	// 口径（v2-S1 F16 后）：model.turn（主循环的模型调用）**加上** context.compacted 里
+	// 记录的压缩模型调用——压缩也是一次真实模型调用，成本必须计入，否则长程任务的成本
+	// 统计会系统性偏低。字段名沿用 model_turns（对外 JSON 形状不变，兼容既有消费端）。
 	ModelTurns int64
 	// ByModel 按模型名分组的计量（cost 按模型分组）。
 	ByModel map[string]ModelUsage

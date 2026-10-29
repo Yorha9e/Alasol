@@ -306,3 +306,48 @@ type AgentLinkHandoffPayload struct {
 	// 结构化交接载荷（开放对象，原样保存；工作流自定义，框架不解释）。
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
+
+// 已完成阶段的留存档位（13 §4/§5）：full=原文逐字留存（最近的 N-1 阶段）；l1=浅摘要（含具体工程操作 + 指针 → 持久化原文，目标残留 ≤10% 窗口，J9 可配初值）；l2=深压缩（小阶段结论 + 一根指针，目标残留 ≤1%）。降级单向：full → l1 → l2，永不回升；最老先降。
+type ContextTier string
+
+const (
+	ContextTierFull ContextTier = "full"
+	ContextTierL1   ContextTier = "l1"
+	ContextTierL2   ContextTier = "l2"
+)
+
+// context.compacted 记录的动作（13 §7 兜底三级 + §4 留存降级）：downgrade=留存策略/预算驱动的降级（full→l1→l2 最老先降、永不回升）；split=兜底②把当前阶段劈成小段按两级压（**诊断证据**：走到这步 = orchestrator 阶段切大了，上游错误不是压缩的错）；budget_warning=预防③框架侧硬预算告警（阶段工作区超 S≤W/3，prompt 已明示"阶段不能过大"，双保险之一）；fallback=压缩模型调用失败/空输出 → 退化为确定性截断（留痕口径：退化必须可见，不许静默降级）。
+type ContextCompactionAction string
+
+const (
+	ContextCompactionActionDowngrade     ContextCompactionAction = "downgrade"
+	ContextCompactionActionSplit         ContextCompactionAction = "split"
+	ContextCompactionActionBudgetWarning ContextCompactionAction = "budget_warning"
+	ContextCompactionActionFallback      ContextCompactionAction = "fallback"
+)
+
+// context.compacted —— 一次压缩动作的事实记录（13 §5 两级压缩 + §7 兜底三级 + §4 留存降级；v2-S1 级联 C 案）。durable=true 进事件流（F7 只增）：阶段大小分布、L1/L2 残留、降级/兜底触发、recall 前置都能从事件流 + context.assembled 复盘（13 §9 转正数据观测面，不做重型统计系统）。**refs 永不指摘要**：ref=stage:N@e:<from>..e:<to>（阶段号 + 原文事件 seq 锚；机器指针以 seq 区间为准，阶段号只是本 Run 别名）指向持久化原文（给 LLM 调 recall 取回全文），seq_from/seq_to 是机器可读的原文事件区间；压缩输入 = goal ledger + 被压区间全文，永不读别的阶段摘要（J17/J18/J19 级联 C 案切断级联链）。envelope.agent_id = 触发压缩的该 session agent。
+type ContextCompactedPayload struct {
+	// 阶段号（1-based；split 时是被劈开的那个阶段）。**仅本 Run 内有效**（引擎 per-Run 重建，阶段号每 Run 重排）——跨 Run 定位用 ref 里的 seq 锚。
+	Stage int64 `json:"stage"`
+	// 压缩动作（downgrade 降级 / split 切阶段 / budget_warning 硬预算告警 / fallback 压缩模型失败退化截断）。
+	Action ContextCompactionAction `json:"action"`
+	// 动作后的留存档位（downgrade/split 的目标档；budget_warning 时记当前档）。
+	Tier ContextTier `json:"tier"`
+	// 被压原文的事件 seq 区间下界（给机器；refs 只指原文、永不指摘要）。
+	SeqFrom int64 `json:"seq_from"`
+	// 被压原文的事件 seq 区间上界。
+	SeqTo int64 `json:"seq_to"`
+	// LLM 指针 stage:N@e:<from>..e:<to>（阶段号 + 原文 seq 锚，跨 Run 稳定；给模型：L1/L2 条目自带"调用 recall(\"...\") 取回全文"的使用说明）。
+	Ref string `json:"ref"`
+	// 压缩前该阶段占用的估算 token（J21 len/4 口径；可度量压缩效果）。
+	TokensBefore int64 `json:"tokens_before"`
+	// 压缩后该阶段占用的估算 token（L1≤10% / L2≤1% 窗口目标的可复盘依据，J9）。
+	TokensAfter int64 `json:"tokens_after"`
+	// 可选：本次压缩的触发原因（取值口径：validation_pass=该阶段在验证通过点收尾 / budget_fallback=总量护栏触发降级 / retention_downgrade_<from>_to_<to>=年龄留存策略 / orchestrator_oversize=兜底②切当前阶段 / fallback_truncate=压缩模型失败退化截断 / stage_over_w_div_3=预防③硬预算告警 / injection_oversize=注入区（规则/账本/常识区/base）不可压缩且独大、护栏降不动 / total_oversize=注入区+历史区(L2)+当前阶段合计仍超 W（护栏已尽力）；供事后审计）。
+	Reason *string `json:"reason,omitempty"`
+	// 可选：产生该摘要的**压缩模型调用**的 token 计量（压缩也是模型调用，成本要进成本统计，J21；usage 只进成本，绝不回填 context 快照/预算）。
+	Usage *ModelTurnUsage `json:"usage,omitempty"`
+	// 可选：产生该摘要的压缩模型名（成本统计按模型分组用；默认主模型、可配，13 §9）。
+	Model *string `json:"model,omitempty"`
+}

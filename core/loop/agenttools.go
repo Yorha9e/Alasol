@@ -10,6 +10,7 @@ import (
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agents"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/policy"
 )
 
@@ -68,6 +69,13 @@ type Agents struct {
 type runState struct {
 	// acc 累积本次 Run 内工具结果的最高污点级（Q7）。
 	acc taintAcc
+
+	// assembler 是本次 Run 的上下文策略实例（v2-S1；nil = 不挂 = append）。per-Run 持有：
+	// 策略有状态（跨轮跟踪阶段），不能跨并发 Run 共享（见 compaction.AssemblerFactory）。
+	assembler compaction.Assembler
+	// strategyTools 是 assembler 注入的框架工具（recall / stage；per-Run）。由 visibleTools
+	// 注入可见集、resolveTool 优先解析执行。
+	strategyTools map[string]compaction.FrameworkTool
 }
 
 // taintAcc 累积一次 Run 的最高污点级（"" = 未观测 = clean）。

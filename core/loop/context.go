@@ -37,9 +37,13 @@ const tokensPerChar = 4
 //   - history      → 对话历史（PartKindHistory；条数 = 消息条数，**不含**在线表）
 //   - online_table → 在线表注入（K14/K15；PartKindInjected；条数 = 行数；恒排最后，Q3/Q4）
 //
-// 预留未实现（等对应机制落地再补，不提前造假数据）：
-//   - ledger / rules（goal ledger 与项目规则注入）；
-//   - stage:N（分级压缩的阶段摘要，06 §4.2 的 tiered 策略）。
+// v2-S1 起，**挂上 context_strategy（compaction.Assembler）时**，history 区由策略装配，
+// 点亮预留来源（由 core/compaction 产 parts，loop 只透传，不认具体策略）：
+//   - ledger / rules（goal ledger 稳定半 / 项目规则注入，J19/X6/Q2）；
+//   - stage:N（分级压缩的阶段摘要：L1/L2，state=compacted + origins=seq 区间，13 §5/J9）；
+//   - common_sense（常识区，13 §6）。
+//
+// **不挂策略时**这些 source 一个都不出现（history 退回本文件的自动计算，与 v1 逐字节等价）。
 const (
 	sourceBase        = "base"
 	sourceTools       = "tools"
@@ -96,9 +100,14 @@ func estimateMessageTokens(m core.Message) int64 {
 // 追加到 req.Messages 的**最末尾**（Q4/Q3），故 history 计数要**排除这最后一条**（否则同一段
 // 内容被 history 与 online_table 双记），并以一个独立 part 记它的行数与 token（kind=injected）。
 //
+// v2-S1：stratParts 非空 = 本轮挂了 context_strategy（compaction.Assembler），history 区由
+// 策略装配（stage:N / ledger / rules / 常识区 / history），**直接用这套 parts 替换下面的自动
+// history 计算**。stratParts 为空（nil / 零长）= 不挂策略 → 走下面原样不变的自动 history
+// （与 v1 逐字节等价，酸测试）。
+//
 // 没有条目就没有 part：System 为空 / 无可见工具 / 无消息时对应 source 根本不出现
 // （"谁都没贡献"用"没有这个 source"表达，比渲染一个 0 宽分段诚实）。
-func (l *Loop) contextSnapshot(turn int, req core.ModelRequest, ot *onlineTable) contracts.ContextSnapshot {
+func (l *Loop) contextSnapshot(turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart) contracts.ContextSnapshot {
 	snap := contracts.ContextSnapshot{
 		SessionID:    l.sessionID,
 		Turn:         int64(turn),
@@ -135,26 +144,35 @@ func (l *Loop) contextSnapshot(turn int, req core.ModelRequest, ot *onlineTable)
 		used += toolTokens
 	}
 
-	// history：对话历史（user prompt + assistant 文本/工具调用 + tool 结果）。
-	// **不含在线表**——ot 非空时 req.Messages 的最后一条就是在线表消息（request 追加的），
-	// 它单独成一个 part（见下），这里要排除掉，避免双记。
-	histMsgs := req.Messages
-	if ot != nil && len(histMsgs) > 0 {
-		histMsgs = histMsgs[:len(histMsgs)-1]
-	}
-	histTokens := int64(0)
-	for _, m := range histMsgs {
-		histTokens += estimateMessageTokens(m)
-	}
-	if len(histMsgs) > 0 {
-		snap.Parts = append(snap.Parts, contracts.ContextPart{
-			Source:  sourceHistory,
-			Kind:    contracts.PartKindHistory,
-			Entries: int64(len(histMsgs)),
-			Tokens:  histTokens,
-			State:   contracts.PartStateVerbatim,
-		})
-		used += histTokens
+	// history 区：挂了 context_strategy → 用策略给出的 parts（stage:N / ledger / rules /
+	// 常识区 / history）；否则原样自动计算（v1 口径，逐字节等价）。
+	if len(stratParts) > 0 {
+		for _, p := range stratParts {
+			snap.Parts = append(snap.Parts, p)
+			used += p.Tokens
+		}
+	} else {
+		// history：对话历史（user prompt + assistant 文本/工具调用 + tool 结果）。
+		// **不含在线表**——ot 非空时 req.Messages 的最后一条就是在线表消息（request 追加的），
+		// 它单独成一个 part（见下），这里要排除掉，避免双记。
+		histMsgs := req.Messages
+		if ot != nil && len(histMsgs) > 0 {
+			histMsgs = histMsgs[:len(histMsgs)-1]
+		}
+		histTokens := int64(0)
+		for _, m := range histMsgs {
+			histTokens += estimateMessageTokens(m)
+		}
+		if len(histMsgs) > 0 {
+			snap.Parts = append(snap.Parts, contracts.ContextPart{
+				Source:  sourceHistory,
+				Kind:    contracts.PartKindHistory,
+				Entries: int64(len(histMsgs)),
+				Tokens:  histTokens,
+				State:   contracts.PartStateVerbatim,
+			})
+			used += histTokens
+		}
 	}
 
 	// online_table：在线表注入（K14/K15）。**恒排最后**（Q3：最变动在后；Q4：打穿前缀 cache 的
@@ -191,8 +209,8 @@ const phaseContextAssembled = "context.assembled"
 // 所有 durable 事件都落不下去（那种情况下 loop.error 同样落不下，agent 也跑不动），
 // 但把"可视化"做成 agent 的执行前提会让可用性被一个非核心特性绑架。诚实取舍：
 // 落不下就在事件流里记一笔，绝不在调用前伪造一条没落库的快照。
-func (l *Loop) publishContextAssembled(ctx context.Context, turn int, req core.ModelRequest, ot *onlineTable) int {
-	ev, err := l.newEvent(KindContextAssembled, nil, l.contextSnapshot(turn, req, ot))
+func (l *Loop) publishContextAssembled(ctx context.Context, turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart) int {
+	ev, err := l.newEvent(KindContextAssembled, nil, l.contextSnapshot(turn, req, ot, stratParts))
 	if err != nil {
 		l.publishLoopError(ctx, turn, phaseContextAssembled, err)
 		return 0

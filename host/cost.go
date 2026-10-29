@@ -20,6 +20,10 @@ import (
 type ModelUsage = indexer.ModelUsage
 
 // TokenCostView 是单 session 的 token 成本视图（GET /api/cost/{session_id}）。
+//
+// model_turns 的口径：**携带 usage 的计量模型调用数**——主循环的 model.turn **加上**
+// 压缩模型调用（v2-S1 F16：压缩也是一次真实模型调用，成本要计入）。字段名沿用旧名，
+// 对外 JSON 形状不变（不破坏既有消费端）。
 type TokenCostView struct {
 	SessionID    string                `json:"session_id"`
 	InputTokens  int64                 `json:"input_tokens"`
@@ -30,6 +34,8 @@ type TokenCostView struct {
 }
 
 // TokenTotalView 是跨 session 的 token 成本汇总（GET /api/cost）。
+//
+// model_turns 的口径同 TokenCostView（计量模型调用数 = model.turn + 压缩调用）。
 type TokenTotalView struct {
 	Sessions     int64                    `json:"sessions"`
 	InputTokens  int64                    `json:"input_tokens"`

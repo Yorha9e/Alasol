@@ -103,6 +103,19 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		MonitorMemMB:       pickFloat(*f.monitorMem, envFloat("ALASOL_MONITOR_MEM_MB"), fc.Monitor.MemMB),
 		MonitorGoroutines:  pickInt(*f.monitorGoroutines, fc.Monitor.Goroutines),
 		MonitorIntervalSec: pickInt(*f.monitorInterval, fc.Monitor.IntervalSec),
+
+		// 上下文策略（v2-S1）：显式 flag > 文件。空 = append（默认）。
+		// 参数面（F10）：window/l1_pct/l2_pct 也走同一条优先级（显式 flag > 文件 > 框架默认），
+		// 全部汇到 host.Config → compaction.Params（数字是可配初值，不写死）。
+		ContextStrategy:       contextStrategyValue(f, fc),
+		ContextStrategyWindow: pickInt64(*f.contextWindow, fc.ContextStrategy.Window),
+		ContextStrategyL1Pct:  pickFloat(*f.contextL1Pct, 0, fc.ContextStrategy.L1Pct),
+		ContextStrategyL2Pct:  pickFloat(*f.contextL2Pct, 0, fc.ContextStrategy.L2Pct),
+		// 注入区上限（规则/常识区）：不可压缩的内容必须有上限，否则一条超长规则就能顶穿窗口。
+		ContextStrategyRulesBudget:       pickInt64(0, fc.ContextStrategy.RulesBudget),
+		ContextStrategyCommonSenseBudget: pickInt64(0, fc.ContextStrategy.CommonSenseBudget),
+		// 项目规则文本（稳定前缀的一部分；只有配置文件面提供——多行文本不适合走 flag）。
+		ContextRules: fc.ContextRules,
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
@@ -121,6 +134,14 @@ func flagIfSet(f *hubFlags, name, flagVal string) string {
 
 // pickInt 取第一个非零值（flag 优先，0=未设）。
 func pickInt(flagVal, fileVal int) int {
+	if flagVal != 0 {
+		return flagVal
+	}
+	return fileVal
+}
+
+// pickInt64 取第一个非零值（flag 优先，0=未设）。
+func pickInt64(flagVal, fileVal int64) int64 {
 	if flagVal != 0 {
 		return flagVal
 	}
@@ -159,4 +180,14 @@ func envFloat(name string) float64 {
 		return 0
 	}
 	return x
+}
+
+// contextStrategyValue 解析上下文策略（v2-S1）：显式 flag > 文件。空 = append（默认）。
+// trim 后比较（容忍 " tiered " 这类带空白的输入）；合法性由 host.Config.validate 收口
+// （装配侧也按 trim 后的值比较——F23：校验与装配必须同一口径，否则静默退回 append）。
+func contextStrategyValue(f *hubFlags, fc *host.FileConfig) string {
+	if f.explicitlySet("context-strategy") {
+		return strings.TrimSpace(*f.contextStrategy)
+	}
+	return strings.TrimSpace(fc.ContextStrategy.Kind)
 }

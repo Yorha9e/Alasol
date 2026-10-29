@@ -52,6 +52,38 @@ type FileConfig struct {
 	OnlineTable OnlineTableFileConfig `toml:"online_table"`
 	// Monitor hub 监控（K9）阈值。
 	Monitor MonitorFileConfig `toml:"monitor"`
+	// ContextStrategy 上下文装配策略（v2-S1）：kind="" = append（默认）| "tiered" = 级联压缩；
+	// window/l1_pct/l2_pct 是 tiered 的可配参数（13 §8/J9：数字是**可配初值**，不写死）。
+	ContextStrategy ContextStrategyFileConfig `toml:"context_strategy"`
+	// ContextRules 项目规则文本（AGENTS.md 等；稳定前缀的一部分，Q2/Q3）。空 = 不注入。
+	ContextRules string `toml:"context_rules"`
+}
+
+// ContextStrategyFileConfig 是上下文装配策略的文件级配置（v2-S1）。
+//
+// 形如：
+//
+//	[context_strategy]
+//	kind = "tiered"
+//	window = 1000000
+//	l1_pct = 10.0
+//	l2_pct = 1.0
+//
+// 口径：**kind 为空 = append**（默认，v1 等价）；tiered 时 window 须 ≥ 256k（13 §8 硬约束，
+// 不满足拒绝装配并说明）。l1_pct/l2_pct 是目标残留占窗口的百分比（可配初值，J9）。
+type ContextStrategyFileConfig struct {
+	// Kind 策略种类："" = append（默认）| "tiered" = 级联压缩。
+	Kind string `toml:"kind"`
+	// Window tiered 的窗口预算 W（token；0 = 默认 1M；须 ≥ 256k）。
+	Window int64 `toml:"window"`
+	// L1Pct L1（浅摘要）目标残留占窗口百分比（0 = 默认 10）。
+	L1Pct float64 `toml:"l1_pct"`
+	// L2Pct L2（深压缩）目标残留占窗口百分比（0 = 默认 1）。
+	L2Pct float64 `toml:"l2_pct"`
+	// RulesBudget 项目规则注入的 token 上限（0 = 布局默认 15k）。
+	RulesBudget int64 `toml:"rules_budget"`
+	// CommonSenseBudget 常识区注入的 token 上限（0 = 布局默认 30k）。
+	CommonSenseBudget int64 `toml:"common_sense_budget"`
 }
 
 // OnlineTableFileConfig 是在线表注入的文件级默认（K14/K15）。

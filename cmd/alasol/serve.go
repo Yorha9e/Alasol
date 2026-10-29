@@ -42,6 +42,10 @@ type hubFlags struct {
 	monitorMem        *float64
 	monitorGoroutines *int
 	monitorInterval   *int
+	contextStrategy   *string
+	contextWindow     *int64
+	contextL1Pct      *float64
+	contextL2Pct      *float64
 	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
 	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
 	set map[string]bool
@@ -74,6 +78,10 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		monitorMem:        fs.Float64("monitor-mem", 0, "hub 内存监控阈值 MB（0=默认，K9）"),
 		monitorGoroutines: fs.Int("monitor-goroutines", 0, "hub goroutine 数监控阈值（0=默认，K9）"),
 		monitorInterval:   fs.Int("monitor-interval", 0, "hub 监控采样周期秒（0=默认，K9）"),
+		contextStrategy:   fs.String("context-strategy", "", "上下文装配策略（v2-S1）：空=append（默认，v1 等价）| tiered=级联压缩（两级 L1/L2 + recall + 留存降级）"),
+		contextWindow:     fs.Int64("context-window", 0, "tiered 策略的上下文窗口预算 W（token；0=默认 1M；须 ≥256k）"),
+		contextL1Pct:      fs.Float64("context-l1-pct", 0, "tiered 策略的 L1（浅摘要）目标残留占窗口百分比（0=默认 10）"),
+		contextL2Pct:      fs.Float64("context-l2-pct", 0, "tiered 策略的 L2（深压缩）目标残留占窗口百分比（0=默认 1）"),
 	}
 }
 

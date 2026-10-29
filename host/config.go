@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
 )
@@ -92,6 +93,27 @@ type Config struct {
 	// WorktreeRoot 多 worktree 隔离（v1-S5 D）的受管根目录（所有 worktree 建在其下）。
 	// 空 = 派生自事件库目录（<DBPath 所在目录>/worktrees）。
 	WorktreeRoot string
+	// ContextStrategy 上下文装配策略（v2-S1；J8 context_strategy）："" = append（默认，v1 等价）
+	// | "tiered" = 级联压缩（core/compaction 的两级 L1/L2 + recall + 留存降级）。opt-in 预备单位。
+	ContextStrategy string
+	// ContextStrategyWindow tiered 策略的窗口预算 W（token；0 = 默认 1M）。须 ≥ 256k 硬约束
+	// （13 §8），不满足则 New 拒绝装配并说明。
+	//
+	// **同时是 context.assembled 的 tokens_budget 分母**（F10/F13：两者必须同源——否则
+	// 挂 tiered 时 UI 的占比是拿 200k 默认分母算的，会显示成几百个百分点）。
+	ContextStrategyWindow int64
+	// ContextStrategyL1Pct tiered 策略的 L1（浅摘要）目标残留占窗口百分比（0 = 默认 10）。
+	ContextStrategyL1Pct float64
+	// ContextStrategyL2Pct tiered 策略的 L2（深压缩）目标残留占窗口百分比（0 = 默认 1）。
+	ContextStrategyL2Pct float64
+	// ContextStrategyRulesBudget 项目规则注入的 token 上限（0 = 布局默认 15k）。
+	// 规则是**不可压缩**的注入内容：没上限时一条超长规则就能顶穿窗口（13 §8 前缀预算）。
+	ContextStrategyRulesBudget int64
+	// ContextStrategyCommonSenseBudget 常识区注入的 token 上限（0 = 布局默认 30k）。
+	ContextStrategyCommonSenseBudget int64
+	// ContextRules 项目规则文本（AGENTS.md 等；稳定前缀的一部分，Q2/Q3）。空 = 不注入。
+	// 注入面：宿主装配 tiered 引擎时调 SetRules（core/compaction 的规则注入口）。
+	ContextRules string
 }
 
 // validate 校验并归一化配置。
@@ -160,7 +182,85 @@ func (c *Config) validate() error {
 	if c.MonitorIntervalSec < 0 {
 		return fmt.Errorf("host: Config.MonitorIntervalSec 不能为负（得到 %d；0 = 默认）", c.MonitorIntervalSec)
 	}
+	// 上下文策略（v2-S1）：只支持 ""（append 默认）| "tiered"。窗口 W 负值拒绝；
+	// tiered 时 W（0=默认 1M）须过 compaction 的 W≥256k 硬约束（否则 loopFor 装配期拒绝）。
+	//
+	// 取值按 **TrimSpace 后**比较（与装配处同一口径，F23：校验用 " tiered " 通过、
+	// 装配用原值比较不通过 → 静默退回 append）。
+	switch strings.TrimSpace(c.ContextStrategy) {
+	case "", contextStrategyTiered:
+	default:
+		return fmt.Errorf("host: Config.ContextStrategy 只支持 %q（默认 append）| %q（得到 %q）",
+			"", contextStrategyTiered, c.ContextStrategy)
+	}
+	if c.ContextStrategyWindow < 0 {
+		return fmt.Errorf("host: Config.ContextStrategyWindow 不能为负（得到 %d；0 = 默认 1M）", c.ContextStrategyWindow)
+	}
+	if c.ContextStrategyRulesBudget < 0 {
+		return fmt.Errorf("host: Config.ContextStrategyRulesBudget 不能为负（得到 %d；0 = 布局默认 15k）", c.ContextStrategyRulesBudget)
+	}
+	if c.ContextStrategyCommonSenseBudget < 0 {
+		return fmt.Errorf("host: Config.ContextStrategyCommonSenseBudget 不能为负（得到 %d；0 = 布局默认 30k）", c.ContextStrategyCommonSenseBudget)
+	}
+	if c.ContextStrategyL1Pct < 0 || c.ContextStrategyL1Pct > 100 {
+		return fmt.Errorf("host: Config.ContextStrategyL1Pct 必须在 (0,100] 内（得到 %v；0 = 默认 10）", c.ContextStrategyL1Pct)
+	}
+	if c.ContextStrategyL2Pct < 0 || c.ContextStrategyL2Pct > 100 {
+		return fmt.Errorf("host: Config.ContextStrategyL2Pct 必须在 (0,100] 内（得到 %v；0 = 默认 1）", c.ContextStrategyL2Pct)
+	}
+	// L2 必须比 L1 更深（目标残留更小）：否则"两级压缩"退化成一级。
+	//
+	// 比较用**归一化后的有效值**（0 = 默认 10% / 1%）：拿原始值比会漏掉"L1 用默认、L2 配成
+	// 50%"这种组合——那正是"更深的反而更宽"的退化配置。
+	l1 := c.ContextStrategyL1Pct
+	if l1 <= 0 {
+		l1 = compaction.DefaultL1TargetPct
+	}
+	l2 := c.ContextStrategyL2Pct
+	if l2 <= 0 {
+		l2 = compaction.DefaultL2TargetPct
+	}
+	if l2 > l1 {
+		return fmt.Errorf("host: Config.ContextStrategyL2Pct（%v）必须 ≤ ContextStrategyL1Pct（%v）：L2 是更深的一级",
+			l2, l1)
+	}
+	// W 的硬约束**前移到启动期**（13 §8：W ≥ 256k）：tiered + W 过小 → 启动即拒绝，
+	// 而不是拖到每个 session 请求才失败（那时错误信息离配置现场太远）。
+	//
+	// 顺带校验**布局自洽**（历史区预算不得为负）：注入区预算配得比窗口还大时，
+	// 历史区就没了份额 → 装配期拒绝（负预算地雷不许带进运行期）。
+	if strings.TrimSpace(c.ContextStrategy) == contextStrategyTiered {
+		p := c.contextStrategyParams()
+		if err := compaction.ValidateWindow(p.Window); err != nil {
+			return fmt.Errorf("host: tiered 策略的窗口不合法: %w", err)
+		}
+		if err := compaction.ValidateLayout(p); err != nil {
+			return fmt.Errorf("host: tiered 策略的布局不合法: %w", err)
+		}
+	}
 	return nil
+}
+
+// contextStrategyParams 把宿主配置折成 compaction.Params（**唯一装配处**：配置校验与
+// 策略工厂共用，避免两处口径漂移）。
+func (c *Config) contextStrategyParams() compaction.Params {
+	p := compaction.DefaultParams()
+	if c.ContextStrategyWindow > 0 {
+		p.Window = c.ContextStrategyWindow
+	}
+	if c.ContextStrategyL1Pct > 0 {
+		p.L1TargetPct = c.ContextStrategyL1Pct
+	}
+	if c.ContextStrategyL2Pct > 0 {
+		p.L2TargetPct = c.ContextStrategyL2Pct
+	}
+	if c.ContextStrategyRulesBudget > 0 {
+		p.RulesBudget = c.ContextStrategyRulesBudget
+	}
+	if c.ContextStrategyCommonSenseBudget > 0 {
+		p.CommonSenseBudget = c.ContextStrategyCommonSenseBudget
+	}
+	return p
 }
 
 // checkLoopback 强制监听地址是 loopback（N5b/O7）。

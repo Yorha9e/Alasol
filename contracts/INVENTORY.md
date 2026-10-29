@@ -46,6 +46,7 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 | `gate.joined` | true | session 加入 gate（K12，v1-S2）：`gate_id` + `source`（auto_repo/auto_workflow/explicit）；无 `gate.left`——离开 = session 结束 |
 | `agentlink.broadcast` | true | 广播消息（K18，v1-S3）：`target`（gate/subtree）+ `text`；拉模型投递，收件方 = 目标 ∩ 发送方可见集（K11/K27） |
 | `agentlink.handoff` | true | 结构化交接（K18，v1-S3）：broadcast + 开放结构 `payload`（工作流自定义，框架不解释） |
+| `context.compacted` | true | **一次压缩动作的事实记录**（`ContextCompactedPayload`，v2-S1 级联 C 案）：两级压缩 L1/L2 + 兜底三级 + 留存降级（full→l1→l2 最老先降、永不回升）；`action`=downgrade/split/budget_warning/fallback（压缩模型失败→退化截断，**留痕**），`tier`=full/l1/l2，`seq_from`/`seq_to`=被压原文机器区间，`ref`=stage:N@e:from..e:to（阶段号 + seq 锚，跨 Run 稳定）给 LLM，`usage`/`model`=压缩模型调用的 token 计量与模型名（成本统计口径，J21）。**refs 永不指摘要**；压缩输入=goal ledger+被压区间全文（永不读他阶段摘要，J17/J18/J19）；阶段大小分布/L1L2 残留/降级兜底触发可从事件流+`context.assembled` 复盘（13 §9） |
 
 写路径铁律（X1）：`intent` **durable 落盘** → 执行 → `result` durable 落盘。**有意图无结果 = 未知结果，不盲目重跑**。
 

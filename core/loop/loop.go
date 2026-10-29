@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/bus"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
 )
@@ -115,6 +117,16 @@ type Config struct {
 	OnlineTable *OnlineTableConfig
 	// OnlineTableSource 在线表数据源（K11：self + gate 相交的对端主 agent；nil = 关闭注入）。
 	OnlineTableSource OnlineTableSource
+	// ContextStrategy 上下文装配策略工厂（v2-S1；compaction.AssemblerFactory，J8 context_strategy）。
+	// **可挂可不挂的预备单位**（13 §1）：
+	//   - nil = 不挂 → loop 走内建 append 路径，装配输出与 v1 **逐字节等价**（酸测试）；
+	//   - 挂上（工厂每次 Run 造一个 fresh Assembler，如 tiered 引擎）→ 旧阶段两级压缩 +
+	//     recall + 留存降级，context.assembled 点亮 stage:N / ledger / rules 来源。
+	// **换/摘策略 core 零改动**：loop 只认 compaction.Assembler 接口，不认识具体实现。
+	// 为什么是工厂：策略有状态（跨轮跟踪阶段），而 Loop 承诺可并发 Run——工厂让每次 Run 各持
+	// 一个 Assembler（放进 runState），既不共享状态又让策略跨轮积累。宿主每次调工厂造一个绑定到
+	// 本次依赖（store/provider/bus）的新实例。
+	ContextStrategy compaction.AssemblerFactory
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -151,6 +163,11 @@ type Loop struct {
 	// onlineConfig 是**共享活配置**（hub 建一个传给所有 loop，运行期可调）。
 	onlineConfig *OnlineTableConfig
 	onlineSource OnlineTableSource
+
+	// ctxStrategy 支撑 v2-S1 上下文装配策略工厂（compaction.AssemblerFactory；nil = 不挂 =
+	// append，与 v1 逐字节等价）。见 Config.ContextStrategy。每次 Run 经它造一个 fresh
+	// Assembler 放进 runState（策略有状态，不能跨并发 Run 共享）。
+	ctxStrategy compaction.AssemblerFactory
 }
 
 // Result 是一次 Run 的产出。
@@ -239,6 +256,7 @@ func New(cfg Config) (*Loop, error) {
 		checkpointEvery: cfg.CheckpointEvery,
 		onlineConfig:    cfg.OnlineTable,
 		onlineSource:    cfg.OnlineTableSource,
+		ctxStrategy:     cfg.ContextStrategy,
 	}, nil
 }
 
@@ -296,6 +314,17 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	// 无论从哪条路径返回，都把本次累积的污点级写进 Result（Q7；空归一为 clean）。
 	defer func() { res.Taint = normalizeTaint(st.acc.level) }()
 
+	// v2-S1：挂了对上下文策略时，本次 Run 造一个 fresh Assembler（策略有状态，per-Run 持有），
+	// 并收集它注入的框架工具（recall / stage）。nil 工厂 = 不挂 = append（v1 等价）。
+	if l.ctxStrategy != nil {
+		st.assembler = l.ctxStrategy()
+		tools, err := l.collectStrategyTools(st.assembler)
+		if err != nil {
+			return res, err // 装配期重名 → fail-close（不许静默遮蔽，F12）
+		}
+		st.strategyTools = tools
+	}
+
 	// 每轮历史都是局部变量：同一 Loop 可被并发 Run 而不互相污染。
 	// 既有历史先**拷贝**一份（调用方可能复用那个切片 → 不能被本次 Run 改写）。
 	msgs := make([]core.Message, 0, len(history)+8)
@@ -321,12 +350,20 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		ot := l.onlineTableForTurn(ctx)
 
 		// 组这一轮的请求（可见工具过滤后的结果，R5/H4；在线表追加以最末尾，Q4/Q3）。
-		req := l.request(msgs, ot)
+		// 挂了 context_strategy（v2-S1）→ 由策略装配 history 区（压缩/注入/降级），并产出
+		// context.assembled 的 stage:N/ledger/rules parts；不挂 → 原样 request()（v1 等价）。
+		var req core.ModelRequest
+		var stratParts []contracts.ContextPart
+		if st.assembler != nil {
+			req, stratParts = l.requestWithStrategy(ctx, msgs, ot, turn, st)
+		} else {
+			req = l.request(msgs, ot)
+		}
 
 		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
 		// 此刻装配已定型（req 就是模型将看到的全部），记录"这一轮给模型看了什么"；
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
-		res.Events += l.publishContextAssembled(ctx, turn, req, ot)
+		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts)
 
 		mr, err := l.provider.Run(ctx, req, l.emit)
 		if err != nil {
@@ -425,8 +462,105 @@ func (l *Loop) request(history []core.Message, ot *onlineTable) core.ModelReques
 		Model:    l.model,
 		System:   l.system,
 		Messages: msgs,
-		Tools:    l.visibleTools(),
+		Tools:    l.visibleTools(nil), // 无策略 → 无框架工具
 	}
+}
+
+// requestWithStrategy 是挂了 context_strategy（v2-S1）时的请求组装：先让策略把 history
+// 装配成压缩/注入后的上下文，再（若有在线表）把在线表追加到**最末尾**（Q4/Q3）。
+//
+// 与 request() 的差别只在 history 区经策略变换；system / tools / 在线表位置都不变。
+// 策略**失败时 fail-open 到 append**（用原始 history）+ 尽力补一条 loop.error 留痕：
+// 策略是上下文管理器不是安全边界，装配出错时让模型看到完整原始历史是已知安全的退路
+// （= v1 行为），比中止整个 agent 更可用；失败事实经 loop.error(phase=context.strategy) 留痕。
+//
+// 装配前先把两件事告诉策略（都是策略自己看不到的上下文）：
+//   - 本轮固定开销（system + 工具 schema）→ 策略据此守"base+tools+history+current ≤ W"
+//     的总量护栏（F2：两个预算各自放行会相加超窗）；
+//   - 本轮模型可见的工具名 → 策略据此决定摘要条目要不要附 recall 说明（F27）。
+func (l *Loop) requestWithStrategy(ctx context.Context, history []core.Message, ot *onlineTable, turn int, st *runState) (core.ModelRequest, []contracts.ContextPart) {
+	tools := l.visibleTools(st.strategyTools)
+	if setter, ok := st.assembler.(compaction.BaseOverheadSetter); ok {
+		// 在线表也是本轮上下文的一部分（loop 追加在末尾，策略看不见）→ 计入固定开销，
+		// 否则总量护栏会漏算它。
+		base := l.baseTokens(tools)
+		if ot != nil {
+			base += ot.tokens
+		}
+		setter.SetBaseTokens(base)
+	}
+	if setter, ok := st.assembler.(compaction.ToolVisibilitySetter); ok {
+		setter.SetVisibleToolNames(l.toolNames(tools))
+	}
+	msgs := history
+	var parts []contracts.ContextPart
+	assembled, err := st.assembler.Assemble(ctx, history, turn)
+	if err != nil {
+		l.publishLoopError(ctx, turn, phaseContextStrategy, err)
+	} else {
+		msgs = assembled.Messages
+		parts = assembled.Parts
+	}
+	if ot != nil {
+		out := make([]core.Message, len(msgs), len(msgs)+1)
+		copy(out, msgs)
+		msgs = append(out, ot.message)
+	}
+	return core.ModelRequest{
+		Model:    l.model,
+		System:   l.system,
+		Messages: msgs,
+		Tools:    tools,
+	}, parts
+}
+
+// baseTokens 本轮固定开销（system 提示 + 模型可见工具 schema）的 token 估算（J21 口径）。
+//
+// 它是**总量护栏**的一半（另一半由策略自己算：注入区 + 历史区 + 当前阶段）。
+func (l *Loop) baseTokens(tools []contracts.Tool) int64 {
+	n := estimateTokens(l.system)
+	for i := range tools {
+		n += estimateToolTokens(&tools[i])
+	}
+	return n
+}
+
+// toolNames 取工具名列表（给策略判断某个框架工具是否可见）。
+func (l *Loop) toolNames(tools []contracts.Tool) []string {
+	out := make([]string, 0, len(tools))
+	for i := range tools {
+		out = append(out, tools[i].Name)
+	}
+	return out
+}
+
+// collectStrategyTools 收集本次 Run 的策略框架工具，并做**重名 fail-close 检查**（F12）。
+//
+// 同名工具（策略框架工具 vs 注册表工具、或两个框架工具彼此同名）会让"可见集"与"执行解析"
+// 变成两套含义：模型看到两个同名工具，执行时却只跑其中一个（框架工具还会遮蔽注册表工具）。
+// 装配期直接报错拒绝（fail-close），不做静默遮蔽——要豁免就把工具名写进 agent 类型的
+// tools 白名单（见 visibleTools 的类型过滤）。
+func (l *Loop) collectStrategyTools(a compaction.Assembler) (map[string]compaction.FrameworkTool, error) {
+	tp, ok := a.(compaction.ToolProvider)
+	if !ok {
+		return nil, nil
+	}
+	tools := tp.Tools()
+	out := make(map[string]compaction.FrameworkTool, len(tools))
+	for _, ft := range tools {
+		name := strings.TrimSpace(ft.Desc.Name)
+		if name == "" {
+			return nil, errors.New("loop: 上下文策略注入的工具没有名字（装配残缺）")
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("loop: 上下文策略注入了重名工具 %q（fail-close：同名工具的执行语义必须唯一）", name)
+		}
+		if _, known := l.registry.Get(name); known {
+			return nil, fmt.Errorf("loop: 上下文策略注入的工具 %q 与注册表工具重名（fail-close：同名工具的执行语义必须唯一；请改框架工具名或移除注册表里的同名工具）", name)
+		}
+		out[name] = ft
+	}
+	return out, nil
 }
 
 // visibleTools 取当前可见工具描述（注册顺序 = 模型看到的顺序，确定性）。
@@ -439,7 +573,16 @@ func (l *Loop) request(history []core.Message, ot *onlineTable) core.ModelReques
 //     Tools 列内的注册工具可见（子 loop 的 tools=type.Tools）；
 //   - **生命周期工具注入**：can_spawn 非空 → 注入 spawn；子 agent（depth>1）→ 注入 complete。
 //     二者由类型可达性/深度控制（K20/K21），不经注册表/policy（三闸门才是授权）。
-func (l *Loop) visibleTools() []contracts.Tool {
+//
+// **框架工具（策略注入的 recall / stage）同样过 type.Tools 白名单**（F1）：框架工具不是
+// 免检通道——"不暴露即不存在"对它们一样成立。要豁免就把工具名写进该 agent 类型的
+// tools 列表（显式豁免，不许静默绕过）。
+//
+// strategyTools 是本次 Run 的上下文策略注入的框架工具（v2-S1：recall / stage；per-Run，
+// 由调用方从 runState 传入；nil = 无策略框架工具）。可见集**按名字去重**（F12）：
+// 同一个名字只出现一次（执行侧的解析优先级与可见集保持一致：策略框架工具优先，
+// 但同名在装配期就已 fail-close 拒绝，见 collectStrategyTools）。
+func (l *Loop) visibleTools(strategyTools map[string]compaction.FrameworkTool) []contracts.Tool {
 	var (
 		typeFilter map[string]bool // 非 nil 时按类型 Tools 收窄注册工具
 		canSpawn   bool
@@ -457,6 +600,7 @@ func (l *Loop) visibleTools() []contracts.Tool {
 
 	entries := l.registry.List(registry.ExtensionKindTool)
 	out := make([]contracts.Tool, 0, len(entries)+2)
+	seen := map[string]bool{}
 	for _, e := range entries {
 		if e.Tool == nil {
 			continue // 非工具扩展（kind 不匹配时已被 List 过滤；Tool 为 nil 是装配残缺）
@@ -467,17 +611,46 @@ func (l *Loop) visibleTools() []contracts.Tool {
 		if !l.toolVisible(e.Tool.Name) {
 			continue // H4：被 deny 的工具移出模型可见集
 		}
+		if seen[e.Tool.Name] {
+			continue // F12：可见集按名字去重
+		}
+		seen[e.Tool.Name] = true
 		out = append(out, *e.Tool)
 	}
 
 	// 生命周期工具注入（阶段 5）。它们**也要过策略**（P2-4：spawn/complete 不许绕过
 	// 策略）：被 deny 的生命周期工具不进模型可见集。
 	if l.agents != nil && l.agents.Tree != nil {
-		if canSpawn && l.toolVisible(ToolSpawn) {
+		if canSpawn && l.toolVisible(ToolSpawn) && !seen[ToolSpawn] {
+			seen[ToolSpawn] = true
 			out = append(out, spawnToolDesc())
 		}
-		if isSubagent && l.toolVisible(ToolComplete) {
+		if isSubagent && l.toolVisible(ToolComplete) && !seen[ToolComplete] {
+			seen[ToolComplete] = true
 			out = append(out, completeToolDesc())
+		}
+	}
+
+	// 上下文策略的框架工具（v2-S1：recall / stage）。与 spawn/complete 同款：也过策略
+	// （deny 的不进可见集）与 agent 类型白名单（F1），按名字排序保证确定性（map 迭代无序）。
+	if len(strategyTools) > 0 {
+		names := make([]string, 0, len(strategyTools))
+		for name := range strategyTools {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			if typeFilter != nil && !typeFilter[name] {
+				continue // F1：类型未列出的工具不暴露（框架工具也不例外）
+			}
+			if !l.toolVisible(name) {
+				continue // H4：被 deny 的工具移出模型可见集
+			}
+			if seen[name] {
+				continue // F12：可见集按名字去重
+			}
+			seen[name] = true
+			out = append(out, strategyTools[name].Desc)
 		}
 	}
 	return out

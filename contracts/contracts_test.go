@@ -209,6 +209,47 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if len(p.Payload) == 0 {
 				t.Errorf("line %d: agentlink.handoff 应带结构化 payload", lineNo)
 			}
+		case "context.compacted":
+			var p ContextCompactedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ContextCompactedPayload: %v", lineNo, err)
+				break
+			}
+			// refs 永不指摘要：ref 必须是 stage:N 指针（指向持久化原文，给 LLM 调 recall）。
+			if !strings.HasPrefix(p.Ref, "stage:") {
+				t.Errorf("line %d: context.compacted ref = %q，应以 stage: 前缀指向持久化原文（refs 永不指摘要）", lineNo, p.Ref)
+			}
+			// seq 区间给机器：下界 ≤ 上界且非负（被压原文的事件区间）。
+			if p.SeqFrom < 0 || p.SeqTo < p.SeqFrom {
+				t.Errorf("line %d: context.compacted seq 区间非法：[%d, %d]", lineNo, p.SeqFrom, p.SeqTo)
+			}
+			switch p.Action {
+			case ContextCompactionActionDowngrade, ContextCompactionActionSplit,
+				ContextCompactionActionBudgetWarning, ContextCompactionActionFallback:
+			default:
+				t.Errorf("line %d: context.compacted action = %q 不在枚举内", lineNo, p.Action)
+			}
+			switch p.Tier {
+			case ContextTierFull, ContextTierL1, ContextTierL2:
+			default:
+				t.Errorf("line %d: context.compacted tier = %q 不在枚举内", lineNo, p.Tier)
+			}
+			// F28：reason 取值集合要与实现产出的口径对齐（契约描述里列举的那几个）。
+			if p.Reason != nil {
+				switch *p.Reason {
+				case "validation_pass", "budget_fallback", "orchestrator_oversize",
+					"fallback_truncate", "stage_over_w_div_3",
+					"injection_oversize", "total_oversize":
+				default:
+					if !strings.HasPrefix(*p.Reason, "retention_downgrade_") {
+						t.Errorf("line %d: context.compacted reason = %q 不在实现产出的取值集合内", lineNo, *p.Reason)
+					}
+				}
+			}
+			// 压缩模型调用的 usage（成本统计口径，F16）：带 usage 时必须带 model 名。
+			if p.Usage != nil && p.Model == nil {
+				t.Errorf("line %d: context.compacted 带 usage 时应带 model 名（成本按模型分组）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -232,7 +273,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	for _, kind := range []string{
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
-		"agentlink.broadcast", "agentlink.handoff",
+		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)
