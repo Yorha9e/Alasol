@@ -212,6 +212,16 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 | **v2-S4 沙箱** | K8/H9 SandboxedExecutionEnv：Windows **job object + 受限 token + 目录 ACL** 务实组合；**可拓展埋点**（Linux/mac seatbelt/bwrap 后续挂）；V8 写保护由此收口 | 工具子进程纳入 job object（进程树清理）；目录外写被 ACL 拒；受限 token 下提权受限；换沙箱 env 不动 agent 逻辑（可插拔酸测试）；埋点接口留出 Linux/mac 挂点 | **✅ 完成（2026-01-29，评审循环 critic 3 轮/reviewer 3 轮至 clean）**：`runtime/cap/sandbox`（job object+受限 token+目录 ACL+WER 压制+Backend 埋点接口）+ host/cmd 装配（run/resume/serve 统一口径）；**已知边界**：默认模式 BUILTIN\Users 授权位置可写可读（`-sandbox-strict-groups` 可关、代价 overlapped I/O）、读只挡用户私有文件、允许根 DACL 追加传播不还原；Net/Proc 维度留挂账 |
 | **v2-S5 存储接口收口** | G1/G2「一组可组合的存储接口」随图/blob 落地收口：事件日志/文档/blob/图接口分立、各自多实现可组合（blob/向量实现留 v4）；v1 挂账能清则清 | 接口分立且可组合（换实现零改动酸测试）；图/blob 接口签名与 G18-G21 实现对齐；07 收口注记 + 合计同步 | **✅ 完成（2026-01-29，评审循环 critic 3 轮/reviewer 3 轮至 clean）**：`core/storage` 五族可组合接口（文档/blob/向量只立接口留 v4；`BlobMeta.Ref()`=`Event.binary_ref` 挂接点）+ 五族双实现酸测试；挂账清理 ②③⑤⑥（hub.alert 入流/worktree Rebuild/models 读 TOML/agentlink 空格路径判据），①④ 如实留挂（worktree 工具级隔离涉 X1、TUI 真 TTY） |
 
+### v3 · MCP / fork / 工作流引擎（施工切分，2026-01-29）
+
+> 每阶段照旧过退出评审循环（critic→reviewer→clean）+ 提交 `refs 07/…`。v3 沿拍板顺序：**MCP client 先**（N1）→ **fork+/btw**（K29）→ **工作流引擎**（W 系，非强制哲学式）。v2 各段的挂账随做随清（见 S3）。
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **v3-S1 MCP client** | N1 拍板 client 先（官方 go-sdk 已实测）：连接外部 MCP server、其工具注册进 registry 走既有工具管线（X1 三段写路径 + 策略链裁决 + R5 可见性）；N2 可选能力**不实现**（sampling/eliciation/roots）；server 声明的工具 schema 进 Tool 契约面 | 连模拟/真实 MCP server 后其工具可被模型调用且三段事件完整、策略链生效；坏 server/断连 fail-close 不拖垮 hub；MCP 工具命名不与内建工具撞名（重名 fail-close） |
+| **v3-S2 fork + /btw** | K29 拍板：fork **只附带上下文**（不复制 ledger/gate 全套）；`/btw` 旁支命令——结果**只给用户、不回灌**主上下文；**预埋**"从 /btw 生成全新 session"钩子（只埋点不实现） | /btw 结果不进主上下文（事件流/快照断言）；fork 附带上下文且不带 ledger/gate（断言）；生成新 session 钩子埋点存在（埋点≠实现） |
+| **v3-S3 工作流引擎 + tower 验证** | W1 能力包（哲学+agent_types+context_strategy+gates+grants）、**非强制**（W2 阶段=哲学非强制序列、W21 编排主 agent 自决框架不校验）；W3 slash/显式触发 → 哲学文本进 system prompt；W4 追加 loop 可组合；W14 代码扩展点**只有两处**（MilestoneHandler + 自定义上下文策略）；W19 **tower 作首个 workflow 包**（critic→reviewer 循环做成第一个包）；**v2 挂账随做随清**：V6 review-tip / V7 冲突预测的合并门禁接线、N2 重建窗口口径补齐、J19 账本生产者、v2-S1 硬边界事件驱动接线（gate receipt → MarkValidationPassed）、N1 邻居截断信号/N5 Tx 类型化 | workflow 包可挂可不挂（不挂零行为变化，酸测试）；tower 包跑通 critic→reviewer 里程碑（MilestoneHandler 实证）；合并门禁能拦"review 后又推一行"（V6 端到端）+ 冲突预测消费端就位；07 挂账注记同步 |
+
 ---
 
 
