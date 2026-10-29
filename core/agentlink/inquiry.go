@@ -513,9 +513,26 @@ const pathTokenDelims = " \t\r\n\v\f\"'`{}[]()<>,;!?，。；：！？、｜|"
 //	   只能靠整串核验：被空白切开就只剩碎片，**完整路径反而核验不过**（假阴性，
 //	   含空格的机器上硬验收直接红）。
 //	② 碎片（按 token 边界切）也入表——散文里提到的路径（"读完了 src/a.go"）靠它核验。
-//	③ 但当整串的**每个空白分片**都像路径时，整串就是"一条带空格的路径"（空格在
-//	   路径的某一段里），此时**只**入整串：那些空白分片只是这条路径的片段
-//	   （`C:\Users\John`），留着它们会让伪造 ref 核验通过（假阳性残留）。
+//	③ **按边界**抑制：只有"含空格的**根路径**"（`C:\Users\John Doe`、`/usr/local/bin tools`）
+//	   那一条的碎片被压掉，**同串的其它路径照常入表**。
+//
+// # ③的口径（p2-A 回归修复后的收窄版）
+//
+// 压掉的**只是那条带空格路径的碎片**（`C:\Users\John`——伪造它能核验通过 = 假阳性：
+// 证据里根本没有那个目录，它只是路径被空白切碎了）。
+//
+// 触发条件收窄到**根路径**左片段（盘符 `C:\` / 前导 `/`）：
+//
+//   - `C:\Users\John Doe` → 命中（`C:` 盘符 + `\Users\John` 已经是完整的目录前缀，
+//     后面的空格只能在路径段内部）→ 碎片 `C:\Users\John` 压掉；
+//   - `updated core/storage and committed` → **不命中**（左片段 `core/storage` 是相对
+//     路径，"路径内部空格"与"词边界"分不出来）→ `core/storage` 照常入表；
+//   - `C:\Users\John Doe core/store.go` → 只压掉 `C:\Users\John` 与 `Doe`，
+//     `core/store.go` **照常入表**（它左边那处空白的左片段不是根路径）。
+//
+// 为什么不能整串抑制（上一版的回归）：整串谓词会**连坐**——串里任一空白"像路径内部"
+// 就整串只留整串，于是散文里的真路径（`core/storage`）与同串的另一条路径
+// （`core/store.go`）全核不过（合法引用大面积假阴性）。
 func pathTokensOf(s string) []string {
 	if s == "" {
 		return nil
@@ -524,19 +541,33 @@ func pathTokensOf(s string) []string {
 	if looksLikePath(s) {
 		out = append(out, s)
 	}
-	if isSpacePathShaped(s) {
-		return out // 整串已入表：空白分片是它的片段，不入表（③）
+	spans := spaceSpans(s)
+	suppressed := spacedPathSpans(s, spans)
+	for i, sp := range spans {
+		if suppressed[i] {
+			continue // 这段是"含空格根路径"的碎片 → 不入表（③）
+		}
+		for _, tok := range tokensOf(s[sp.start:sp.end]) {
+			if looksLikePath(tok) {
+				out = append(out, tok)
+			}
+		}
 	}
+	return out
+}
+
+// tokensOf 把一段非空白文本按 token 边界（pathTokenDelims）切成候选 token。
+//
+// 与空白切分（spaceSpans）配合：token 不会跨空白——空白本身也是 token 边界字符。
+func tokensOf(s string) []string {
+	var out []string
 	start := -1
 	flush := func(end int) {
 		if start < 0 {
 			return
 		}
-		tok := s[start:end]
+		out = append(out, s[start:end])
 		start = -1
-		if looksLikePath(tok) {
-			out = append(out, tok)
-		}
 	}
 	for i := 0; i < len(s); i++ {
 		if strings.IndexByte(pathTokenDelims, s[i]) >= 0 {
@@ -551,22 +582,129 @@ func pathTokensOf(s string) []string {
 	return out
 }
 
-// isSpacePathShaped 报告这段文本是不是"一条含空格的路径"：含空白，且**每个**空白分片
-// 都像路径（空格在路径的某一段里，而不是分开两段话）。
-func isSpacePathShaped(s string) bool {
-	if !strings.ContainsAny(s, " \t\r\n\v\f") {
+// spacedPathSpans 算出**该被压掉的分片**（空白切出的片段）下标集合。
+//
+// 一处空白是"含空格的根路径的内部空格"，当且仅当：
+//
+//	① 空白**左侧**的分片是**根路径**（盘符 `C:\…` 或前导 `/`）；
+//	② 空白两侧紧邻的字节都是路径字符（字母/数字/._-）——不是词边界。
+//
+// 命中时，**这一处空白两侧的分片**都压掉：左侧是根路径被截断的前缀
+// （`C:\Users\John`），右侧是同一条路径的续段（`Doe\proj\a.txt`）。
+// **其它分片不受牵连**（同串的另一条路径照常入表——p2-A 回归修复的核心）。
+func spacedPathSpans(s string, spans []span) map[int]bool {
+	out := map[int]bool{}
+	for i := 1; i < len(spans); i++ {
+		left, right := spans[i-1], spans[i]
+		if !isRootPathFragment(s[left.start:left.end]) {
+			continue // 左侧不是根路径 → 那是词边界（散文），不是路径里的空格
+		}
+		if hasFileExtSuffix(s[left.start:left.end]) {
+			// 左侧根路径**已带文件扩展名**（`C:\Users\John\report.doc`）→ 路径已完整，
+			// 空白是词边界而非路径内部空格（p3-G）：不压片，该路径照常入表。
+			continue
+		}
+		if left.end-1 < 0 || right.start >= len(s) {
+			continue
+		}
+		if !isPathByte(s[left.end-1]) || !isPathByte(s[right.start]) {
+			continue // 空白两侧不是路径字符 → 词边界
+		}
+		out[i-1] = true
+		out[i] = true
+	}
+	return out
+}
+
+// hasFileExtSuffix 报告分片末段是否以"文件扩展名"形状结尾（最后一个 '.' 之后是
+// 1–10 个 ASCII 字母数字，且 '.' 不在段首）。
+//
+// 用于 spacedPathSpans 的例外：根路径带扩展名时通常已经完整（`report.doc`），
+// 后面的空白是词边界。取舍（如实记账）：`C:\Users\John.Doe Smith` 这种"点段目录名 +
+// 空格"会被误判为完整路径，碎片 `C:\Users\John.Doe` 入表（假阳性窄面）——扩展名形态
+// 压倒空格歧义；不带扩展名的 `C:\Users\John Doe` 仍按带空格路径只认整串。
+func hasFileExtSuffix(seg string) bool {
+	if i := strings.LastIndexAny(seg, `/\`); i >= 0 {
+		seg = seg[i+1:]
+	}
+	dot := strings.LastIndexByte(seg, '.')
+	if dot <= 0 || dot == len(seg)-1 {
 		return false
 	}
-	pieces := strings.Fields(s)
-	if len(pieces) < 2 {
+	ext := seg[dot+1:]
+	if len(ext) > 10 {
 		return false
 	}
-	for _, p := range pieces {
-		if !looksLikePath(p) {
+	for i := 0; i < len(ext); i++ {
+		c := ext[i]
+		if !isASCIILetter(c) && (c < '0' || c > '9') {
 			return false
 		}
 	}
 	return true
+}
+
+// isRootPathFragment 报告这个分片是不是**根路径**（absolute root）：
+//
+//   - 盘符形态：`C:\…` / `C:/…`（盘符 + 分隔符开头）；
+//   - POSIX 前导 `/`（`/usr/local/bin`）。
+//
+// 为什么只认根路径：散文里的**相对**路径（`core/storage`、`src/a.go`）后面跟一个
+// ASCII 单词时，"空白落在路径内部"与"空白分隔两段话"**分不出来**——按"左片段像路径"
+// 判会把散文里的真路径整条压掉（p2-A 回归：合法引用大面积核不过）。
+// 根路径没有这种歧义：`C:\Users\John Doe` 只能是"一条带空格的路径"（`C:` 盘符 +
+// `\Users\John` 已经是一个完整的目录前缀，后面的空格在路径段内部）。
+func isRootPathFragment(s string) bool {
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "/") {
+		return true // POSIX 绝对路径
+	}
+	// 盘符形态：C:\… / C:/…（盘符 + 分隔符）。
+	return len(s) >= 3 && isDriveLetter(s[0]) && s[1] == ':' && (s[2] == '\\' || s[2] == '/')
+}
+
+// span 是字符串里一段非空白文本的起止位置（左闭右开）。
+type span struct{ start, end int }
+
+// spaceSpans 按 ASCII 空白把 s 切成若干非空白片段（记起止位置）。
+func spaceSpans(s string) []span {
+	var out []span
+	start := -1
+	for i := 0; i < len(s); i++ {
+		if isSpaceByte(s[i]) {
+			if start >= 0 {
+				out = append(out, span{start, i})
+				start = -1
+			}
+			continue
+		}
+		if start < 0 {
+			start = i
+		}
+	}
+	if start >= 0 {
+		out = append(out, span{start, len(s)})
+	}
+	return out
+}
+
+// isSpaceByte 报告这个字节是不是空白（ASCII 口径：路径里的空白形态就这几种）。
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f'
+}
+
+// isPathByte 报告这个字节是不是路径里的"普通字符"（字母 / 数字 / 下划线 / 连字符 / 点）。
+//
+// 用途：判"空白是不是落在路径内部"——两侧都是路径字符才算路径里的空格。
+func isPathByte(c byte) bool {
+	return isASCIILetter(c) || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'
+}
+
+// isASCIILetter 报告这个字节是不是 ASCII 字母（路径字符判定用；中文等非 ASCII 一律不算）。
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 // normalizePathText 规范化用于比对的文本（S13 口径的**纯变换**部分：统一分隔符 + 小写）。

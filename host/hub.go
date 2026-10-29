@@ -264,6 +264,12 @@ func New(cfg Config) (*Hub, error) {
 			hubLog.Warn("host: 取进程工作目录失败，hub 级默认 repo gate 不可用", "err", werr.Error())
 		}
 	}
+	// K9 告警事件流（v2-S5 清账②）：hub 级事件的伪归属按**规范化后**的库路径确定性派生
+	// （跨重启稳定；不是 agent session，不进在线表——在线表按 hub.* 事件族**整族**过滤，
+	// 见 host/projection.go 的 rows：派生口径变了也照样挡得住）。
+	alertSink := newHubAlertSink(st, cfg.DBPath)
+	proj := newProjection(st)
+
 	h := &Hub{
 		cfg:          cfg,
 		store:        st,
@@ -273,7 +279,7 @@ func New(cfg Config) (*Hub, error) {
 		engine:       eng,
 		provider:     prov,
 		approver:     ap,
-		proj:         newProjection(st),
+		proj:         proj,
 		disc:         disc,
 		discFeed:     discFeed,
 		cwd:          cwd,
@@ -317,12 +323,13 @@ func New(cfg Config) (*Hub, error) {
 	}()
 
 	// 后台监控（K9）：hub 级 CPU/内存周期采样 + 超阈值告警。用独立 ctx（Close 时取消）。
+	// 告警走三个出口：slog + 内存环/api/monitor + **事件流**（v2-S5 清账②）。
 	h.monitor = NewMonitor(monitorConfig{
 		CPUPercent:  cfg.MonitorCPUPercent,
 		MemMB:       cfg.MonitorMemMB,
 		Goroutines:  cfg.MonitorGoroutines,
 		IntervalSec: cfg.MonitorIntervalSec,
-	}, nil) // nil src = 真实采样
+	}, nil, WithAlertSink(alertSink)) // nil src = 真实采样
 	h.monCtx, h.monCancel = context.WithCancel(context.Background())
 	h.monitor.Start(h.monCtx)
 
@@ -335,6 +342,16 @@ func New(cfg Config) (*Hub, error) {
 	if werr != nil {
 		_ = h.Close()
 		return nil, fmt.Errorf("host: 建 worktree 管理器: %w", werr)
+	}
+	// 登记表**启动时重建**（v2-S5 清账③）：登记表此前只是进程内存，hub 重启后
+	// "谁建了哪个 worktree"全丢，而磁盘上的 worktree 还在（git 元数据跨进程存活）。
+	// 现在按 `git worktree list` 从磁盘重建（幂等合并：已登记的同名条目不覆盖）。
+	if n, rerr := wm.Rebuild(context.Background()); rerr != nil {
+		// 重建失败**不阻断启动**：worktree 是并行任务的便利设施，不是 loop 的依赖
+		// （宁可少登记几个，也别让 hub 起不来）。告警说清"登记表可能不全"。
+		hubLog.Warn("host: worktree 登记表重建失败（可稍后手动重建）", "err", rerr.Error())
+	} else if n > 0 {
+		hubLog.Info("host: worktree 登记表已从磁盘重建", "count", n, "root", wm.Root())
 	}
 	h.worktrees = wm
 

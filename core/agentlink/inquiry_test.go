@@ -607,3 +607,264 @@ func TestPathRefWithSpacesVerifiesWholePathOnly(t *testing.T) {
 		t.Fatalf("路径 token 应核验通过: %+v", res.RefChecks)
 	}
 }
+
+// TestPathRefProseWithSeveralSpaceSeparatedPaths（v2-S5 清账⑥）：散文里用**空白并列**的
+// 几个路径必须各自可核验（旧口径把它们当成"一条带空格的路径"，只入整串 → 两条真实路径
+// 全核不过 = 假阴性；而模型是如实引用证据里的路径的）。
+func TestPathRefProseWithSeveralSpaceSeparatedPaths(t *testing.T) {
+	w := newWorld(t)
+	const (
+		a = "core/store.go"
+		b = "core/graph/graph.go"
+	)
+	// 证据：一条 summary 正文里空白并列两个路径（无标点，模型很常这么写）。
+	w.touch(w.childA1, a+" "+b)
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "改完了", []string{last2ref(last)})
+
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{a, b},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	for i, want := range []string{a, b} {
+		c := res.RefChecks[i]
+		if !c.OK {
+			t.Fatalf("散文里并列的路径 %q 应核验通过（假阴性）: %+v", want, c)
+		}
+	}
+}
+
+// TestPathRefSingleSpacedPathStillWholeOnly：收窄⑥**不能**放松假阳性防线——
+// 真正"一条带空格的路径"仍然只认整串，碎片必须被拒（否则伪造 ref 能蒙过去）。
+func TestPathRefSingleSpacedPathStillWholeOnly(t *testing.T) {
+	w := newWorld(t)
+	const spaced = "C:\\Users\\John Doe\\proj\\a.txt"
+	w.touch(w.childA1, spaced)
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "读完了", []string{last2ref(last)})
+
+	// 整串核得过。
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{spaced},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(整串): %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("含空格的完整路径应核验通过: %+v", res.RefChecks)
+	}
+	// 碎片必须被拒（假阳性防线不收窄）。
+	res, err = w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"C:\\Users\\John", "Doe\\proj\\a.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(碎片): %v", err)
+	}
+	for i, c := range res.RefChecks {
+		if c.OK {
+			t.Fatalf("碎片 %q 不该核验通过（假阳性）: %+v", []string{"C:\\Users\\John", "Doe\\proj\\a.txt"}[i], c)
+		}
+	}
+}
+
+// last2ref 把 seq 折成 `e:<seq>` 引用（测试辅助）。
+func last2ref(seq int64) string { return fmt.Sprintf("e:%d", seq) }
+
+// TestPathRefSpacedUserDirFragmentRejected（p2-5 回归）：`C:\Users\John Doe` 这种
+// "目录名带空格"的路径，其**空白分片**（`C:\Users\John`）不许进证据表——
+// 否则伪造的 ref `C:\Users\John` 能核验通过（假阳性：证据里根本没有那个目录，
+// 只是路径被空白切碎了；K24 口径：宁可误报不可放过）。
+//
+// 旧口径要求"每个空白分片都像路径"（`Doe` 不像 → 整串被判成"散文里并列的路径"）
+// → 分片入表 → 伪造 ref 蒙过去。
+func TestPathRefSpacedUserDirFragmentRejected(t *testing.T) {
+	w := newWorld(t)
+	const spaced = "C:\\Users\\John Doe"
+	w.touch(w.childA1, spaced)
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "读完了", []string{last2ref(last)})
+
+	// 整串核得过（它就是证据里的那条路径）。
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{spaced},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(整串): %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("整串应核验通过: %+v", res.RefChecks)
+	}
+	// 空白切出的碎片必须被拒（假阳性防线）。
+	forged := []string{"C:\\Users\\John", "Doe"}
+	res, err = w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: forged,
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(碎片): %v", err)
+	}
+	for i, c := range res.RefChecks {
+		if c.OK {
+			t.Fatalf("空白切出的碎片 %q 不该核验通过（假阳性）: %+v", forged[i], c)
+		}
+		if c.Detail == "" {
+			t.Fatalf("失败的 ref %q 应给出原因", forged[i])
+		}
+	}
+}
+
+// TestPathRefProsePathStillVerifies（p2-5 的反面）：收窄假阳性**不能**把真引用一起收掉——
+// 散文里提到的路径（"读完了 src/a.go"）仍要能核验。
+//
+// 判据：空白左侧的分片不是路径分片（这里是中文词"读完了"）→ 那是**词边界**，
+// 碎片照常入表 → 那条路径仍可核验。
+func TestPathRefProsePathStillVerifies(t *testing.T) {
+	w := newWorld(t)
+	// 证据只在 summary 正文里（没有独立的参数值兜底）。
+	w.appendCompleted(w.childA1, "读完了 src/a.go，三段结构", nil)
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"src/a.go"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("散文里提到的路径应核验通过（假阴性）: %+v", res.RefChecks)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// p2-A 回归：碎片抑制**按边界** + 触发只认**根路径**（上一版整串抑制 → 合法引用大面积核不过）
+// ---------------------------------------------------------------------------
+
+// TestPathRefAsciiProseExtensionlessPath（p2-A 回归①）：ASCII 散文里的**无扩展名**路径
+// 必须能核验（`updated core/storage and committed` → 引用 `core/storage` 要过）。
+//
+// 上一版口径把"左片段像路径 + 空白两侧是路径字符"判成"路径内部空格"→ 整串只留整串
+// → `core/storage` 核不过（合法引用假阴性）。收窄后：左片段是**相对**路径 → 不触发。
+func TestPathRefAsciiProseExtensionlessPath(t *testing.T) {
+	w := newWorld(t)
+	w.touch(w.childA1, "updated core/storage and committed")
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "done", []string{last2ref(last)})
+
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"core/storage"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("散文里的无扩展名路径应核验通过（p2-A 假阴性）: %+v", res.RefChecks)
+	}
+}
+
+// TestPathRefSeveralPathsInOneString（p2-A 回归②）：**同串多路径**时，
+// 带空格的根路径只压掉**它自己**的碎片，同串的其它路径照常可核验
+// （`C:\Users\John Doe core/store.go` → 引用 `core/store.go` 要过、
+// 引用 `C:\Users\John` 必须被拒）。
+//
+// 上一版是**整串抑制**（串里任一空白像路径内部 → 整串只留整串）→ `core/store.go` 连坐
+// 核不过（合法引用假阴性）；本版按边界抑制 → 各归各的。
+func TestPathRefSeveralPathsInOneString(t *testing.T) {
+	w := newWorld(t)
+	const evidence = "C:\\Users\\John Doe core/store.go"
+	w.touch(w.childA1, evidence)
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "done", []string{last2ref(last)})
+
+	// ① 同串的另一条路径必须能核验。
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"core/store.go"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("同串的其它路径应核验通过（p2-A 假阴性）: %+v", res.RefChecks)
+	}
+
+	// ② 带空格根路径的碎片仍必须被拒（假阳性防线不能松）。
+	res, err = w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"C:\\Users\\John"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(碎片): %v", err)
+	}
+	if len(res.RefChecks) != 1 || res.RefChecks[0].OK {
+		t.Fatalf("带空格根路径的碎片不该核验通过（假阳性）: %+v", res.RefChecks)
+	}
+	if res.RefChecks[0].Detail == "" {
+		t.Fatal("失败的 ref 应给出原因（fail-close 也要让人知道卡在哪）")
+	}
+}
+
+// TestPathRefExtensionPathFollowedByAsciiWord（p2-A 回归③）：**扩展名**路径后面跟一个
+// ASCII 词（`src/a.go updated`）时，那条路径必须能核验。
+//
+// 收窄后的口径：只有根路径（盘符/前导 /）的左片段才触发"内部空格"判定，
+// 相对路径一律不触发 → 路径照常入表。
+func TestPathRefExtensionPathFollowedByAsciiWord(t *testing.T) {
+	w := newWorld(t)
+	w.touch(w.childA1, "src/a.go updated")
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "done", []string{last2ref(last)})
+
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"src/a.go"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("扩展名路径应核验通过（p2-A 假阴性）: %+v", res.RefChecks)
+	}
+}
+
+// TestPathRefRootPathWithExtFollowedByAsciiWord（p3-G）：**根路径带扩展名**后面跟 ASCII 词
+// （`C:\Users\John\report.doc final`）时，那条路径必须能核验——路径已完整，空白是词边界。
+//
+// p2-A 收窄后只有根路径触发"内部空格"判定；若不看扩展名，该形态会被误判成
+// "带空格的路径"整条压掉（`C:\Users\John\report.doc` 核不过 = 假阴性）。
+// 反面：无扩展名的前缀碎片仍必须被拒（假阳性防线不松）。
+func TestPathRefRootPathWithExtFollowedByAsciiWord(t *testing.T) {
+	w := newWorld(t)
+	w.touch(w.childA1, "C:\\Users\\John\\report.doc final")
+	last := w.sessionLastSeq(w.sidA)
+	w.appendCompleted(w.childA1, "done", []string{last2ref(last)})
+
+	// ① 带扩展名的根路径必须能核验（p3-G 假阴性）。
+	res, err := w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"C:\\Users\\John\\report.doc"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry: %v", err)
+	}
+	if len(res.RefChecks) != 1 || !res.RefChecks[0].OK {
+		t.Fatalf("带扩展名的根路径应核验通过（p3-G 假阴性）: %+v", res.RefChecks)
+	}
+
+	// ② 前缀碎片仍必须被拒（假阳性防线）。
+	res, err = w.link.Inquiry(context.Background(), agentlink.InquiryRequest{
+		Caller:    agentlink.Identity{SessionID: w.sidA, AgentID: w.amA},
+		SessionID: w.sidA, Refs: []string{"C:\\Users\\John"},
+	})
+	if err != nil {
+		t.Fatalf("Inquiry(碎片): %v", err)
+	}
+	if len(res.RefChecks) != 1 || res.RefChecks[0].OK {
+		t.Fatalf("前缀碎片不该核验通过（假阳性）: %+v", res.RefChecks)
+	}
+}

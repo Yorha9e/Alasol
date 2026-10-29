@@ -13,6 +13,17 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// 覆盖范围与**已知边界**（v2-S5 挂账④，如实记账）：
+//
+//   - 已覆盖：model 层的全部交互语义（切面 / 输入累积 / 提交跑 prompt / 审批渲染与决定 /
+//     fail-close / 三面渲染非空）——按键经 tea.KeyMsg 直接喂给 model，不走终端。
+//   - **未覆盖**：真 TTY 上的端到端交互（pty 里跑 bubbletea、发转义序列、截图比对）。
+//     阻塞原因：bubbletea 的 Program 要一个终端（自带 renderer 走 termenv/raw mode），
+//     而 Go 侧在 Windows 上没有稳定的 pty 库（conpty 要 cgo/系统调用），CI 三平台也不齐；
+//     硬造一个"假 TTY"测到的是 bubbletea 自己，不是我们的逻辑。**因此交互自动化测试留挂**，
+//     补法应是：Linux/macOS 上开 pty 跑最小冒烟（Windows 跳过），或改用 bubbletea 的
+//     `tea.WithInput(nil)` 无输入模式做渲染回归。当前 model 层测试已覆盖语义面。
+
 // stubProvider 是不调工具的脚本 provider（TUI 对话测试用）。
 type stubProvider struct{}
 

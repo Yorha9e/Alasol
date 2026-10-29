@@ -405,3 +405,15 @@ type ConflictPredictedPayload struct {
 	// 逐分支的撞车预判明细（**逐条看 risks[].available**——它才是每条分支自己的覆盖度结论）。
 	Risks []ConflictRisk `json:"risks,omitempty"`
 }
+
+// hub.alert —— K9 hub 级资源监控的一条超阈值告警（v2-S5 清账②：告警此前只进 slog 日志，事件流里看不到、崩溃后不可复盘 → 补成 durable 事实事件）。durable=true 进事件流（F7 只增不删不改义）：可回放、可被 UI/审计/成本面板消费，不再只活在进程日志里。**envelope 归属伪 session**：hub 级事件不属于任何 agent session，而 envelope 强制要求 session_id/agent_id（ULID）→ 由宿主按**事件库路径确定性派生**一对伪 id（跨重启稳定，同一库的告警聚成一条可查的流；不是 agent session，不参与在线表/gate 语义）。payload **只记结论**（指标名 + 实测值 + 阈值 + 人读正文），不含任何会话内容/凭据——与 host.Monitor.Alert 的字段一一对应。
+type HubAlertPayload struct {
+	// 指标名（开放字符串；当前实现取 cpu / mem / goroutines 三档，与 host 监控阈值同口径）。
+	Metric string `json:"metric"`
+	// 触发时的实测值（cpu 为单核等价百分比可 >100；mem 为字节；goroutines 为个数）。
+	Value float64 `json:"value"`
+	// 触发时的生效阈值（与 value 同单位；0 = 实现未提供）。
+	Threshold float64 `json:"threshold"`
+	// 人读的告警正文（含指标名与两个数值；可直接进日志/UI）。
+	Message string `json:"message"`
+}

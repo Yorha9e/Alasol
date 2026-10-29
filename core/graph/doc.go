@@ -89,4 +89,13 @@
 // 成对定义，事务继续复用这里的 Tx；blob 天然接得上 Event.binary_ref（D4）、向量接
 // Retriever.retrieve（G2d）。本包**不预留任何图专用的旁路接口**——免得"可组合"
 // 退化成"一张大接口"。
+//
+// # v2-S5 收口后的族全集
+//
+// 存储接口全集已收口在 `core/storage`（v2-S5）：事件日志 / 图 / 文档 / blob / 向量五族，
+// 各自多个实现、可组合（`storage.Set`）。本包的三个接口（Graph / GraphProjection / Tx）
+// 是其中**图族**的定义处，并被 core/storage 以别名出口（`storage.Graph` 等）——
+// **定义处不搬家**（F7：只增不删、不改义；别名让"一族"有个统一入口，不制造第二份定义）。
+// 换实现零改动酸测试：core/storage/compose_test.go（各族接口面组合）+ host/storage_acid_test.go
+// （SQLite 图引擎 ↔ 内存图引擎，消费者零改动）。
 package graph

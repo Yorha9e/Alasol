@@ -37,6 +37,11 @@ type sessionState struct {
 	EventCount int64
 	LastKind   string
 	UpdatedAt  string
+	// hubEvents / agentEvents：按**事件族**记账（hub.* = hub 级基础设施事件族）。
+	// 两者相除即知"这个 session 是不是 hub 伪 session"（只有 hub 事件、没有 agent 事件
+	// → 伪 session → 不进在线表；见 rows）。
+	hubEvents   int
+	agentEvents int
 }
 
 // projection 是 host 的**内存投影**：session 目录 + 每个 session 最新的
@@ -120,6 +125,12 @@ func (p *projection) apply(ev *contracts.Event) {
 		}
 	}
 	st.EventCount++
+	// 按事件族记账：hub.* = hub 级基础设施事件（伪 session 的判定依据，见 rows）。
+	if isHubEventKind(ev.Kind) {
+		st.hubEvents++
+	} else {
+		st.agentEvents++
+	}
 	if ev.Kind == loop.KindContextAssembled && len(ev.Payload) > 0 {
 		// 最新一条覆盖（LWW，按 seq 顺序天然成立：扫描按 seq 升序）。
 		p.contexts[sid] = append(json.RawMessage(nil), ev.Payload...)
@@ -133,6 +144,11 @@ func (p *projection) rows(watermark int64, limit int) []SessionRow {
 	defer p.mu.Unlock()
 	out := make([]SessionRow, 0, len(p.sessions))
 	for sid, st := range p.sessions {
+		if st.hubEvents > 0 && st.agentEvents == 0 {
+			// hub 伪 session（只承载 hub.* 基础设施事件）：在线表只列 agent session。
+			// 判据是**事件族**而不是某个 id——派生口径变了也照样挡得住（p2-2）。
+			continue
+		}
 		out = append(out, SessionRow{
 			SessionID:  string(sid),
 			FirstSeq:   st.FirstSeq,

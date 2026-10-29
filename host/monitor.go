@@ -11,11 +11,19 @@ import (
 
 // 本文件实现 K9 的 **hub 级 CPU/内存监控告警**：对冲 goroutine 隔离的代价（OS 级崩溃
 // 带走整个 hub / 死循环 goroutine 抢占 / 内存泄漏拖垮 hub）。周期采样 → 超阈值记告警
-// （slog 留痕 + 内存有界环 + /api/monitor 可查）。
+// （slog 留痕 + 内存有界环 + /api/monitor 可查 + **事件流入流**，v2-S5 清账②）。
 //
 // 可测性设计：采样经 **SampleSource 接口**注入——测试用假源直接返回超阈值样本触发告警，
 // **不真烧 CPU**（硬验收要求）。真实采样（内存/goroutine/CPU）在 defaultSampleSource，
 // CPU 的累积计时按平台分文件（linux /proc、windows GetProcessTimes、其它尽力而为）。
+//
+// # 告警的三个出口（v2-S5 清账②）
+//
+//	① slog 留痕（原有，进程日志）；
+//	② 内存有界环 + /api/monitor（原有，活状态）；
+//	③ **durable 事件 hub.alert**（本刀新增）：告警是事实，进事件流才能回放/审计/被 UI 消费
+//	   ——此前只进日志，hub 一重启什么都没了。出口经 AlertSink 接口注入（宿主接 store，
+//	   测试接假 sink），**不传 = 与之前完全等价**（老调用方零改动）。
 
 // monitorLog 是监控告警的出口（可被宿主接管）。
 var monitorLog = slog.Default()
@@ -33,7 +41,24 @@ const (
 	defaultMonitorIntervalSec = 5
 	// maxAlerts 告警环大小（有界，防内存泄漏反被监控拖垮）。
 	maxAlerts = 50
+	// alertEventSuppressSec 是**同一指标**的告警入事件流的抑制窗口（秒）。
+	//
+	// 为什么需要：监控是周期的（默认 5s），一个持续 runaway 的指标会**每个周期**
+	// 记一条告警——全进事件流就是 720 条/小时/指标，把回放和订阅者全拖死
+	// （F12 同款理由：上限是正确性不是优化）。日志与 /api/monitor 仍每个周期都记
+	// （活状态该全）。
+	//
+	// **口径如实说**（F2）：这是**限流**，**不是**"状态切换级"——同一指标在窗口内
+	// **最多入流一条**，窗口过后再来一条又放行（哪怕指标一直没回落）。
+	// 也就是：持续 runaway 的指标 = **每 60s 一条**事件（不是"一次 runaway 一条"）。
+	// 想要"一次 runaway 一条"得改成按**状态切换**记账（进/出阈值各记一条）——
+	// 那是行为变更，本刀不做（如实记账在此）。
+	alertEventSuppressSec = 60
 )
+
+// KindHubAlert 是 K9 告警事件的 kind（durable；契约见 contracts/schema/event.json 的
+// HubAlertPayload 与 INVENTORY §2）。
+const KindHubAlert = "hub.alert"
 
 // Sample 是 hub 的一次资源采样快照。
 type Sample struct {
@@ -86,18 +111,50 @@ func (c monitorConfig) withDefaults() monitorConfig {
 	return c
 }
 
+// AlertSink 是告警的**事件流出流**（K9 → durable 事件，v2-S5 清账②）。
+//
+// 宿主接事件库（host/alert_event.go 的 hubAlertSink），测试接假 sink（不碰真库）。
+// 不接 = 与 v1 等价（告警只进日志 + 内存环）。
+type AlertSink interface {
+	// RecordAlert 把一条告警落进事件流（durable 事件 hub.alert）。
+	//
+	// 失败**不得**影响监控本身：调用方只记一条告警日志（告警环与 /api/monitor 仍有效），
+	// 不重试、不panic——监控是兜底机制，它自己不能再变成故障源。
+	RecordAlert(ctx context.Context, a Alert) error
+}
+
+// MonitorOption 配置 Monitor（v2-S5 起引入；老调用方不传选项 = 行为与之前完全一致）。
+type MonitorOption func(*monitorOptions)
+
+// monitorOptions 是 Monitor 的可选项（零值 = 全关）。
+type monitorOptions struct {
+	sink AlertSink
+}
+
+// WithAlertSink 把告警接进事件流（K9，v2-S5 清账②）。
+//
+// s 为 nil 或**不传**这个选项 = 不落事件（与 v1 等价）。s 非 nil 时：
+//   - 超阈值仍照旧记 slog + 内存环 + /api/monitor（三个出口都保留）；
+//   - 额外落一条 durable 事件 hub.alert（同一指标受 alertEventSuppressSec 抑制窗口约束）。
+func WithAlertSink(s AlertSink) MonitorOption {
+	return func(o *monitorOptions) { o.sink = s }
+}
+
 // Monitor 周期采样并在超阈值时记告警（K9）。
 //
-// 并发：mu 保护 latest 与 alerts；采样只在 Monitor 自己的 goroutine 里跑（Start 起、
-// Stop 停），Latest/Alerts 可被任意 goroutine 读。
+// 并发：mu 保护 latest / alerts / lastEventAt / ctx；采样只在 Monitor 自己的 goroutine 里跑
+// （Start 起、Stop 停），Latest/Alerts 可被任意 goroutine 读。
 type Monitor struct {
 	src      SampleSource
 	cfg      monitorConfig
 	memLimit uint64 // MemMB → bytes
+	sink     AlertSink
 
-	mu     sync.Mutex
-	latest Sample
-	alerts []Alert
+	mu          sync.Mutex
+	latest      Sample
+	alerts      []Alert
+	lastEventAt map[string]time.Time // 指标 → 最近一次入事件流的时刻（抑制窗口）
+	ctx         context.Context      // Start 时记下（事件写入的生命周期；Stop 后取消）
 
 	running bool
 	stop    chan struct{}
@@ -105,15 +162,23 @@ type Monitor struct {
 }
 
 // NewMonitor 建监控器（应用默认阈值）。src 为 nil → 用 defaultSampleSource（真实采样）。
-func NewMonitor(cfg monitorConfig, src SampleSource) *Monitor {
+// opts 是可选项（目前只有告警事件流出口 WithAlertSink）。
+func NewMonitor(cfg monitorConfig, src SampleSource, opts ...MonitorOption) *Monitor {
 	cfg = cfg.withDefaults()
 	if src == nil {
 		src = &defaultSampleSource{}
+	}
+	var o monitorOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
 	}
 	return &Monitor{
 		src:      src,
 		cfg:      cfg,
 		memLimit: uint64(cfg.MemMB * 1024 * 1024),
+		sink:     o.sink,
 	}
 }
 
@@ -129,6 +194,8 @@ func (m *Monitor) Start(ctx context.Context) {
 	m.stop = make(chan struct{})
 	m.done = make(chan struct{})
 	stop, done := m.stop, m.done
+	// 记下生命周期 ctx：告警事件流跟着它走（Stop/ctx 取消后不再写库）。
+	m.ctx = ctx
 	m.mu.Unlock()
 
 	interval := time.Duration(m.cfg.IntervalSec) * time.Second
@@ -196,8 +263,69 @@ func (m *Monitor) check(s Sample) {
 	}
 	for _, b := range breaches {
 		msg := fmt.Sprintf("hub %s 超阈值: %.1f > %.1f", b.metric, b.value, b.threshold)
-		m.record(Alert{At: s.At, Metric: b.metric, Value: b.value, Threshold: b.threshold, Message: msg})
+		a := Alert{At: s.At, Metric: b.metric, Value: b.value, Threshold: b.threshold, Message: msg}
+		m.record(a)
 		monitorLog.Warn("K9 hub 监控告警", "metric", b.metric, "value", b.value, "threshold", b.threshold)
+		// 事件流出流（v2-S5 清账②）：抑制窗口外的告警才入流。
+		if m.claimEventSlot(b.metric, s.At) {
+			m.emit(a)
+		}
+	}
+}
+
+// claimEventSlot 占用某指标的事件流入流槽位（抑制窗口内只放行一次）。
+//
+// 返回 true = 本次该入流。**判定与占位同一把锁**：否则并发采样会重复放行
+// （监控只在单 goroutine 里跑，但 Start/Stop 与测试并发读仍可能碰到）。
+func (m *Monitor) claimEventSlot(metric string, at time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sink == nil {
+		return false
+	}
+	if m.lastEventAt == nil {
+		m.lastEventAt = map[string]time.Time{}
+	}
+	if last, ok := m.lastEventAt[metric]; ok && at.Sub(last) < alertEventSuppressSec*time.Second {
+		return false
+	}
+	m.lastEventAt[metric] = at
+	return true
+}
+
+// emit 把一条告警写进事件流（锁外调用：写库可能阻塞，不能占着 mu）。
+//
+// 失败只记日志——**监控自己不能变成故障源**（告警环与 /api/monitor 仍有效）。
+//
+// **失败要释放抑制槽位**（F1）：槽位是"占位"（窗口内只放行一次），写库失败却占着
+// 不放 = 这条告警在窗口内**再也不会重试**（事件流里就永远缺这条事实，而日志里
+// 又写着"稍后会重试"）。释放后下个周期会重新尝试（抑制窗口也随之重新计时）。
+func (m *Monitor) emit(a Alert) {
+	m.mu.Lock()
+	sink, ctx := m.sink, m.ctx
+	m.mu.Unlock()
+	if sink == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := sink.RecordAlert(ctx, a); err != nil {
+		m.releaseEventSlot(a.Metric, a.At)
+		monitorLog.Warn("K9 告警入事件流失败（告警环仍有效；已释放抑制槽位，下个周期重试）",
+			"metric", a.Metric, "err", err.Error())
+	}
+}
+
+// releaseEventSlot 释放某指标的抑制槽位（写库失败时调用）。
+//
+// 只释放**自己占的那一次**（占位时刻相同才释放）——并发下别的采样已经占了新槽位时，
+// 不能把它的抑制也一起掀掉（那会让限流形同虚设）。
+func (m *Monitor) releaseEventSlot(metric string, at time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if last, ok := m.lastEventAt[metric]; ok && last.Equal(at) {
+		delete(m.lastEventAt, metric)
 	}
 }
 

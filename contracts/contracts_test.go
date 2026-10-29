@@ -332,6 +332,24 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Collisions != int64(confirmed) {
 				t.Errorf("line %d: conflict.predicted collisions = %d，期望确认命中数 %d", lineNo, p.Collisions, confirmed)
 			}
+		case "hub.alert":
+			var p HubAlertPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into HubAlertPayload: %v", lineNo, err)
+				break
+			}
+			// K9 告警事件（v2-S5 清账②）：指标名/实测值/阈值/人读正文四要素齐全才可复盘。
+			if p.Metric == "" {
+				t.Errorf("line %d: hub.alert metric 不能为空", lineNo)
+			}
+			if p.Threshold <= 0 {
+				t.Errorf("line %d: hub.alert threshold 应 >0（0 = 实现未提供阈值，不该出现在事实事件里）", lineNo)
+			}
+			if p.Message == "" {
+				t.Errorf("line %d: hub.alert message 不能为空（人读正文）", lineNo)
+			}
+			// 伪归属的三个 id 的**框架形态**由通用的 checkULID 断言（每行都查：
+			// 26 字符 Crockford + 首字符 '0'..'7'——p3-E）。
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -356,7 +374,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
-		"review.recorded", "conflict.predicted",
+		"review.recorded", "conflict.predicted", "hub.alert",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)
@@ -392,11 +410,26 @@ func checkAgentLinkTarget(t *testing.T, line int, target AgentLinkTarget) {
 	}
 }
 
-// checkULID asserts that an id field is a well-formed ULID.
+// checkULID asserts that an id field is a well-formed ULID **in the framework's
+// actual shape**.
+//
+// 两层口径：
+//   - 契约层（common.json#/$defs/Ulid）：26 字符 Crockford base32（ulidPattern）；
+//   - **框架实际形态**（p3-E）：首字符落在 '0'..'7'——128bit 编进 26×5=130bit，
+//     最高字符只用 3 个有效位，core.NewUlid / core.ShortHash 生成的 id 一律如此。
+//     首字符 >'7' 的串是**手写**出来的假 ULID：消费方按"框架发的 id"理解它，
+//     会读出错误的语义（时间戳前缀、随机位分布全都不对）。
+//
+// 样本里的 id 必须是框架**发出来**的形态——否则跨语言消费端拿到的样本就是"假数据"。
 func checkULID(t *testing.T, line int, field, value string) {
 	t.Helper()
 	if !ulidPattern.MatchString(value) {
 		t.Errorf("line %d: %s = %q is not a ULID", line, field, value)
+		return
+	}
+	if value[0] < '0' || value[0] > '7' {
+		t.Errorf("line %d: %s = %q 的首字符必须是 '0'..'7'（框架实际形态：128bit 编进 130bit，"+
+			"最高字符只用 3 个有效位）", line, field, value)
 	}
 }
 

@@ -8,8 +8,10 @@
 //	          [-api-key-env OPENAI_API_KEY] [-approval deny-all|always-allow|terminal] \
 //	          [-allow read,write,bash] [-db alasol.db] [-max-turns 20] [-system "..."]
 //
-//	alasol models [-base-url ...] [-api-key-env OPENAI_API_KEY]
+//	alasol models [-base-url ...] [-api-key-env OPENAI_API_KEY] [-config path]
 //	          → 列出端点支持的模型名（模型名是端点相关的，没有万能默认值）
+//	          → base_url / api_key 也读用户级 TOML 配置（H15：显式 flag > env > 文件，
+//	            与 run/serve/resume 同一条优先级）
 //
 //	alasol resume -session <id> [-db alasol.db] [-verify git|none] [-continue "<提示>"]
 //	          → 跑 X4 恢复流程（读 checkpoint → fold → 处置 in-flight → session.resumed），

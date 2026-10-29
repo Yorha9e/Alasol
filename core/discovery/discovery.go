@@ -118,6 +118,18 @@ func New() *Table {
 //
 // 载荷不可解析的已知 kind **跳过该 kind 的专属投影**（不中断、不影响其余事件），
 // 与 runtime/indexer 的坏载荷隔离同口径（D7 宽容哲学）。
+//
+// # hub.* 记录：无主、无 gate，**不参与可见性**
+//
+// `hub.*`（如 hub.alert，v2-S5 清账②）是 **hub 级**事件：envelope 里的 session_id /
+// agent_id 是宿主按库路径确定性派生的**伪 id**——它不对应任何真实 agent session。
+// 这里照样给它建一条记录（"最近活动"是事实：hub 确实在那一刻动过），但它：
+//   - **没有 gate**（不 join 任何 gate）→ 不进 gate 成员表、不进 /api/peers 的可见面；
+//   - **不是主 agent**（没有 agent.spawned / 主 agent 归属）→ 不参与 K11 可见性判定
+//     （VisiblePeers / selfVisibleAgents 都按 gate 与 agent 树算，它两边都不在）；
+//   - **不被 Activate**（宿主只激活真 session）→ 不进 presence（活状态）。
+//
+// 换句话说：发现表里那条记录只是"时间线痕迹"，**不是**一个可被查询/交流的会话。
 func (t *Table) Apply(ev *contracts.Event) {
 	if t == nil || ev == nil || !ev.Durable {
 		return

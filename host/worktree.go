@@ -16,6 +16,18 @@ import (
 // 执行（read/write/bash）仍跑在 hub 进程 cwd——把工具执行真正 chroot 进各 worktree 需要
 // 改 core/loop 的工具执行上下文，属更深改动（与 X1 冲突），留作后续（见汇报"缺口"）。
 //
+// **v2-S5 重新评估后仍然留挂（①）**，具体阻塞点（不是"懒得做"）：
+//   - 工具执行器在 host.New 里**一次性注册**（tools.NewRead(local.FS{}) / tools.NewWrite /
+//     tools.NewBash(execCap)）——一个 hub 只有一套 FS/Exec 能力面，没有 per-session 的；
+//   - core/loop 也没有 per-session 执行上下文：工具调用路径是 X1 的三段写路径
+//     （intent 落盘 → 执行 → result 落盘），在这里插"按 session 换 cwd/能力"要动
+//     toolcall 的执行段——**X1 红线明令本刀不碰**；
+//   - 折中做法（每个 session 复制一套执行器 + loop 传 cwd）要么改 core/loop，要么在 host
+//     里维护 N 套注册表并与 loop 的执行段对不齐（两处真相）。
+// 因此结论：**留挂**，正确做法是作为独立一刀（"per-session 执行上下文"）连 core/loop 一起改，
+// 并配 X1 三段事件的回归测试。当前的缓解：CreateSession 命中 Worktree 时打醒目告警 +
+// SessionSpec 文档写清边界（不让用户以为"绑了 worktree = 工具在 worktree 里跑"）。
+//
 // 因此 session 绑到 worktree（SessionSpec.Worktree）**只**影响自动 gate 的 repo_id 计算与
 // 工作区登记，**不**改变工具的工作目录：CreateSession 命中 Worktree 时会打一条醒目告警
 //（"⚠ 工具级隔离未启用…"，见 host/discovery.go 的 worktreeIsolationNotice），
