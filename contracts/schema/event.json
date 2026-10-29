@@ -33,7 +33,8 @@
         "context.compacted": "ContextCompactedPayload",
         "review.recorded": "ReviewRecordedPayload",
         "conflict.predicted": "ConflictPredictedPayload",
-        "hub.alert": "HubAlertPayload"
+        "hub.alert": "HubAlertPayload",
+        "btw.forked": "BtwForkedPayload"
       },
       "required": ["v", "id", "kind", "ts", "session_id", "agent_id", "durable"],
       "properties": {
@@ -761,6 +762,21 @@
         "message": {
           "type": "string",
           "description": "人读的告警正文（含指标名与两个数值；可直接进日志/UI）。"
+        }
+      }
+    },
+    "BtwForkedPayload": {
+      "type": "object",
+      "description": "btw.forked —— 一次 /btw 旁支 fork 的事实记录（K29：fork 只附带上下文，不复制 ledger/gate；主场景 = /btw 类旁支命令）。durable=true 进事件流（F7 只增不删不改义）：标记本 session 是一条从 source_session_id 分叉出的旁支执行线，可审计、可回放。**envelope 归属 fork（旁支）session**：session_id/agent_id = fork 的 id，与主 session 完全不同——主 session 的事件流因此零新增（/btw 结果不回灌主上下文，UX 拍板）。payload 只记来源与问题原文，**不含主 session 的对话内容**/凭据（问题原文本身是对话内容，故不能说\"不含任何对话内容\"）。**预埋从 /btw 生成全新 session 钩子（只埋点不实现）**：本事件 + 宿主回调即扩展点；把 fork 提成一流 session 需多方面微调（gate 归属/在线表可见性/agent 树/UI 呈现），v3-S2 不实现。",
+      "required": ["source_session_id", "question"],
+      "properties": {
+        "source_session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "发起 /btw 的主 session id（fork 的上下文来源；FoldConversation 同源）。"
+        },
+        "question": {
+          "type": "string",
+          "description": "用户的 /btw 问题原文（fork 的 user.prompt 同文；不含任何主 session 此前的对话内容——上下文经折叠历史喂给 loop，不复制进本 payload）。"
         }
       }
     }

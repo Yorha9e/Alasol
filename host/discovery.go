@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +95,18 @@ type discoveryFeed struct {
 
 	mu      sync.Mutex
 	scanSeq int64
+
+	// forks 是已知的 **/btw 旁支 fork session** 集合（v3-S2 K29）。
+	//
+	// 为什么 host 侧维护（core/discovery 不改，X1 纪律）：fork 标记目前只落在**投影**
+	// （在线表）里，发现表没有"这是一条旁支"的概念——两张表对同一个 session 的可见性
+	// 于是分叉（在线表不可见 / 发现表看得见）。这里把 fork session 显式记下来，
+	// 让 presence/peers 面**统一过滤**（旁支不是一等会话），而不是靠"它恰好没 join
+	// gate、恰好没被激活"这种副产物兜着。
+	//
+	// 数据来源是**事件流**（btw.forked）：进程重启后重扫即恢复（与在线表的 fork
+	// 标记同源同口径）。
+	forks map[contracts.Ulid]struct{}
 }
 
 func newDiscoveryFeed(store core.Store, table *discovery.Table) *discoveryFeed {
@@ -117,6 +130,7 @@ func (f *discoveryFeed) catchUp(ctx context.Context) (int, error) {
 		}
 		for i := range evs {
 			f.table.Apply(&evs[i])
+			f.noteForkEventLocked(&evs[i])
 			if evs[i].Seq != nil && *evs[i].Seq > f.scanSeq {
 				f.scanSeq = *evs[i].Seq
 			}
@@ -144,6 +158,7 @@ func (f *discoveryFeed) rebuild(ctx context.Context) error {
 		}
 		for i := range evs {
 			f.table.Apply(&evs[i])
+			f.noteForkEventLocked(&evs[i])
 			if evs[i].Seq != nil && *evs[i].Seq > f.scanSeq {
 				f.scanSeq = *evs[i].Seq
 			}
@@ -159,6 +174,59 @@ func (f *discoveryFeed) watermark() int64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.scanSeq
+}
+
+// noteForkEventLocked 记下事件流里的 fork 标记（调用方持有 f.mu）。
+//
+// btw.forked 事件的**归属 session** 就是那条旁支（envelope.session_id = fork id），
+// 故按 envelope 记，不看载荷里的 source_session_id（那是主 session）。
+func (f *discoveryFeed) noteForkEventLocked(ev *contracts.Event) {
+	if ev == nil || ev.Kind != KindBtwForked || ev.SessionID == "" {
+		return
+	}
+	if f.forks == nil {
+		f.forks = make(map[contracts.Ulid]struct{})
+	}
+	f.forks[ev.SessionID] = struct{}{}
+}
+
+// markFork 登记一个 fork session（RunBtw 造出旁支时立即登记，不等事件流扫到）。
+func (f *discoveryFeed) markFork(sid contracts.Ulid) {
+	if f == nil || sid == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.forks == nil {
+		f.forks = make(map[contracts.Ulid]struct{})
+	}
+	f.forks[sid] = struct{}{}
+}
+
+// isFork 报告某 session 是否是一条 /btw 旁支 fork。
+func (f *discoveryFeed) isFork(sid contracts.Ulid) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.forks[sid]
+	return ok
+}
+
+// forkSessions 返回已知的 fork session 集合（升序；审计/诊断用）。
+func (f *discoveryFeed) forkSessions() []contracts.Ulid {
+	if f == nil {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]contracts.Ulid, 0, len(f.forks))
+	for sid := range f.forks {
+		out = append(out, sid)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +383,8 @@ func (h *Hub) GateMembers(ctx context.Context, gateID string) ([]discovery.Sessi
 	if _, err := h.discFeed.catchUp(ctx); err != nil {
 		return nil, fmt.Errorf("host: 扫事件流: %w", err)
 	}
-	return h.disc.GateMembers(gateID), nil
+	// 剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话，不该出现在 gate 成员面。
+	return h.filterForkGateMembers(h.disc.GateMembers(gateID)), nil
 }
 
 // peersView 组装可见面（先扫描追平）。
@@ -331,7 +400,9 @@ func (h *Hub) viewOf(sessionID contracts.Ulid) PeersView {
 	return PeersView{
 		SessionID: string(sessionID),
 		Gates:     h.disc.GatesOf(sessionID),
-		Peers:     h.disc.VisiblePeers(sessionID),
+		// 对端里剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话（它没有 gate、
+		// 没被激活，本就不会出现在对端里；这里显式过滤，让口径不靠副产物）。
+		Peers: h.filterForkPeers(h.disc.VisiblePeers(sessionID)),
 	}
 }
 

@@ -45,4 +45,16 @@
 // 最后 cmd.Wait() 收尸——SDK 的 pipeRWC.Close 在 Windows 上只会 SIGTERM/Kill
 // 直接子进程，孙子进程会继承管道写端把 Wait 挂住（本机实测量级的坑，
 // 见 runtime/cap/local 的 waitDelay 注释）。
+//
+// # 工具列表 = 连接时刻快照，不支持动态刷新（v3-S2 清账）
+//
+// 装配期（connect 握手后）**只发一次** tools/list，结果缓存进 serverConn.discovered
+// 并被复用（见 conn.go 的 Tools）。此后 core 眼里这个 server 有哪些工具就**固定不变**：
+// server 运行期再上/下线工具（MCP 的 tools/list_changed 通知）**不会**反映到已注册的
+// registry 条目上——要刷新得重连（重启 hub / 重跑装配）。
+//
+// 为什么 v3-S2 只快照不接 list_changed 回调：动态刷新要处理"工具突然消失但模型正在调"
+// "新工具要不要过策略/白名单重审""并发刷新与在飞调用交错"一连串状态一致性问题，远超
+// "接个回调"的成本；而 alasol 的模型调用是**每轮重新取可见集**的（loop.visibleTools），
+// 快照式工具面与之匹配。接入 list_changed 是后续增强（需多方面微调），此处如实标注边界。
 package mcp

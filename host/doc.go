@@ -55,6 +55,24 @@
 // `repo:<repo_id>`（runtime/identity.RepoID，worktree 按 git root 聚合）与
 // `workflow:<run_id>`（有 run_id 才加；工作流引擎在 v3，钩子先留）。
 //
+// # /btw 旁支 fork（K29，v3-S2）
+//
+// `/btw <问题>` 跑一条**旁支执行线**：从主 session 的对话历史（FoldConversation 折叠，
+// 与 resume 同源）分叉出一个**全新 session_id + agent_id**，旁支带 system + 折叠历史、
+// **不带** ledger/gate（不挂上下文策略、不 join gate），跑一轮后结果**只回给用户**、
+// **不回灌**主上下文（主 session 的事件流零新增）。契约见 `btw.forked`
+// （contracts.BtwForkedPayload），实现见 host/fork.go。
+//
+// **旁支不是一等会话**（v3-S2 修的口径）：host 侧维护 fork session 集合
+// （discoveryFeed.forks；数据来自 btw.forked 事件，重启后重扫即恢复），在
+// **presence / peers / 在线表注入 / gate 成员面**统一过滤——core/discovery 不改
+// （X1 纪律），过滤落在 host 层，于是"旁支不可见"不再依赖"它恰好没 join gate、
+// 恰好没被激活"这种副产物。原始发现表（Hub.Discovery()，宿主内部 / 审计面）里
+// 仍能看到旁支（可审计、可回放）——这是**有意保留**的边界。
+//
+// **历史口径**：主轮次不带历史（每轮只带本轮 prompt，历史只存在于事件流里），
+// /btw 带历史（带条数/长度上限 + 截断告知：模型侧一条 system 说明 + 用户侧一行提示）。
+//
 // # agentlink（K18 五件套）
 //
 // 交流能力落在 **core/agentlink**（E8 通用组件：library 形态、不绑协议、不做 IO），

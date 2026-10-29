@@ -57,6 +57,11 @@ func (s *discoveryOnlineSource) OnlineRows(ctx context.Context, sessionID contra
 		})
 	}
 	for _, p := range s.table.VisiblePeers(sessionID) {
+		// 剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话——注入给主 agent 的
+		// 在线表与 presence 面必须同一个口径（core/discovery 不改，过滤在 host 层）。
+		if s.feed != nil && s.feed.isFork(contracts.Ulid(p.SessionID)) {
+			continue
+		}
 		out = append(out, loop.OnlineTableRow{
 			SessionID:   p.SessionID,
 			MainAgentID: p.MainAgentID,

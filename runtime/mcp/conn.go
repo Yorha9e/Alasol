@@ -73,6 +73,10 @@ type serverConn struct {
 	// 为什么缓存：装配期**只发一次** tools/list。坏 server 常在**第二次**
 	// tools/list 上挂死（第一次给个像样的列表，第二次就不动了）——那次请求若
 	// 没有 deadline，hub 启动会永久挂起（p1）。
+	//
+	// **连接时刻快照，不支持动态刷新**（v3-S2 清账，见 doc.go 的同款说明）：这份
+	// 列表在握手时定格，server 运行期上/下线工具（tools/list_changed）不反映到
+	// 已注册的 registry 条目；要刷新得重连。
 	discovered []*mcp.Tool
 	close      sync.Once
 }
@@ -136,7 +140,7 @@ func connectSession(ctx context.Context, cfg ServerConfig, transport mcp.Transpo
 		// 连不上（命令不存在 / 握手失败 / 超时）→ 已经拉起的子进程必须收尸，
 		// 否则每次失败的装配都漏一个进程（"谁拉起谁收尸"对失败路径同样成立）。
 		if cmd != nil {
-			reapProcess(cmd)
+			reapProcess(cmd, killTree)
 		}
 		return nil, fmt.Errorf("mcp: server %q 连接失败（transport=%s）: %w",
 			cfg.Name, cfg.Transport, scrubEndpoint(cfg, err))
@@ -159,10 +163,11 @@ func connectSession(ctx context.Context, cfg ServerConfig, transport mcp.Transpo
 	// tools/list——第二次请求既浪费又是新的挂死面（p1）。
 	tools, err := listTools(cctx, sess)
 	if err != nil {
-		_ = sess.Close()
-		if cmd != nil {
-			reapProcess(cmd)
-		}
+		// 失败路径也要**有界地**收尾（v3-S2 清账）：裸 sess.Close() 会等在飞请求，
+		// 一个半死的 server 能把这里挂住 → hub 启动从"最多 TimeoutMs"变永久挂起。
+		// 复用 closeInner 的同款有界关闭（gracePeriod/killGrace + stdio 杀树 + Wait），
+		// 不另写一套（F7：产物逻辑只一份）。
+		_ = closeSessionBounded(sess, cmd, cfg.Name, cfg.Transport)
 		return nil, fmt.Errorf("mcp: server %q tools/list 失败: %w", cfg.Name, scrubEndpoint(cfg, err))
 	}
 
@@ -176,12 +181,39 @@ func connectSession(ctx context.Context, cfg ServerConfig, transport mcp.Transpo
 // **必须有 deadline**：产品侧传进来的 ctx 是 context.Background()（host.New /
 // `alasol run` / `alasol resume` 都那样传），没有这层预算，一个挂死的 server
 // 会让 hub 启动**永久挂起**——"坏 server 不拖垮 hub"在时间维度上同样成立（p1）。
+//
+// # 预算口径（v3-S2 清账，数字写死）
+//
+// 装配耗时 ≤ **TimeoutMs + 收尾预算**：
+//
+//	stdio：TimeoutMs + **14s** = TimeoutMs + 关停两段(2s+5s) + 收尸两段(2s+5s)
+//	http ：TimeoutMs +  **7s** = TimeoutMs + 关停两段(2s+5s)（无子进程可收尸）
+//
+// 推导（每一段都是**上界**，不是典型值——顺利时都是 0）：
+//
+//	关停第一段 gracePeriod(2s)：等 session 收尾（没有在飞请求时它立刻返回）；
+//	关停第二段 killGrace(5s)   ：杀进程树后再等一次（管道断开 → 在飞请求失败）；
+//	收尸第一段 gracePeriod(2s)：cmd.Wait() 的优雅退出窗口；
+//	收尸第二段 killGrace(5s)   ：杀树后 cmd.WaitDelay 的兜底。
+//
+// stdio 之所以比 http 多 7s：它多了一个"收尸子进程"的两段窗口（http 没有子进程）。
+// 这两个数字由 closeBudgetStdio / closeBudgetHTTP 常量钉住（回归会断言它们与
+// gracePeriod / killGrace 一致——口径不许漂）。
 func serverTimeout(sc ServerConfig) time.Duration {
 	if sc.TimeoutMs > 0 {
 		return time.Duration(sc.TimeoutMs) * time.Millisecond
 	}
 	return connectTimeout
 }
+
+// 失败路径的**收尾预算**（v3-S2 清账）：见 serverTimeout 的推导。
+//
+//	closeBudgetStdio = 关停两段(7s) + 收尸两段(7s) = 14s
+//	closeBudgetHTTP  = 关停两段(7s)                 =  7s
+const (
+	closeBudgetStdio = gracePeriod + killGrace + gracePeriod + killGrace
+	closeBudgetHTTP  = gracePeriod + killGrace
+)
 
 // listTools 列一次工具（分页由 SDK 的迭代器处理：Tools 会自动翻页）。
 //
@@ -301,9 +333,52 @@ func (c *serverConn) Close() error {
 
 // closeInner 是 Close 的真身（外层只负责幂等）。
 func (c *serverConn) closeInner() error {
+	return closeSessionBounded(c.sess, c.cmd, c.cfg.Name, c.cfg.Transport)
+}
+
+// closeSessionBounded **有界地**关一个 session 并收尸子进程（stdio 杀树）。
+//
+// # 为什么收**具体指针**而不是接口（N1）
+//
+// 接口化的坑：`var s interface{ Close() error } = (*mcp.ClientSession)(nil)` 时
+// `s != nil` 仍为 true → goroutine 里 `s.Close()` 空指针解引用 **panic**。所以这里
+// 收具体类型 `*mcp.ClientSession` 并在**入口判空**（nil 直接返回）——判空发生在
+// 具体类型上，那个"接口装 nil 指针"的陷阱就不存在了。
+//
+// 需要可测形态（喂一个"Close 永不返回"的替身）时用 closeSessionBoundedWith：
+// 它收**函数**（func() error），没有接口的 nil 陷阱。
+//
+// # 预算（v3-S2 清账，数字写死）
+//
+// 有界关闭的总窗口 = **stdio 14s / http 7s**（含收尸两段，见 serverTimeout 的推导）。
+// 也就是说：即使 session 的 Close 永不返回，这段收尾也会在预算内**返回**（并按
+// "已收尸"处理），不会把 hub 启动/关停拖成永久挂起。
+func closeSessionBounded(sess *mcp.ClientSession, cmd *exec.Cmd, name, transport string) error {
+	if sess == nil {
+		return nil // 没有 session 可关（也不该有子进程要收）
+	}
+	return closeSessionBoundedWith(sess.Close, cmd, name, transport, killTree)
+}
+
+// closeSessionBoundedWith 是有界关闭的**真身**：close 与 kill 都由**参数**传入。
+//
+// 为什么把杀树做成参数（N8）：包级可变函数指针（`var killTreeFn = killTree`）既是
+// 竞态源（测试改写它 = 产品面留了个可改写的入口），也让"杀树被调过"这件事没法被
+// 精确观测。做成参数后：产物路径传 killTree，测试路径传自己的替身——**不留全局可变**。
+//
+// 顺序/窗口口径见 Close 的四步注释：
+//
+//  1. 后台 close()（没有在飞请求时它立刻关管道 → server 见 stdin EOF 自退）；
+//  2. 有界等它收尾（gracePeriod）：超时说明在飞请求卡住 → 杀进程树（stdio）；
+//  3. 杀树后仍有界等（killGrace）：仍不收尾 → 按"已收尸"处理（只告警，不把关闭变失败）；
+//  4. cmd.Wait() 收尸（必须在管道关闭之后）。
+//
+// 关停告警文案按 **cmd != nil** 分（v3-S2 清账）：stdio 有子进程可杀 → "已强杀进程树"；
+// http 无子进程 → "无进程可杀"（只有 deadline 兜底，别说成杀了树）。
+func closeSessionBoundedWith(closeFn func() error, cmd *exec.Cmd, name, transport string, kill func(*exec.Cmd)) error {
 	closeDone := make(chan error, 1)
-	if c.sess != nil {
-		go func() { closeDone <- c.sess.Close() }()
+	if closeFn != nil {
+		go func() { closeDone <- closeFn() }()
 	} else {
 		closeDone <- nil
 	}
@@ -316,27 +391,48 @@ func (c *serverConn) closeInner() error {
 		settled = true
 	case <-time.After(gracePeriod):
 		// ② 窗口用尽：在飞请求卡住了 → 杀进程树让 server 立刻死（stdio）。
-		if c.cmd != nil {
-			killTree(c.cmd)
+		if cmd != nil {
+			killProcessTree(cmd, kill)
 		}
 		select {
 		case sessErr = <-closeDone:
 			settled = true
 		case <-time.After(killGrace):
 			// ③ 强杀后仍不收尾：按"已强杀"处理（告警 + 放弃等待，不阻塞关停）。
-			mcpLog.Warn("mcp: 关 session 超时（stdio 已强杀进程树；按已收尸处理）",
-				"server", c.cfg.Name, "transport", c.cfg.Transport, "timeout", killGrace)
+			// 文案按传输分：stdio 真杀了树；http 没有进程可杀（只有 deadline 兜底）。
+			mcpLog.Warn(sessionCloseTimeoutNote(cmd),
+				"server", name, "transport", transport, "timeout", killGrace)
 		}
 	}
 
 	// ④ 收尸子进程（Wait 只能调一次；且必须在管道关闭之后——见 Close 的注释）。
-	if c.cmd != nil {
-		reapProcess(c.cmd)
+	if cmd != nil {
+		reapProcess(cmd, kill)
 	}
 	if !settled {
 		return nil
 	}
 	return sessErr
+}
+
+// killProcessTree 杀进程树（kill 为 nil 时退回默认实现）。
+func killProcessTree(cmd *exec.Cmd, kill func(*exec.Cmd)) {
+	if kill != nil {
+		kill(cmd)
+		return
+	}
+	killTree(cmd)
+}
+
+// sessionCloseTimeoutNote 是关停第二段（杀树后仍不收尾）的告警文案，按 **cmd != nil**
+// 分（v3-S2 清账）：stdio 有子进程、真杀了进程树 → "已强杀进程树"；http 无子进程、
+// 只有 deadline 兜底 → "无进程可杀"。拆成纯函数是为了能对两种传输各钉一条快回归，
+// 不必为触发 7s 超时而起一个装睡的 server。
+func sessionCloseTimeoutNote(cmd *exec.Cmd) string {
+	if cmd != nil {
+		return "mcp: 关 session 超时（stdio 已强杀进程树；按已收尸处理）"
+	}
+	return "mcp: 关 session 超时（http 无进程可杀；按已收尾处理）"
 }
 
 // gracePeriod 是**关停第一段**的等待窗口：等 session 收尾（没有在飞请求时
@@ -469,7 +565,9 @@ func childEnv(cfg *ServerConfig) []string {
 //
 // 幂等且永不返回 error（收尸失败只能告警，不能把 Close 变成失败——
 // hub 关停路径上的错误会把真正重要的错误淹没）。
-func reapProcess(cmd *exec.Cmd) {
+//
+// 杀树实现由参数传入（N8：不留包级可变函数指针）；nil 时退回默认的 killTree。
+func reapProcess(cmd *exec.Cmd, kill func(*exec.Cmd)) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
@@ -483,7 +581,7 @@ func reapProcess(cmd *exec.Cmd) {
 		return // 优雅退出
 	case <-time.After(gracePeriod):
 	}
-	killTree(cmd) // Windows: taskkill /T /F /PID（陷阱 5）
+	killProcessTree(cmd, kill) // Windows: taskkill /T /F /PID（陷阱 5）
 	select {
 	case <-done:
 	case <-time.After(killGrace):

@@ -111,6 +111,131 @@ func TestChatSubmitRunsPrompt(t *testing.T) {
 	}
 }
 
+// mainRow 取主 session 的在线表行（EventCount = 该 session 的事件条数）。
+func mainRow(t *testing.T, h *host.Hub, sid contracts.Ulid) host.SessionRow {
+	t.Helper()
+	rows, err := h.Sessions(context.Background())
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+	for _, r := range rows {
+		if r.SessionID == string(sid) {
+			return r
+		}
+	}
+	t.Fatalf("在线表里没有 session %s", sid)
+	return host.SessionRow{}
+}
+
+// TestChatSubmitRunsBtw：对话面 /btw → 旁支 fork → 结果只进 log（btw> 前缀），
+// 且**主 session 零新增**（行为断言，不看实现自己打印的文案）。
+//
+// "主上下文零新增"这条性质由 host 回归（host/fork_internal_test.go 断言①）钉死；
+// TUI 侧钉**可观测的行为**：主 session 的事件数与上下文快照在 /btw 前后**不变**，
+// 且旁支**不进**在线表（它不是一等会话）。
+func TestChatSubmitRunsBtw(t *testing.T) {
+	h, err := host.New(host.Config{
+		DBPath:   filepath.Join(t.TempDir(), "tui-btw.db"),
+		Model:    "stub",
+		Provider: stubProvider{},
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	ctx := context.Background()
+	sid := host.NewSession()
+	m := newModel(Options{Hub: h, Session: sid, Approver: NewApprover()})
+	// 先跑一轮主对话，让主 session 有可折叠的上下文（/btw 会带上它）。
+	m.Update(keyRunes("主对话"))
+	_, mainCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(mainCmd())
+
+	// /btw 之前的基线：主 session 的事件数 + 上下文快照 + 在线表行数。
+	before := mainRow(t, h, sid)
+	snapBefore, ok, err := h.ContextSnapshot(ctx, sid)
+	if err != nil || !ok {
+		t.Fatalf("取主 session 上下文快照: ok=%v err=%v", ok, err)
+	}
+	rowsBefore, err := h.Sessions(ctx)
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+
+	// /btw 旁支询问。
+	m.Update(keyRunes("/btw 旁支询问"))
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if !m.running {
+		t.Fatal("/btw Enter 后应 running=true")
+	}
+	if cmd == nil {
+		t.Fatal("/btw 应返回跑旁支的 Cmd")
+	}
+	done := cmd()
+	m.Update(done)
+	if m.running {
+		t.Fatal("旁支跑完应 running=false")
+	}
+	log := strings.Join(m.chatLog, "\n")
+	// 旁支结果以 btw> 前缀只给用户展示（UX 契约）。
+	if !strings.Contains(log, "btw> ") {
+		t.Fatalf("log 里应有 btw> 旁支输出: %v", m.chatLog)
+	}
+
+	// 行为断言①：主 session 的**事件数**不变（/btw 不回灌主上下文）。
+	after := mainRow(t, h, sid)
+	if after.EventCount != before.EventCount {
+		t.Fatalf("主 session 事件数被 /btw 改动：%d → %d（不该回灌主上下文）",
+			before.EventCount, after.EventCount)
+	}
+	// 行为断言②：主 session 的**上下文快照**不变。
+	snapAfter, ok, err := h.ContextSnapshot(ctx, sid)
+	if err != nil {
+		t.Fatalf("取主 session 上下文快照: %v", err)
+	}
+	if !ok || string(snapAfter) != string(snapBefore) {
+		t.Fatal("主 session 的上下文快照被 /btw 改动（不该回灌主上下文）")
+	}
+	// 行为断言③：旁支**不进在线表**（旁支不是一等会话，在线表行数不变）。
+	rowsAfter, err := h.Sessions(ctx)
+	if err != nil {
+		t.Fatalf("Sessions: %v", err)
+	}
+	if len(rowsAfter) != len(rowsBefore) {
+		t.Fatalf("在线表行数被 /btw 改动：%d → %d（旁支不该出现在在线表）",
+			len(rowsBefore), len(rowsAfter))
+	}
+}
+
+// TestChatSubmitRunsBtwTabSeparator："/btw\t问题" 与 "/btw 问题" **等价**
+// （tab 也算分隔符——与挂账 e 的"tab 分隔变体也要认"同款口径）。
+func TestChatSubmitRunsBtwTabSeparator(t *testing.T) {
+	h, err := host.New(host.Config{
+		DBPath:   filepath.Join(t.TempDir(), "tui-btw-tab.db"),
+		Model:    "stub",
+		Provider: stubProvider{},
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	sid := host.NewSession()
+	m := newModel(Options{Hub: h, Session: sid, Approver: NewApprover()})
+	// tab 分隔也要被认成 /btw 命令（而不是普通 prompt）。
+	m.Update(keyRunes("/btw\t旁支询问"))
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("/btw（tab 分隔）应返回跑旁支的 Cmd")
+	}
+	m.Update(cmd())
+	log := strings.Join(m.chatLog, "\n")
+	if !strings.Contains(log, "btw> ") {
+		t.Fatalf("tab 分隔的 /btw 应跑旁支（结果进 log）: %v", m.chatLog)
+	}
+}
+
 // TestApprovalRequestRendersAndDecides：审批请求进 UI + y/n 决策移除并 resolve。
 func TestApprovalRequestRendersAndDecides(t *testing.T) {
 	appr := NewApprover()

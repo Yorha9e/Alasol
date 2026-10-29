@@ -95,6 +95,16 @@ type chatDoneMsg struct {
 	text string
 	err  error
 }
+type btwDoneMsg struct {
+	text    string
+	forkSID contracts.Ulid
+	// historyMsgs 是旁支带上的主对话条数；truncated / trimmed 标记两种裁切
+	// （F7/N5）：truncated = 触了上限截断，trimmed = 工具调用配对不完整被丢弃。
+	historyMsgs int
+	truncated   bool
+	trimmed     bool
+	err         error
+}
 type approvalRequestMsg struct {
 	id      contracts.Ulid
 	summary string
@@ -122,6 +132,26 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.chatLog = append(m.chatLog, "alasol> "+msg.text)
 		} else {
 			m.chatLog = append(m.chatLog, "alasol> （无文本输出）")
+		}
+		return m, nil
+
+	case btwDoneMsg:
+		// /btw 旁支结果（K29）：只给用户展示，**不回灌**主会话（主 session 事件流零新增）。
+		m.running = false
+		if msg.err != nil {
+			m.chatLog = append(m.chatLog, "btw> [错误] "+msg.err.Error())
+		} else if msg.text != "" {
+			m.chatLog = append(m.chatLog, "btw> "+msg.text)
+		} else {
+			m.chatLog = append(m.chatLog, "btw> （无文本输出）")
+		}
+		m.chatLog = append(m.chatLog, dim(fmt.Sprintf("[btw] 旁支 session=%s（未回灌主会话）", msg.forkSID)))
+		// 两种裁切分开说（F7/N5）：上限截断 ≠ 配平丢弃。
+		if msg.truncated {
+			m.chatLog = append(m.chatLog, dim(fmt.Sprintf("[btw] 主对话已按旁支上下文上限截断（只带最近 %d 条）", msg.historyMsgs)))
+		}
+		if msg.trimmed {
+			m.chatLog = append(m.chatLog, dim(fmt.Sprintf("[btw] 旁支主对话里有工具调用配对不完整的片段被丢弃（只带 %d 条）", msg.historyMsgs)))
 		}
 		return m, nil
 
@@ -186,6 +216,18 @@ func (m *Model) handleChatKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input = ""
 		if line == "" || m.running || m.hub == nil {
 			return m, nil
+		}
+		// /btw <问题>：旁支 fork（K29）——带主 session 上下文跑一轮，结果只给用户、不回灌主会话。
+		// 命令解析与 CLI 共用同一个口径（host.ParseBtwCommand）：**空格与 tab 都算分隔符**
+		//（"/btwxyz" 不当命令，按普通 prompt 走）。
+		if question, isBtw := host.ParseBtwCommand(line); isBtw {
+			m.chatLog = append(m.chatLog, "you> "+line)
+			if question == "" {
+				m.chatLog = append(m.chatLog, dim("[btw] 用法：/btw <问题>（旁支询问，不影响主会话）"))
+				return m, nil
+			}
+			m.running = true
+			return m, runBtwCmd(m.hub, m.session, question)
 		}
 		m.chatLog = append(m.chatLog, "you> "+line)
 		m.running = true
@@ -316,6 +358,21 @@ func runPromptCmd(h *host.Hub, session contracts.Ulid, prompt string) tea.Cmd {
 	return func() tea.Msg {
 		res, err := h.RunPrompt(context.Background(), session, prompt)
 		return chatDoneMsg{text: res.Text, err: err}
+	}
+}
+
+// runBtwCmd 跑一次 /btw 旁支 fork（K29）：带主 session 上下文跑一轮，结果只给用户。
+func runBtwCmd(h *host.Hub, session contracts.Ulid, question string) tea.Cmd {
+	return func() tea.Msg {
+		res, err := h.RunBtw(context.Background(), session, question)
+		return btwDoneMsg{
+			text:        res.Text,
+			forkSID:     res.ForkSessionID,
+			historyMsgs: res.HistoryMessages,
+			truncated:   res.HistoryTruncated,
+			trimmed:     res.HistoryTrimmed,
+			err:         err,
+		}
 	}
 }
 

@@ -48,6 +48,15 @@ const maxStderrLine = 4 << 10
 // 并补一条"stderr 已截断"（让人知道后面的输出没被记录）。
 const maxStderrTotal = 64 << 10
 
+// maxStderrLines 是**单个 server** 的 stderr 记录**条数**上限（1000 行）。
+//
+// 为什么字节闸之外还要条数闸（v3-S2 清账）：字节闸挡的是"大"，挡不住"多"——
+// 一个话痨 server 可以用很多**短**行刷日志（每行都合法、都不超单行/总量字节上限），
+// 1000 行 × 40 字节的噪声足以把真正有用的启动错误淹掉。所以记录条数也封顶：
+// 超过 maxStderrLines 就**停止逐行记录**并补一条"stderr 已截断"（与字节闸同口径）。
+// 两个闸是 OR 关系——谁先触发谁截断，之后都不再逐条记。
+const maxStderrLines = 1000
+
 // stderrSink 把子进程的 stderr 按行接到 mcpLog（脱敏后）。
 //
 // 为什么要按行：server 的诊断信息通常是"一行一件事"（栈 trace 是多行，
@@ -63,7 +72,9 @@ type stderrSink struct {
 	buf []byte
 	// total 是已落日志的字节数（对照 maxStderrTotal）。
 	total int
-	// truncated 标记总量闸已触发（之后的行不再逐条记录）。
+	// lines 是已落日志的条数（对照 maxStderrLines）。
+	lines int
+	// truncated 标记总量闸（字节或条数）已触发（之后的行不再逐条记录）。
 	truncated bool
 }
 
@@ -103,9 +114,12 @@ func (s *stderrSink) Write(p []byte) (int, error) {
 
 // log 落一行（脱敏 + 截断 + 走 mcpLog）。
 //
-// 总量闸：已落的字节数超过 maxStderrTotal → **停止逐行记录**（只补一条
-// "stderr 已截断"的说明）。不这么做的话，一个话痨 server 能刷爆日志
-// （1 万行 × 1KB = 11MB），把真正有用的诊断信息淹掉。
+// 两道总量闸（OR，谁先触发谁截断，之后都不再逐条记）：
+//   - **条数闸**（maxStderrLines）：挡"很多短行"——字节都合法但条数能刷爆日志；
+//   - **字节闸**（maxStderrTotal）：挡"大"——少数几行就顶到字节上限。
+//
+// 不这么做的话，一个话痨 server 能刷爆日志（1 万行 × 1KB = 11MB），把真正有用的
+// 诊断信息淹掉。
 func (s *stderrSink) log(line string) {
 	line = strings.TrimRight(line, "\r")
 	if strings.TrimSpace(line) == "" {
@@ -118,8 +132,15 @@ func (s *stderrSink) log(line string) {
 	if len(line) > maxStderrLine {
 		line = line[:maxStderrLine] + "…[truncated]"
 	}
+	// 条数闸：已记录行数达到上限 → 补一条说明后停止逐条记录。
+	if s.lines >= maxStderrLines {
+		note := fmt.Sprintf("stderr 已截断（超过 %d 行上限，后续输出不再记录）", maxStderrLines)
+		mcpLog.Warn("mcp: server stderr", "server", s.server, "line", note)
+		s.truncated = true
+		return
+	}
+	// 字节闸：本条会把总量顶过上限 → 补一条说明后停止逐条记录（说明自己也字节封顶）。
 	if s.total+len(line) > maxStderrTotal {
-		// 总量闸：补一条说明（这一条自己也算进总量）。
 		note := fmt.Sprintf("stderr 已截断（超过 %d 字节上限，后续输出不再记录）", maxStderrTotal)
 		mcpLog.Warn("mcp: server stderr", "server", s.server, "line", note)
 		s.total += len(note)
@@ -128,6 +149,7 @@ func (s *stderrSink) log(line string) {
 	}
 	mcpLog.Warn("mcp: server stderr", "server", s.server, "line", line)
 	s.total += len(line)
+	s.lines++
 }
 
 // secretValues 列出这个 server 的**已知凭据值**（脱敏用）。
@@ -177,22 +199,32 @@ func secretValues(cfg *ServerConfig) []string {
 	return out
 }
 
-// credentialSchemes 是常见的凭据 scheme 前缀（小写比较）。
+// credentialSchemes 是常见的凭据 scheme 词（小写比较；**不含分隔符**）。
 //
 // 为什么只认这几个：scheme 前缀是**协议形状**（HTTP 的认证 scheme），不是
 // 凭据内容本身；剥掉它之后剩下的才是值本体。认不认得准不要紧——
 // 脱敏是"多认一点总比漏好一点"的方向，而这里认错了最多是把一段普通文本
 // 也打码（不会泄密）。
-var credentialSchemes = []string{"bearer ", "basic ", "token ", "apikey ", "api-key "}
+var credentialSchemes = []string{"bearer", "basic", "token", "apikey", "api-key"}
 
-// stripScheme 剥掉凭据的 scheme 前缀（"Bearer sk-x" → "sk-x"）。
+// credentialSeps 是 scheme 词与值本体之间的分隔符（v3-S2 清账：补 tab 变体）。
 //
-// 只在前缀**恰好**是已知 scheme 时才剥（带空白分隔）；其余原样返回。
+// 除了常规空格外，还要认 **tab**（"Bearer\tsk-x"）：server 打配置时用 tab 对齐很常见
+// （`printf "%s\t%s"` / 日志表格），只认空格会漏掉这一形态的凭据值本体。
+var credentialSeps = []string{" ", "\t"}
+
+// stripScheme 剥掉凭据的 scheme 前缀（"Bearer sk-x" / "Bearer\tsk-x" → "sk-x"）。
+//
+// 只在前缀**恰好**是 "已知 scheme 词 + 一个空白分隔符（空格或 tab）"时才剥；
+// 其余原样返回。
 func stripScheme(v string) string {
 	lower := strings.ToLower(v)
 	for _, scheme := range credentialSchemes {
-		if strings.HasPrefix(lower, scheme) {
-			return strings.TrimSpace(v[len(scheme):])
+		for _, sep := range credentialSeps {
+			prefix := scheme + sep
+			if strings.HasPrefix(lower, prefix) {
+				return strings.TrimSpace(v[len(prefix):])
+			}
 		}
 	}
 	return v

@@ -350,6 +350,17 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			}
 			// 伪归属的三个 id 的**框架形态**由通用的 checkULID 断言（每行都查：
 			// 26 字符 Crockford + 首字符 '0'..'7'——p3-E）。
+		case "btw.forked":
+			var p BtwForkedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into BtwForkedPayload: %v", lineNo, err)
+				break
+			}
+			// K29 fork+/btw：来源 session（fork 的上下文来源）+ 问题原文两要素齐全才可审计。
+			checkULID(t, lineNo, "btw.forked source_session_id", string(p.SourceSessionID))
+			if p.Question == "" {
+				t.Errorf("line %d: btw.forked question 不能为空（/btw 问题原文）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -375,6 +386,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 		"context.assembled", "user.prompt", "model.turn", "gate.joined",
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
 		"review.recorded", "conflict.predicted", "hub.alert",
+		"btw.forked",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)

@@ -23,6 +23,7 @@ import (
 //	<任意文本>   发一轮对话（RunPrompt），打印模型最终文本
 //	/table       打印在线表（indexer 投影：session / 事件数 / 最后 kind / 更新时间 / 水位）
 //	/ctx         打印当前 session 的上下文构成（ContextSnapshot 的 parts 占比）
+//	/btw <问题>  旁支 fork（K29）：带当前对话上下文跑一轮，结果只给用户、不回灌主 session
 //	/session     打印当前 session id
 //	/quit        退出（等价 EOF / Ctrl-C）
 //
@@ -59,7 +60,7 @@ func chatMain(args []string) int {
 	in := bufio.NewScanner(os.Stdin)
 	fmt.Printf("[alasol] chat 就绪：session=%s model=%s approval=%s allow=%v\n",
 		sid, cfg.Model, *f.approval, splitList(*f.allow))
-	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /quit 退出")
+	fmt.Println("[alasol] 输入内容开始对话；/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw 旁支询问 · /quit 退出")
 
 	for {
 		fmt.Print("you> ")
@@ -69,6 +70,39 @@ func chatMain(args []string) int {
 		}
 		line := strings.TrimSpace(in.Text())
 		if line == "" {
+			continue
+		}
+		// /btw <问题>：旁支 fork（K29）——带主 session 的对话上下文跑一轮，结果**只给用户**、
+		// **不回灌**主 session 的事件流（主 session 的 user.prompt/model.turn/context.assembled
+		// 零新增）。命令解析与 TUI 共用同一个口径（host.ParseBtwCommand）：**空格与 tab
+		// 都算分隔符**（"/btwxyz" 不当命令，按普通 prompt 走）。
+		if question, isBtw := host.ParseBtwCommand(line); isBtw {
+			if question == "" {
+				fmt.Println("用法：/btw <问题>（旁支询问：带当前上下文跑一轮，不影响主会话历史）")
+				continue
+			}
+			res, err := h.RunBtw(ctx, sid, question)
+			if err != nil {
+				// 失败不退出 REPL（同普通对话：改一句话重试比重启便宜）。
+				fmt.Fprintln(os.Stderr, "/btw 失败:", err)
+				continue
+			}
+			// 结果只给用户展示——**不**进主 session（K29：旁支归属独立 fork session）。
+			if res.Text != "" {
+				fmt.Printf("btw> %s\n", res.Text)
+			} else {
+				fmt.Println("btw> （无文本输出）")
+			}
+			// 裁切告知（F7/N5）：两种裁切**分开说**——上限截断（太长装不下）与配平
+			// 丢弃（工具调用配对不完整、provider 发不出去）不是一回事。
+			if res.HistoryTruncated {
+				fmt.Fprintf(os.Stderr, "[btw] 主对话已按旁支上下文上限截断（只带最近 %d 条）\n", res.HistoryMessages)
+			}
+			if res.HistoryTrimmed {
+				fmt.Fprintf(os.Stderr, "[btw] 旁支主对话里有工具调用配对不完整的片段被丢弃（只带 %d 条）\n", res.HistoryMessages)
+			}
+			fmt.Fprintf(os.Stderr, "[btw] 旁支 session=%s turns=%d tool_calls=%d events=%d（主 session=%s 事件流零新增）\n",
+				res.ForkSessionID, res.Turns, res.ToolCalls, res.Events, sid)
 			continue
 		}
 		switch line {
@@ -87,7 +121,7 @@ func chatMain(args []string) int {
 			fmt.Printf("session=%s\n", sid)
 			continue
 		case "/help":
-			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /session 当前 session · /quit 退出")
+			fmt.Println("命令：/table 在线表 · /ctx 上下文构成 · /cost 成本统计 · /btw <问题> 旁支询问 · /session 当前 session · /quit 退出")
 			continue
 		}
 		if ctx.Err() != nil {

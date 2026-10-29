@@ -42,6 +42,10 @@ type sessionState struct {
 	// → 伪 session → 不进在线表；见 rows）。
 	hubEvents   int
 	agentEvents int
+	// fork 标记本 session 是一条 /btw 旁支 fork（v3-S2 K29；见 btw.forked 事件）。
+	// fork session 是**一次性旁支执行线**（结果只回给用户、不回灌主上下文），不是用户在用的
+	// 会话 → 不进在线表（与 hub 伪 session 同款：可审计/可回放，但不在"活跃会话"面展示）。
+	fork bool
 }
 
 // projection 是 host 的**内存投影**：session 目录 + 每个 session 最新的
@@ -131,6 +135,10 @@ func (p *projection) apply(ev *contracts.Event) {
 	} else {
 		st.agentEvents++
 	}
+	// /btw 旁支 fork 标记（v3-S2 K29）：本 session 是 fork → 不进在线表（见 rows）。
+	if ev.Kind == KindBtwForked {
+		st.fork = true
+	}
 	if ev.Kind == loop.KindContextAssembled && len(ev.Payload) > 0 {
 		// 最新一条覆盖（LWW，按 seq 顺序天然成立：扫描按 seq 升序）。
 		p.contexts[sid] = append(json.RawMessage(nil), ev.Payload...)
@@ -147,6 +155,10 @@ func (p *projection) rows(watermark int64, limit int) []SessionRow {
 		if st.hubEvents > 0 && st.agentEvents == 0 {
 			// hub 伪 session（只承载 hub.* 基础设施事件）：在线表只列 agent session。
 			// 判据是**事件族**而不是某个 id——派生口径变了也照样挡得住（p2-2）。
+			continue
+		}
+		if st.fork {
+			// /btw 旁支 fork（v3-S2 K29）：一次性旁支执行线，结果只回给用户、不进在线表。
 			continue
 		}
 		out = append(out, SessionRow{

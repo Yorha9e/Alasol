@@ -137,7 +137,14 @@ func (h *Hub) Presence(ctx context.Context, sessionID contracts.Ulid) (agentlink
 	if err != nil {
 		return agentlink.PresenceReport{}, err
 	}
-	return h.link.Presence(id, sessionID)
+	rep, err := h.link.Presence(id, sessionID)
+	if err != nil {
+		return rep, err
+	}
+	// 剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话——presence 面（谁在线）
+	// 与在线表（在线表面）必须同一个口径，不能一个看得见一个看不见。
+	rep.Peers = h.filterForkPeerPresence(rep.Peers)
+	return rep, nil
 }
 
 // Discover 按 gate / 按 agent 树查找（K18 Discover）。
@@ -155,7 +162,17 @@ func (h *Hub) Discover(ctx context.Context, q agentlink.DiscoverQuery) (agentlin
 		return agentlink.DiscoverResult{}, err
 	}
 	q.Caller = id
-	return h.link.Discover(q)
+	res, err := h.link.Discover(q)
+	if err != nil {
+		return res, err
+	}
+	// 剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话，不该出现在成员面。
+	res.Sessions = h.filterForkSessionPresence(res.Sessions)
+	// **Agents 面同样要剔**（N7）：agent 行带 session_id——只滤 Sessions 会留下
+	// "成员里没有它、agent 树里却有它"的自相矛盾（agentlink 的 Discover 按 agent_id
+	// 查时会回 agent 行）。
+	res.Agents = h.filterForkAgentPresence(res.Agents)
+	return res, nil
 }
 
 // Inquiry 深入查询一个 session（K18 Inquiry / Q6）：结构化摘要 + 事件窗口 + refs 核验。

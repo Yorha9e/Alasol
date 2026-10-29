@@ -107,7 +107,10 @@ type Hub struct {
 	joinLocks map[contracts.Ulid]*sync.Mutex
 	// injectWarned：注入区被截断的告警**只报一次**（工厂是 per-Run 的，不去重就是每轮一条）。
 	injectWarned bool
-	closed       bool
+	// btwPromote 是"从 /btw 生成全新 session"的预埋钩子（K29：只埋点不实现；nil = 不接）。
+	// 经 SetBtwPromoteHook 设置、RunBtw 完成后锁外触发（见 host/fork.go）。
+	btwPromote BtwPromoteFunc
+	closed     bool
 }
 
 // New 装配一个 Hub。
