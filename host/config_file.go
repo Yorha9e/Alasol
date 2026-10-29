@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/Yorha9e/alasol/runtime/mcp"
 )
 
 // 本文件实现 H15 的**用户级 TOML 配置**：凭据来源 = 进程 env + TOML 配置文件
@@ -61,6 +62,150 @@ type FileConfig struct {
 	Graph GraphFileConfig `toml:"graph"`
 	// Sandbox 沙箱执行环境（v2-S4，K8/H9；默认关 = 走 local，与 v1 等价）。
 	Sandbox SandboxFileConfig `toml:"sandbox"`
+	// MCP MCP client（v3-S1，N1：client 先；默认关 = 不连任何外部 server）。
+	MCP MCPFileConfig `toml:"mcp"`
+}
+
+// MCPFileConfig 是 MCP client 的文件级配置（v3-S1）。
+//
+// 形如：
+//
+//	[[mcp.servers]]
+//	name = "fs"                          # 必填；工具名前缀 mcp__fs__<tool>
+//	transport = "stdio"                  # stdio（默认）| http
+//	command = "npx"
+//	args = ["-y", "@scope/server-fs", "."]
+//	enabled = true
+//	env = { TOKEN = "..." }              # 子进程 env 直填（凭据；永不进日志）
+//	env_from = ["MY_TOKEN"]              # 从父进程 env 继承这些变量名
+//
+//	[[mcp.servers]]
+//	name = "remote"
+//	transport = "http"
+//	url = "http://127.0.0.1:1234/mcp"
+//	headers = { Authorization = "Bearer ..." }
+//
+// 口径（三条，与 host.Config.MCP 的注释一致，不重抄数字）：
+//
+//  1. **默认关**：`[[mcp.servers]]` 一条都没有 = 不装 MCP（零外部进程、零工具，
+//     与 v2 行为完全一致）。
+//  2. **deny-all 默认**：声明了 server 也只是"工具可见/可注册"，能不能调还要
+//     策略链放行（`allow` 里列 `mcp__<server>__<tool>`）与 agent 类型白名单
+//     （R5）双重同意。
+//  3. **凭据纪律**：`env` / `headers` 的值可能含 server 凭据，**永不进事件/日志**。
+//     本结构含凭据 → 绝不整体日志化，要打印用 Redacted()。
+type MCPFileConfig struct {
+	// Servers 是要连接的 server 列表（TOML 的数组表 [[mcp.servers]]）。
+	//
+	// enabled 的缺省口径：TOML 的 bool 零值是 false，所以"没写 enabled"会解析成
+	// false = 不连。这与"默认关"看似一致，实则误导——使用者写了一条 server 却
+	// 忘了 enabled，会得到"静默不连"。因此 host 侧对 enabled 未显式写的条目
+	// **按 true 处理**（见 host/mcp.go 的 normalizeEnabled），让"写了就要连"
+	// 成为默认，`enabled = false` 才是显式关闭。
+	Servers []MCPServerFileConfig `toml:"servers"`
+}
+
+// MCPServerFileConfig 是一个 MCP server 的文件级声明（[[mcp.servers]] 的元素）。
+//
+// 字段与 runtime/mcp.ServerConfig 一一对应；Dir 不暴露（文件级配置不该能改
+// 子进程工作目录——那会让"连一个工具 server"变成"在任意目录跑任意命令"）。
+type MCPServerFileConfig struct {
+	// Name server 逻辑名（工具名前缀 mcp__<server>__<tool> 的来源；全局唯一）。
+	Name string `toml:"name"`
+	// Transport 传输类型：stdio（缺省）| http。
+	Transport string `toml:"transport"`
+	// Enabled 是否启用。
+	//
+	// **指针**而不是 bool：TOML 的 bool 零值是 false，用值类型就无法区分
+	// "没写 enabled" 与 "写了 enabled = false"。没写 = 使用者声明了这条 server
+	// 却忘了开关 → 按 **true** 处理（"写了就要连"比"静默不连"好排查得多）；
+	// 只有显式 `enabled = false` 才是关闭。
+	Enabled *bool `toml:"enabled"`
+	// Command / Args 是 stdio 传输的进程声明（不走 shell）。
+	Command string   `toml:"command"`
+	Args    []string `toml:"args"`
+	// Env 是显式注入子进程的键值（**可能含凭据**；永不进事件/日志）。
+	Env map[string]string `toml:"env"`
+	// EnvFrom 是要从父进程 env 继承的**变量名**（只传名字，值在装配期取出）。
+	EnvFrom []string `toml:"env_from"`
+	// URL / Headers 是 http 传输的端点与请求头（Headers 可能含凭据）。
+	URL     string            `toml:"url"`
+	Headers map[string]string `toml:"headers"`
+	// TimeoutMs 连接/发现超时（毫秒；0 = 默认）。
+	TimeoutMs int `toml:"timeout_ms"`
+}
+
+// Redacted 返回凭据已打码的副本（**只有它输出的结构可安全落日志**，H12/H19）。
+func (c MCPFileConfig) Redacted() MCPFileConfig {
+	out := c
+	out.Servers = make([]MCPServerFileConfig, len(c.Servers))
+	for i, s := range c.Servers {
+		out.Servers[i] = s.Redacted()
+	}
+	return out
+}
+
+// Redacted 返回单个 server 的凭据打码副本（Env/Headers 的值 → "***"）。
+func (s MCPServerFileConfig) Redacted() MCPServerFileConfig {
+	out := s
+	out.Args = append([]string(nil), s.Args...)
+	out.EnvFrom = append([]string(nil), s.EnvFrom...)
+	if len(s.Env) > 0 {
+		out.Env = make(map[string]string, len(s.Env))
+		for k := range s.Env {
+			out.Env[k] = "***"
+		}
+	}
+	if len(s.Headers) > 0 {
+		out.Headers = make(map[string]string, len(s.Headers))
+		for k := range s.Headers {
+			out.Headers[k] = "***"
+		}
+	}
+	return out
+}
+
+// MCPConfig 把文件级配置折成 runtime/mcp.Config（host.Config.MCP 的**唯一来源**）。
+//
+// 只做搬运 + 两件事：
+//  1. `enabled` 未显式写的条目按 **true** 处理（理由见 MCPServerFileConfig.Enabled：
+//     "写了 server 却静默不连"比"多连一个"更难排查）；
+//  2. 没写 name 的条目照样搬过去——由 runtime/mcp.Config.Validate 给出
+//     "server 名不能为空"的明确错误（fail-close：不在这里静默丢弃，
+//     否则使用者以为连上了）。
+func (c MCPFileConfig) MCPConfig() mcp.Config {
+	out := mcp.Config{Servers: make([]mcp.ServerConfig, 0, len(c.Servers))}
+	for _, s := range c.Servers {
+		enabled := true
+		if s.Enabled != nil {
+			enabled = *s.Enabled
+		}
+		out.Servers = append(out.Servers, mcp.ServerConfig{
+			Name:      s.Name,
+			Transport: s.Transport,
+			Enabled:   enabled,
+			Command:   s.Command,
+			Args:      append([]string(nil), s.Args...),
+			Env:       copyEnvMap(s.Env),
+			EnvFrom:   append([]string(nil), s.EnvFrom...),
+			URL:       s.URL,
+			Headers:   copyEnvMap(s.Headers),
+			TimeoutMs: s.TimeoutMs,
+		})
+	}
+	return out
+}
+
+// copyEnvMap 拷一份键值表（nil 安全；不共享底层 map，防调用方改到配置内部）。
+func copyEnvMap(m map[string]string) map[string]string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // GraphFileConfig 是图投影的文件级配置（v2-S2）。
@@ -183,10 +328,15 @@ type MonitorFileConfig struct {
 // Redacted 返回一个凭据已打码的副本（供日志/诊断打印：**只有这个方法输出的结构可安全
 // 落日志**）。APIKey 非空 → "***"（保留"有没有设"的信息，不泄露值）；APIKeyEnv 是变量名
 // （非值）可原样保留。
+//
+// **MCP 段同样要打码**（v3-S1）：[[mcp.servers]] 的 env / headers 里放的就是
+// server 凭据——只打码 APIKey 而放过 MCP 段，等于让"可安全落日志"的承诺在最
+// 容易被忽略的那一段上失效（凭据纪律 H12/H19）。
 func (c FileConfig) Redacted() FileConfig {
 	if strings.TrimSpace(c.APIKey) != "" {
 		c.APIKey = "***"
 	}
+	c.MCP = c.MCP.Redacted()
 	return c
 }
 

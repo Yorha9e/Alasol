@@ -85,6 +85,10 @@ func runMain(args []string) int {
 		SandboxMaxActiveProcesses: pickInt(*sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
 		SandboxACLMaxObjects:      pickInt(*sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
 		SandboxStrictGroups:       pickBoolFlag(flagSet(fs, "sandbox-strict-groups"), *sandboxStrictGroups, fc.Sandbox.StrictGroups),
+
+		// MCP client（v3-S1，N1）：只走文件配置面（[[mcp.servers]]）。
+		// 默认关：一条都没有 = 不装 MCP（零外部进程、零工具）。
+		MCP: fc.MCP.MCPConfig(),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

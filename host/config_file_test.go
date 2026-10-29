@@ -1,6 +1,7 @@
 package host
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -192,6 +193,49 @@ func TestCredentialNeverInRedacted(t *testing.T) {
 	}
 }
 
+// TestFileConfigRedactedMasksMCPCredentials 钉死 **MCP 段也打码**：
+// FileConfig.Redacted() 是"只有它输出的结构可安全落日志"的唯一入口，
+// 而 [[mcp.servers]] 的 env / headers 里放的就是 server 凭据——只打码
+// APIKey 而放过 MCP 段，等于让这条承诺在最容易被忽略的那一段上失效。
+func TestFileConfigRedactedMasksMCPCredentials(t *testing.T) {
+	const (
+		envSecret    = "sk-mcp-env-SECRET"
+		headerSecret = "Bearer sk-mcp-header-SECRET"
+	)
+	fc := FileConfig{
+		APIKey: "sk-provider-SECRET",
+		MCP: MCPFileConfig{Servers: []MCPServerFileConfig{{
+			Name:    "fs",
+			Command: "npx",
+			Env:     map[string]string{"TOKEN": envSecret},
+			Headers: map[string]string{"Authorization": headerSecret},
+		}}},
+	}
+	red := fc.Redacted()
+
+	// 整体序列化（"整体日志化"的唯一安全途径）里不许出现任何凭据值。
+	dumped := mustJSONString(red)
+	for _, secret := range []string{envSecret, headerSecret, "sk-provider-SECRET"} {
+		if strings.Contains(dumped, secret) {
+			t.Fatalf("Redacted() 泄漏了凭据值 %q：%s", secret, dumped)
+		}
+	}
+	// 键名与 server 名保留（诊断价值）。
+	if red.MCP.Servers[0].Env["TOKEN"] != "***" {
+		t.Fatalf("MCP env 值未打码: %q", red.MCP.Servers[0].Env["TOKEN"])
+	}
+	if red.MCP.Servers[0].Headers["Authorization"] != "***" {
+		t.Fatalf("MCP headers 值未打码: %q", red.MCP.Servers[0].Headers["Authorization"])
+	}
+	if red.MCP.Servers[0].Name != "fs" {
+		t.Fatalf("server 名应保留: %q", red.MCP.Servers[0].Name)
+	}
+	// 原值不被改动（Redacted 返回副本）。
+	if fc.MCP.Servers[0].Env["TOKEN"] != envSecret {
+		t.Fatalf("Redacted() 不应改动原值")
+	}
+}
+
 // TestDefaultConfigPathShape 验证默认配置路径形态（平台相关；用 env 覆盖 HOME/XDG/APPDATA 探测）。
 func TestDefaultConfigPathShape(t *testing.T) {
 	home := t.TempDir()
@@ -232,4 +276,183 @@ func TestDefaultConfigPathShape(t *testing.T) {
 	if !strings.HasSuffix(filepath.ToSlash(p2), ".config/alasol/config.toml") {
 		t.Fatalf("无 XDG 应回落 ~/.config/alasol/config.toml: %q", p2)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// MCP client 文件级配置（v3-S1，N1）
+// ---------------------------------------------------------------------------
+
+// TestMCPFileConfigParses：TOML 的 [[mcp.servers]] 数组表完整解析
+// （命令/参数/env/headers/传输/开关）。
+func TestMCPFileConfigParses(t *testing.T) {
+	const body = `
+[[mcp.servers]]
+name = "fs"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@scope/server-fs", "."]
+env = { TOKEN = "sk-token" }
+env_from = ["MY_TOKEN"]
+timeout_ms = 5000
+
+[[mcp.servers]]
+name = "remote"
+transport = "http"
+url = "http://127.0.0.1:1234/mcp"
+headers = { Authorization = "Bearer x" }
+enabled = false
+`
+	fc, err := LoadFileConfig(writeConfig(t, body))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if len(fc.MCP.Servers) != 2 {
+		t.Fatalf("server 数 = %d，want 2", len(fc.MCP.Servers))
+	}
+	s0 := fc.MCP.Servers[0]
+	if s0.Name != "fs" || s0.Transport != "stdio" || s0.Command != "npx" {
+		t.Fatalf("server[0] 基本字段不对: %+v", s0)
+	}
+	if len(s0.Args) != 3 || s0.Args[1] != "@scope/server-fs" {
+		t.Fatalf("args = %v", s0.Args)
+	}
+	if s0.Env["TOKEN"] != "sk-token" {
+		t.Fatalf("env = %v", s0.Env)
+	}
+	if len(s0.EnvFrom) != 1 || s0.EnvFrom[0] != "MY_TOKEN" {
+		t.Fatalf("env_from = %v", s0.EnvFrom)
+	}
+	if s0.TimeoutMs != 5000 {
+		t.Fatalf("timeout_ms = %d", s0.TimeoutMs)
+	}
+	s1 := fc.MCP.Servers[1]
+	if s1.Transport != "http" || s1.URL != "http://127.0.0.1:1234/mcp" {
+		t.Fatalf("server[1] = %+v", s1)
+	}
+	if s1.Headers["Authorization"] != "Bearer x" {
+		t.Fatalf("headers = %v", s1.Headers)
+	}
+	if s1.Enabled == nil || *s1.Enabled {
+		t.Fatalf("enabled=false 应解析成指针 false（得到 %v）", s1.Enabled)
+	}
+}
+
+// TestMCPFileConfigEnabledDefaultTrue：**没写 enabled = true**。
+//
+// 这是本刀唯一一处"TOML bool 零值语义被反转"的地方，理由：用值类型时
+// "写了 server 却忘了 enabled" 会静默不连（比多连一个难排查得多）。
+func TestMCPFileConfigEnabledDefaultTrue(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if len(fc.MCP.Servers) != 1 {
+		t.Fatalf("server 数 = %d", len(fc.MCP.Servers))
+	}
+	if fc.MCP.Servers[0].Enabled != nil {
+		t.Fatalf("没写 enabled 时应为 nil（=未显式设置），得到 %v", *fc.MCP.Servers[0].Enabled)
+	}
+	// 折成 runtime/mcp.Config 后必须变成 true（"写了就要连"）。
+	cfg := fc.MCP.MCPConfig()
+	if len(cfg.Servers) != 1 || !cfg.Servers[0].Enabled {
+		t.Fatalf("MCPConfig 应把 enabled 缺省折成 true：%+v", cfg.Servers)
+	}
+	// 显式 false 仍要尊重。
+	fc2, err := LoadFileConfig(writeConfig(t, `
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+enabled = false
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if cfg2 := fc2.MCP.MCPConfig(); cfg2.Servers[0].Enabled {
+		t.Fatalf("显式 enabled=false 未被尊重")
+	}
+}
+
+// TestMCPFileConfigRedacted：凭据打码（**只有 Redacted() 输出可安全落日志**）。
+func TestMCPFileConfigRedacted(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+env = { TOKEN = "sk-token" }
+headers = { Authorization = "Bearer sk-token" }
+env_from = ["MY_TOKEN"]
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	red := fc.MCP.Redacted()
+	s := red.Servers[0]
+	if s.Env["TOKEN"] != "***" || s.Headers["Authorization"] != "***" {
+		t.Fatalf("凭据未打码: env=%v headers=%v", s.Env, s.Headers)
+	}
+	if len(s.EnvFrom) != 1 || s.EnvFrom[0] != "MY_TOKEN" {
+		t.Fatalf("env_from（变量名）应保留: %v", s.EnvFrom)
+	}
+	// 原配置不被改写。
+	if fc.MCP.Servers[0].Env["TOKEN"] != "sk-token" {
+		t.Fatalf("Redacted 改到了原配置")
+	}
+	if strings.Contains(mustJSONString(red), "sk-token") {
+		t.Fatalf("Redacted 输出仍含凭据值")
+	}
+}
+
+// TestMCPFileConfigEmpty：没有 [[mcp.servers]] → 零 server（默认关 = 不装 MCP）。
+func TestMCPFileConfigEmpty(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `model = "m"`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if len(fc.MCP.Servers) != 0 {
+		t.Fatalf("未配 server 时应为空，得到 %d", len(fc.MCP.Servers))
+	}
+	cfg := fc.MCP.MCPConfig()
+	if len(cfg.Servers) != 0 {
+		t.Fatalf("MCPConfig 应为空")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("空配置应通过校验: %v", err)
+	}
+}
+
+// TestMCPFileConfigBadEntries：坏条目经 MCPConfig → Validate 被拒（fail-close：
+// 不在文件层静默丢弃，否则使用者以为连上了）。
+func TestMCPFileConfigBadEntries(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+[[mcp.servers]]
+name = ""
+command = "npx"
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	cfg := fc.MCP.MCPConfig()
+	mustContainErr(t, cfg.Validate(), "server 名不能为空")
+}
+
+func mustContainErr(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("期望错误含 %q，得到 nil", want)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("错误信息不含 %q：%v", want, err)
+	}
+}
+
+func mustJSONString(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }

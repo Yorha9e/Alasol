@@ -203,7 +203,11 @@ func serveHub(ctx context.Context, h *host.Hub) error {
 	if err != nil {
 		return fmt.Errorf("监听 %s: %w", h.Addr(), err)
 	}
-	printBanner(ln.Addr().String(), h.GraphEnabled())
+	printBanner(ln.Addr().String(), bannerOptions{
+		GraphEnabled: h.GraphEnabled(),
+		MCPEnabled:   h.MCPEnabled(),
+		MCPTools:     len(h.MCPToolNames()),
+	})
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -222,8 +226,20 @@ func serveHub(ctx context.Context, h *host.Hub) error {
 	}
 }
 
+// bannerOptions 是 printBanner 的输入（图/MCP 两个可选能力的启用状态）。
+//
+// 用结构体而不是一长串位置参数：可选能力会继续增加（v3 的工作流引擎、tower），
+// 位置参数到第四个就开始出错且看不出谁是谁。
+type bannerOptions struct {
+	GraphEnabled bool
+	MCPEnabled   bool
+	// MCPTools 是已注册的 MCP 工具数（banner 只打**数量**——server 名/命令/env
+	// 可能含凭据，不进 stdout，H12/H19 同理）。
+	MCPTools int
+}
+
 // printBanner 打印就绪信息（地址从**真实监听器**取，端口是 0 时也能显示实际值）。
-func printBanner(addr string, graphEnabled bool) {
+func printBanner(addr string, opts bannerOptions) {
 	fmt.Printf("[alasol] hub 已就绪\n")
 	fmt.Printf("  Web UI   http://%s/\n", addr)
 	fmt.Printf("  事件流   ws://%s/ws（NDJSON）\n", addr)
@@ -232,11 +248,19 @@ func printBanner(addr string, graphEnabled bool) {
 	fmt.Printf("  可见性   http://%s/api/peers?session_id=...（K11 水平可见性）\n", addr)
 	fmt.Printf("  加 gate  curl -X POST http://%s/api/gates/join -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
 	fmt.Printf("  在线表配置 http://%s/api/online-table/config（GET 读 / POST 运行期调，K15 不重启）\n", addr)
-	if graphEnabled {
+	if opts.GraphEnabled {
 		// 图投影（v2-S2，G2f 可选投影）：启用了才提示——没启用时打这行会让人以为有数据。
 		fmt.Printf("  影响面   http://%s/api/graph/impact?roots=a,b（change_impact，G21/W16）\n", addr)
 	} else {
 		fmt.Printf("  图投影   未启用（-graph 开启后可用 /api/graph/impact，G2f 可选投影）\n")
+	}
+	if opts.MCPEnabled {
+		// MCP client（v3-S1，N1）：只打**工具数**——server 名/命令/env 可能含凭据，
+		// 不进 stdout（H12/H19 同款纪律）。deny-all 默认这件事必须写在 banner 里，
+		// 否则使用者会以为"连上了就能调"。
+		fmt.Printf("  MCP      已装配 %d 个外部工具（deny-all 默认：需 -allow 放行才可调用）\n", opts.MCPTools)
+	} else {
+		fmt.Printf("  MCP      未启用（配置文件写 [[mcp.servers]] 接入外部 MCP server，v3-S1）\n")
 	}
 	fmt.Printf("  健康     http://%s/api/health\n", addr)
 	fmt.Printf("  只监听 loopback（N5b）；Ctrl-C 退出\n")

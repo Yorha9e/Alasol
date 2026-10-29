@@ -16,6 +16,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
+	"github.com/Yorha9e/alasol/runtime/mcp"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/tools"
@@ -46,6 +47,12 @@ type runnerOpts struct {
 	// SandboxStrictGroups 是否启用严格组 SID 模式（见 sandbox.Policy.StrictGroupSIDs）。
 	SandboxStrictGroups bool
 
+	// MCP 是 MCP client 配置（v3-S1，N1：client 先）。**只走文件配置面**
+	// （[[mcp.servers]]）——不给 flag：server 列表是结构化数据（命令/参数/env），
+	// 硬塞进命令行既难写又容易把凭据泄进 shell 历史与 ps 输出（H12/H19）。
+	// 零值 = 不装 MCP（不连外部进程、不注册工具，与 v2 行为一致）。
+	MCP mcp.Config
+
 	// provider 覆盖（测试注入脚本 provider；nil = openai）
 	provider core.Provider
 	// approver 覆盖（测试注入；nil = 按 Approval 选）
@@ -62,6 +69,10 @@ type runner struct {
 	// 写入，进程退出不 Close 就会一直留在用户机器上（下次跑 alasol 会看到
 	// "别人加过的"排除项，而第一个的痕迹永远不撤）。
 	sandbox *sandbox.Env
+	// mcp 是 MCP client 管理器（v3-S1；nil = 未装配）。runner **持有**它是为了
+	// Close 时收尸——stdio server 是本进程拉起的，杀树归本进程（陷阱 5：
+	// 谁拉起谁收尸）。工具在装配期就进了 reg，loop 眼里它们与 read/write/bash 无异。
+	mcp *mcp.Manager
 }
 
 // newRunner 装配：store → bus → policy → registry（注册 read/write/bash）→ provider → approver → loop。
@@ -94,6 +105,27 @@ func newRunner(opts runnerOpts) (*runner, error) {
 	if err != nil {
 		st.Close()
 		return nil, err
+	}
+
+	// MCP client（v3-S1，N1）：外部 server 的工具注册进**同一个** reg——与内置工具
+	// 同一个入口、同一条 X1 三段写路径、同一套策略链与 R5 可见性。
+	//
+	// 配置错误（server 名重复 / transport 缺 command 或 url）→ 致命，拒绝装配：
+	// 那是使用者要修的。连接失败（命令不存在 / 握手超时 / tools/list 失败）→ 非致命，
+	// 记下来继续（坏 server 不该让 `alasol run` 跑不起来）。
+	mcpMgr, mcpErrs, err := assembleRunnerMCP(context.Background(), opts.MCP, reg)
+	if err != nil {
+		st.Close()
+		if sbEnv != nil {
+			_ = sbEnv.Close()
+		}
+		return nil, err
+	}
+	for _, e := range mcpErrs {
+		fmt.Fprintf(os.Stderr, "[alasol] MCP server 装配有问题（该 server 的工具未注册）: %v\n", e)
+	}
+	if names := mcpMgr.ToolNames(); len(names) > 0 {
+		fmt.Fprintf(os.Stderr, "[alasol] MCP 工具已注册：%v\n", names)
 	}
 
 	prov := opts.provider
@@ -134,9 +166,27 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		if sbEnv != nil {
 			_ = sbEnv.Close()
 		}
+		if mcpMgr != nil {
+			_ = mcpMgr.Close()
+		}
 		return nil, fmt.Errorf("构造 loop: %w", err)
 	}
-	return &runner{loop: lp, store: st, sandbox: sbEnv}, nil
+	return &runner{loop: lp, store: st, sandbox: sbEnv, mcp: mcpMgr}, nil
+}
+
+// assembleRunnerMCP 连接 opts.MCP 声明的 server 并把工具注册进 reg
+// （run / resume 与 host.New 共用同一套口径，见 host/mcp.go 的注释）。
+//
+// 返回 (manager, 非致命错误, 致命错误)。零 server → (nil, nil, nil)（不装 MCP）。
+func assembleRunnerMCP(ctx context.Context, cfg mcp.Config, reg *registry.Registry) (*mcp.Manager, []error, error) {
+	if len(cfg.Servers) == 0 {
+		return nil, nil, nil
+	}
+	mgr, err := mcp.New(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("MCP 配置: %w", err)
+	}
+	return mgr, mgr.Attach(ctx, reg), nil
 }
 
 // registerBuiltinTools 把 read/write/bash 三个内置工具注册进 reg（run 与 resume 共用）。
@@ -185,13 +235,17 @@ func (r *runner) Run(ctx context.Context, prompt string) (loop.Result, error) {
 	return r.loop.Run(ctx, prompt)
 }
 
-// Close 释放存储与沙箱（沙箱的 WER 排除项必须撤掉——F8）。
+// Close 释放存储、沙箱与 MCP 连接（沙箱的 WER 排除项必须撤掉——F8；
+// MCP 的 server 进程树必须收尸——陷阱 5）。
 func (r *runner) Close() {
 	if r.store != nil {
 		r.store.Close()
 	}
 	if r.sandbox != nil {
 		_ = r.sandbox.Close()
+	}
+	if r.mcp != nil {
+		_ = r.mcp.Close()
 	}
 }
 

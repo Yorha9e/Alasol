@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Yorha9e/alasol/host"
+	"github.com/Yorha9e/alasol/runtime/mcp"
 )
 
 // buildConfigFrom 是测试辅助：注册 flag → parse 给定 argv → buildConfig。
@@ -279,5 +280,106 @@ func TestBuildConfigGraphPrecedence(t *testing.T) {
 	}
 	if len(hc3.GraphCoreNodes) != 2 || hc3.GraphCoreNodes[0] != "host/*" {
 		t.Errorf("③ flag 的核心接口声明应覆盖文件: %v", hc3.GraphCoreNodes)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MCP client 配置面（v3-S1，N1）
+// ---------------------------------------------------------------------------
+
+// TestBuildConfigMCPFromFile：[[mcp.servers]] 从文件流进 host.Config.MCP。
+//
+// 口径：**只走文件配置面**（不给 flag——server 列表是结构化数据，硬塞进命令行
+// 既难写又容易把凭据泄进 shell 历史与 ps 输出）。
+func TestBuildConfigMCPFromFile(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := `
+model = "m"
+
+[[mcp.servers]]
+name = "fs"
+command = "npx"
+args = ["-y", "@scope/server-fs"]
+env = { TOKEN = "sk-token" }
+
+[[mcp.servers]]
+name = "remote"
+transport = "http"
+url = "http://127.0.0.1:1234/mcp"
+enabled = false
+`
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("buildConfig: %v", err)
+	}
+	if len(hc.MCP.Servers) != 2 {
+		t.Fatalf("MCP server 数 = %d，want 2", len(hc.MCP.Servers))
+	}
+	s0 := hc.MCP.Servers[0]
+	if s0.Name != "fs" || s0.Command != "npx" || !s0.Enabled {
+		t.Fatalf("server[0] = %+v", s0)
+	}
+	if len(s0.Args) != 2 || s0.Args[1] != "@scope/server-fs" {
+		t.Fatalf("args = %v", s0.Args)
+	}
+	s1 := hc.MCP.Servers[1]
+	if s1.Transport != mcp.TransportHTTP || s1.Enabled {
+		t.Fatalf("server[1] = %+v", s1)
+	}
+}
+
+// TestBuildConfigMCPDefaultOff：没写 [[mcp.servers]] → 零 server（默认关 =
+// 不装 MCP，与 v2 行为一致）。
+func TestBuildConfigMCPDefaultOff(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgFile, []byte("model = \"m\"\n"), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("buildConfig: %v", err)
+	}
+	if len(hc.MCP.Servers) != 0 {
+		t.Fatalf("未配 server 时 MCP 应为空，得到 %+v", hc.MCP.Servers)
+	}
+}
+
+// TestBuildConfigMCPBadConfigSurfaces：坏 MCP 配置**不会被静默吞掉**——
+// buildConfig 原样搬进 host.Config.MCP，由 host.Config.validate 拒（fail-close）。
+// （host 侧的 TestHubMCPBadConfigIsFatal 验的就是那个拒绝点；这里验"搬对了 +
+//
+//	校验能抓到"。）
+func TestBuildConfigMCPBadConfigSurfaces(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := `
+model = "m"
+
+[[mcp.servers]]
+name = "a"
+command = "x"
+
+[[mcp.servers]]
+name = "a"
+command = "y"
+`
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("buildConfig 自身不该拒（校验归 host）: %v", err)
+	}
+	if len(hc.MCP.Servers) != 2 {
+		t.Fatalf("两个 server 都应被搬进来（让校验去拒）：%+v", hc.MCP.Servers)
+	}
+	verr := hc.MCP.Validate()
+	if verr == nil {
+		t.Fatalf("重复 server 名应被拒")
+	}
+	if !strings.Contains(verr.Error(), "重复声明") {
+		t.Fatalf("错误信息应点名重复：%v", verr)
 	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/graph"
 	"github.com/Yorha9e/alasol/runtime/indexer"
+	"github.com/Yorha9e/alasol/runtime/mcp"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/tools"
@@ -75,6 +76,11 @@ type Hub struct {
 	// sandbox 是 v2-S4 沙箱执行环境（K8：可插拔 ExecutionEnv；nil = 未启用，
 	// 走 local）。启用时 Close 会撤掉 WER 排除项并收口残留 job 句柄。
 	sandbox *sandbox.Env
+	// mcpManager 是 v3-S1 的 MCP client 管理器（N1：client 先；nil = 未装配任何
+	// MCP server）。工具在装配期就进了 reg，loop 眼里它们与 read/write/bash 无异；
+	// hub 保留引用只为 Close 时收尸——stdio server 由本进程拉起，杀树归本进程
+	// （陷阱 5：谁拉起谁收尸）。
+	mcpManager *mcp.Manager
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -117,6 +123,37 @@ func New(cfg Config) (*Hub, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host: 打开事件库: %w", err)
 	}
+
+	// 装配失败时的**统一收口**（v3-S1）：
+	//
+	// 装配期已经拉起的东西——沙箱 env（WER 排除项是持久的用户级注册表写入，
+	// 没人 Close 就留在用户机器上，F8）、MCP server 子进程（stdio 由本进程
+	// exec，没人收尸就是孤儿进程，陷阱 5）、事件库——必须在**任何**失败路径上
+	// 全部收掉。
+	//
+	// 为什么用 defer 兜底而不是逐条路径手写：漏一条就是一次泄漏。本次修的
+	// 正是"assembleMCP 之后失败只关事件库"那条（stdio MCP server 变成孤儿），
+	// 以及它的邻居"沙箱 env 在工具注册失败时没人 Close"。
+	//
+	// （早期失败路径里那些 `_ = st.Close()` 留着无害——sqlite.Store.Close 是
+	// 幂等的；本 defer 是**唯一**保证 MCP / 沙箱被收的地方。）
+	var (
+		sbEnv     *sandbox.Env
+		mcpMgr    *mcp.Manager
+		assembled bool
+	)
+	defer func() {
+		if assembled {
+			return // 成功装配：资源归 Hub 所有（Close 时收）
+		}
+		if mcpMgr != nil {
+			_ = mcpMgr.Close() // 收尸 MCP server 进程树（谁拉起谁收尸）
+		}
+		if sbEnv != nil {
+			_ = sbEnv.Close() // 撤掉 WER 排除项（F8）
+		}
+		_ = st.Close()
+	}()
 
 	// 图投影（v2-S2，G2f 可选投影）：**默认不启用**——不建引擎、不驻留内存。
 	// 启用时先建读引擎（它只被查询时加载），再把它接成索引器写面的失效通知目标
@@ -176,7 +213,6 @@ func New(cfg Config) (*Hub, error) {
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
 	// 执行环境（K8：可插拔 ExecutionEnv）。**默认 local**（v1 等价，零沙箱开销）；
 	// Config.Sandbox=true 时换成 sandbox.Env——工具代码、loop、策略链一行不动。
-	var sbEnv *sandbox.Env
 	fsCap, execCap := core.FSCapability(local.FS{}), core.ExecCapability(local.Exec{})
 	if cfg.Sandbox {
 		env, serr := sandbox.New(cfg.sandboxPolicy())
@@ -212,6 +248,22 @@ func New(cfg Config) (*Hub, error) {
 			_ = st.Close()
 			return nil, fmt.Errorf("host: 注册工具 %s: %w", d.Name, err)
 		}
+	}
+
+	// MCP client（v3-S1，N1）：外部 server 的工具注册进**同一个** reg——与内置工具
+	// 同一个入口、同一条 X1 三段写路径、同一套策略链与可见性（R5）。
+	//
+	// 顺序在策略引擎建好之后：装配期不裁决策略（策略裁决发生在 loop 的每次调用），
+	// 但要把"哪些工具该出现"这件事在 hub 起来时就定下来。
+	//
+	// **内置工具先注册**：这样 MCP 工具若与内置撞名，撞的是"已注册的内置条目"——
+	// fail-close 的拒绝信息能点名是哪一个（runtime/mcp 的注册前检查）。
+	// 结构上前缀已经让撞名不可能（mcp__<server>__<tool>），这里是纵深防御。
+	var merr error
+	mcpMgr, merr = assembleMCP(context.Background(), cfg, reg)
+	if merr != nil {
+		_ = st.Close()
+		return nil, merr
 	}
 
 	prov := cfg.Provider
@@ -292,17 +344,20 @@ func New(cfg Config) (*Hub, error) {
 		onlineSource: &discoveryOnlineSource{table: disc, feed: discFeed},
 		graphEngine:  graphEngine,
 		sandbox:      sbEnv,
+		mcpManager:   mcpMgr,
 	}
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
 	if _, err := h.proj.catchUp(context.Background()); err != nil {
 		_ = h.Close()
+		assembled = true // h.Close 已收口（沙箱 / MCP / 事件库）
 		return nil, fmt.Errorf("host: 播种投影失败: %w", err)
 	}
 	// 播种发现表：join 历史 / agent 树投影从事件流重建（K10/G17b）。**老 session 不会
 	// 因此变回存活**——活状态是进程本地的，重启后全部失活（这是设计，不是遗漏）。
 	if _, err := h.discFeed.catchUp(context.Background()); err != nil {
 		_ = h.Close()
+		assembled = true
 		return nil, fmt.Errorf("host: 播种发现表失败: %w", err)
 	}
 
@@ -341,6 +396,7 @@ func New(cfg Config) (*Hub, error) {
 	wm, werr := worktree.NewManager(wtRoot)
 	if werr != nil {
 		_ = h.Close()
+		assembled = true
 		return nil, fmt.Errorf("host: 建 worktree 管理器: %w", werr)
 	}
 	// 登记表**启动时重建**（v2-S5 清账③）：登记表此前只是进程内存，hub 重启后
@@ -355,6 +411,8 @@ func New(cfg Config) (*Hub, error) {
 	}
 	h.worktrees = wm
 
+	// 装配成功：资源归 Hub 所有（Close 时收）——失败兜底不再插手。
+	assembled = true
 	return h, nil
 }
 
@@ -387,6 +445,14 @@ func (h *Hub) Close() error {
 	if h.sandbox != nil {
 		if err := h.sandbox.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("host: 关沙箱执行环境: %w", err))
+		}
+	}
+	// MCP server 进程树收尸（v3-S1，陷阱 5）：stdio server 是本进程拉起的，
+	// hub Close 时也由本进程杀树 + Wait。放在关库**之前**——server 可能还在
+	// 往里写东西（虽然它写的是自己的 stdio，不是我们的事件库）。
+	if h.mcpManager != nil {
+		if err := h.mcpManager.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("host: 关 MCP 连接: %w", err))
 		}
 	}
 	if err := h.store.Close(); err != nil {

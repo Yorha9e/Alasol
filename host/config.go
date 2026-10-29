@@ -12,6 +12,7 @@ import (
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
+	"github.com/Yorha9e/alasol/runtime/mcp"
 )
 
 // DefaultAddr 是 HTTP/WS 的默认监听地址（N5b：只监听 loopback）。
@@ -163,6 +164,26 @@ type Config struct {
 	// "只授予 Users 写权限的目录"（典型是 C:\ProgramData），代价是用 overlapped I/O
 	// 写文件的程序（Go/.NET/Rust/Node）会写不进去。
 	SandboxStrictGroups bool
+
+	// ---- v3-S1 MCP client（N1：client 先）----
+	//
+	// MCP 是否装配外部 server 的工具。**默认零值 = 不装**：不连任何外部进程、
+	// 不注册任何工具，与 v2 行为完全一致（酸测试不回归）。
+	//
+	// 口径与 Config.Graph / Config.Sandbox 同形态：opt-in 配置面 + 默认关 + 零开销。
+	// 装配后的工具走**既有管线**（同一个 registry 入口 → 同一条 X1 三段写路径 →
+	// 同一套策略链与 R5 可见性），core/loop 一行不改。
+	//
+	// 安全口径（写全，免得后人误以为"MCP 工具自动可用"）：
+	//   - **deny-all 默认**：策略引擎没有 allow 命中就拒绝（H5 fail-close）。
+	//     要放行得显式 `allow = ["mcp__<server>__<tool>"]`（或 "*"）；
+	//   - **R5 不暴露即不存在**：agent 类型的 tools[] 白名单没列它 → 模型看不见；
+	//   - **不给特权**：MCP 工具的描述比内置工具更保守（side_effect=write /
+	//     approvable=true / idempotent=false / replay=unsafe）；
+	//   - **凭据纪律**：MCP.Servers 里的 Env/Headers 可能含 server 凭据，
+	//     **永不进事件 / 日志 / 错误文案**（H12/H19）。host.Config 本身不得被
+	//     整体日志化；要打印用 MCP.Redacted()。
+	MCP mcp.Config
 }
 
 // validate 校验并归一化配置。
@@ -318,6 +339,12 @@ func (c *Config) validate() error {
 		if !filepath.IsAbs(d) {
 			return fmt.Errorf("host: Config.SandboxWriteDirs 必须是绝对路径（得到 %q）", d)
 		}
+	}
+	// MCP client（v3-S1）：配置面校验**前移到启动期**（与 tiered 窗口同一纪律）——
+	// 坏配置（server 名重复 / transport 缺 command 或 url / 传输类型不支持）
+	// 在 host.New 就炸，而不是拖到装配期或更糟地静默跳过。
+	if err := c.MCP.Validate(); err != nil {
+		return fmt.Errorf("host: Config.MCP: %w", err)
 	}
 	return nil
 }

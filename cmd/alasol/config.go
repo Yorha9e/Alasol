@@ -133,6 +133,12 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		SandboxMaxActiveProcesses: pickInt(*f.sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
 		SandboxACLMaxObjects:      pickInt(*f.sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
 		SandboxStrictGroups:       pickBoolFlag(f.explicitlySet("sandbox-strict-groups"), *f.sandboxStrictGroups, fc.Sandbox.StrictGroups),
+
+		// MCP client（v3-S1，N1）：**只走文件配置面**（[[mcp.servers]] 数组表）。
+		// 不给 flag：server 列表是结构化数据（命令/参数/env/headers），
+		// 硬塞进命令行既难写又容易把凭据泄进 shell 历史与 ps 输出（H12/H19）。
+		// 默认关：一条 [[mcp.servers]] 都没有 = 不装 MCP。
+		MCP: fc.MCP.MCPConfig(),
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。

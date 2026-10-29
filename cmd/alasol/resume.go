@@ -113,6 +113,24 @@ func resumeMain(args []string) int {
 		defer func() { _ = sbEnv.Close() }()
 	}
 
+	// MCP client（v3-S1，N1）：resume 的**重放路径真的执行**工具调用，所以被重放的
+	// op 若引用 `mcp__<server>__<tool>`，那个 server 必须在这儿连上——否则重放会
+	// 撞上"工具未注册"而失败（fail-close 但不可用）。
+	//
+	// 与 run/serve 同一配置面（[[mcp.servers]]）、同一装配口径（host/mcp.go）；
+	// 连接失败非致命（ surfaced 到 stderr，重放继续——不含 MCP 工具的 op 照常重放）。
+	mcpMgr, mcpErrs, merr := assembleRunnerMCP(context.Background(), fc.MCP.MCPConfig(), reg)
+	if merr != nil {
+		fmt.Fprintln(os.Stderr, "MCP 配置:", merr)
+		return 2
+	}
+	if mcpMgr != nil {
+		defer func() { _ = mcpMgr.Close() }() // 收尸：server 进程树归本进程（陷阱 5）
+	}
+	for _, e := range mcpErrs {
+		fmt.Fprintf(os.Stderr, "[alasol] MCP server 装配有问题（该 server 的工具未注册）: %v\n", e)
+	}
+
 	// provider：恢复流程本身只重放工具、不调模型（noop）；要**续跑对话**时才用真 provider。
 	prov := core.Provider(noopProvider{})
 	modelName := "resume"
