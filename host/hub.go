@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/Yorha9e/alasol/core/registry"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
+	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/graph"
 	"github.com/Yorha9e/alasol/runtime/indexer"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
@@ -70,6 +72,9 @@ type Hub struct {
 	// graphEngine 是 v2-S2 图投影的读引擎（G2f：**可选投影**；nil = 未启用）。
 	// 未启用时宿主不建它、不驻留内存，索引器也不建图表（零图开销，酸测试）。
 	graphEngine *graph.Engine
+	// sandbox 是 v2-S4 沙箱执行环境（K8：可插拔 ExecutionEnv；nil = 未启用，
+	// 走 local）。启用时 Close 会撤掉 WER 排除项并收口残留 job 句柄。
+	sandbox *sandbox.Env
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -169,10 +174,33 @@ func New(cfg Config) (*Hub, error) {
 	eng := policy.New(rules...)
 
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
+	// 执行环境（K8：可插拔 ExecutionEnv）。**默认 local**（v1 等价，零沙箱开销）；
+	// Config.Sandbox=true 时换成 sandbox.Env——工具代码、loop、策略链一行不动。
+	var sbEnv *sandbox.Env
+	fsCap, execCap := core.FSCapability(local.FS{}), core.ExecCapability(local.Exec{})
+	if cfg.Sandbox {
+		env, serr := sandbox.New(cfg.sandboxPolicy())
+		if serr != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("host: 装配 SandboxedExecutionEnv: %w", serr)
+		}
+		sbEnv = env
+		fsCap, execCap = env, env
+		for _, d := range env.Diagnostics() {
+			lvl := slog.LevelInfo
+			if !d.OK {
+				lvl = slog.LevelWarn
+			}
+			hubLog.Log(context.Background(), lvl, "host: 沙箱埋点",
+				"kind", d.Kind, "ok", d.OK, "detail", d.Detail)
+		}
+		hubLog.Info("host: 已启用 SandboxedExecutionEnv",
+			"backend", env.BackendName(), "allowed_roots", env.AllowedRoots())
+	}
 	execs := map[string]core.ToolExecutor{
-		"read":  tools.NewRead(local.FS{}),
-		"write": tools.NewWrite(local.FS{}),
-		"bash":  tools.NewBash(local.Exec{}),
+		"read":  tools.NewRead(fsCap),
+		"write": tools.NewWrite(fsCap),
+		"bash":  tools.NewBash(execCap),
 	}
 	for _, d := range tools.Descriptors() {
 		ex, ok := execs[d.Name]
@@ -257,6 +285,7 @@ func New(cfg Config) (*Hub, error) {
 		onlineConfig: onlineCfg,
 		onlineSource: &discoveryOnlineSource{table: disc, feed: discFeed},
 		graphEngine:  graphEngine,
+		sandbox:      sbEnv,
 	}
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
@@ -337,6 +366,11 @@ func (h *Hub) Close() error {
 	}
 	if h.monitor != nil {
 		h.monitor.Stop()
+	}
+	if h.sandbox != nil {
+		if err := h.sandbox.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("host: 关沙箱执行环境: %w", err))
+		}
 	}
 	if err := h.store.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("host: 关事件库: %w", err))

@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"path/filepath"
 	"strings"
 
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/core/loop"
+	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 )
 
 // DefaultAddr 是 HTTP/WS 的默认监听地址（N5b：只监听 loopback）。
@@ -135,6 +137,32 @@ type Config struct {
 	// GraphEscalateReachable 是 change_impact 的 escalate 阈值（可达节点数超过它才触发；
 	// 0 = 默认 50）。W15：风险闸门，不是预算上限。
 	GraphEscalateReachable int
+
+	// ---- v2-S4 沙箱（K8/H9）----
+	//
+	// Sandbox 是否把工具执行环境从 LocalExecutionEnv 换成 SandboxedExecutionEnv
+	// （runtime/cap/sandbox）。**默认 false = 与 v1 等价**（走 runtime/cap/local）。
+	//
+	// 形态对齐 Config.Graph（v2-S2）：一个 opt-in 布尔开关，默认关、零开销。
+	// K8 的酸测试就在这儿——换 env 实现**不动 agent 逻辑/工具代码**，只换装配。
+	Sandbox bool
+	// SandboxWriteDirs 是沙箱的"允许写根"集合（空 = 只用 CWD + 沙箱自管临时根）。
+	//
+	// 语义见 sandbox.Policy.AllowedRoots（写与读分开说）：
+	// 根之外**写**被内核拒绝（除 BUILTIN\Users 有写权限的位置，默认模式下的已知残留）；
+	// 根之外**用户私有文件**（.env/.ssh）读不到，系统位置默认仍可读。
+	SandboxWriteDirs []string
+	// SandboxMaxActiveProcesses 是 job object 的活动进程上限（0 = 框架默认 64）。
+	// fork 炸弹的有界化：进程数有上限，最坏情况才是有界的最坏情况。
+	SandboxMaxActiveProcesses int
+	// SandboxACLMaxObjects 是给允许根施加 ACL 前数子树对象的上限（0 = 框架默认）。
+	// 防止允许根被误配成 `C:\` 这种大根——可继承 ACE 会传播到既有子对象。
+	SandboxACLMaxObjects int
+	// SandboxStrictGroups 是否启用**严格组 SID 模式**（把 BUILTIN 的 Users SID 也
+	// deny-only）。见 sandbox.Policy.StrictGroupSIDs 的取舍说明：严格模式堵上
+	// "只授予 Users 写权限的目录"（典型是 C:\ProgramData），代价是用 overlapped I/O
+	// 写文件的程序（Go/.NET/Rust/Node）会写不进去。
+	SandboxStrictGroups bool
 }
 
 // validate 校验并归一化配置。
@@ -275,7 +303,38 @@ func (c *Config) validate() error {
 	if c.GraphEscalateReachable < 0 {
 		return fmt.Errorf("host: Config.GraphEscalateReachable 不能为负（得到 %d；0 = 框架默认）", c.GraphEscalateReachable)
 	}
+	// 沙箱（v2-S4，K8/H9）：负值拒绝；0 = 框架默认。允许根必须是绝对路径
+	// （sandbox.Policy.Validate 会再校一遍，这里先给一句宿主层的早错）。
+	if c.SandboxMaxActiveProcesses < 0 {
+		return fmt.Errorf("host: Config.SandboxMaxActiveProcesses 不能为负（得到 %d；0 = 框架默认）", c.SandboxMaxActiveProcesses)
+	}
+	if c.SandboxACLMaxObjects < 0 {
+		return fmt.Errorf("host: Config.SandboxACLMaxObjects 不能为负（得到 %d；0 = 框架默认）", c.SandboxACLMaxObjects)
+	}
+	for _, d := range c.SandboxWriteDirs {
+		if strings.TrimSpace(d) == "" {
+			return fmt.Errorf("host: Config.SandboxWriteDirs 含空路径")
+		}
+		if !filepath.IsAbs(d) {
+			return fmt.Errorf("host: Config.SandboxWriteDirs 必须是绝对路径（得到 %q）", d)
+		}
+	}
 	return nil
+}
+
+// sandboxPolicy 把宿主配置折成 sandbox.Policy（**唯一装配处**：配置校验与沙箱工厂共用，
+// 避免两处口径漂移——与 contextStrategyParams / graphLimits 同一纪律）。
+//
+// 口径本身在 host/sandbox.go 的 SandboxPolicy 里（cmd/alasol 的 run/resume 也调它），
+// 这里只负责把 Config 的字段搬过去。
+func (c *Config) sandboxPolicy() sandbox.Policy {
+	return SandboxPolicy(SandboxOptions{
+		WriteDirs:          c.SandboxWriteDirs,
+		CWD:                c.CWD,
+		MaxActiveProcesses: c.SandboxMaxActiveProcesses,
+		ACLMaxObjects:      c.SandboxACLMaxObjects,
+		StrictGroups:       c.SandboxStrictGroups,
+	})
 }
 
 // contextStrategyParams 把宿主配置折成 compaction.Params（**唯一装配处**：配置校验与

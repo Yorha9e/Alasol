@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -125,6 +126,13 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		GraphMaxResults:        pickInt(*f.graphMaxResults, fc.Graph.MaxResults),
 		GraphCoreNodes:         graphCoreNodes(f, fc),
 		GraphEscalateReachable: pickInt(*f.graphEscalate, fc.Graph.EscalateReachable),
+
+		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
+		Sandbox:                   sandboxEnabled(f, fc),
+		SandboxWriteDirs:          sandboxWriteDirs(f, fc),
+		SandboxMaxActiveProcesses: pickInt(*f.sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
+		SandboxACLMaxObjects:      pickInt(*f.sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
+		SandboxStrictGroups:       pickBoolFlag(f.explicitlySet("sandbox-strict-groups"), *f.sandboxStrictGroups, fc.Sandbox.StrictGroups),
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
@@ -144,6 +152,18 @@ func flagIfSet(f *hubFlags, name, flagVal string) string {
 // pickInt 取第一个非零值（flag 优先，0=未设）。
 func pickInt(flagVal, fileVal int) int {
 	if flagVal != 0 {
+		return flagVal
+	}
+	return fileVal
+}
+
+// pickBoolFlag 解析布尔开关（显式 flag > 文件 > 默认 false）。
+//
+// 布尔 flag 的口径与 int 不一样：false 是**合法值**（用户可以显式关掉），
+// 所以"flag > 文件"要看**显式设置**而不是"值非零"——
+// 由调用方用 explicitlySet / flagSet 判定（见 sandboxEnabledFlag）。
+func pickBoolFlag(explicit bool, flagVal bool, fileVal bool) bool {
+	if explicit {
 		return flagVal
 	}
 	return fileVal
@@ -219,6 +239,53 @@ func graphCoreNodes(f *hubFlags, fc *host.FileConfig) []string {
 	}
 	if len(fc.Graph.Core) > 0 {
 		return fc.Graph.Core
+	}
+	return nil
+}
+
+// sandboxEnabled 解析沙箱开关（v2-S4，K8/H9）：显式 flag > 文件。默认关。
+func sandboxEnabled(f *hubFlags, fc *host.FileConfig) bool {
+	return sandboxEnabledFlag(f.explicitlySet("sandbox"), *f.sandbox, fc)
+}
+
+// sandboxEnabledFlag 解析沙箱开关（**唯一口径**：显式 flag > 文件 > 默认关）。
+//
+// F20：`alasol run` 之前写的是 `*sandboxEnabled || fc.Sandbox.Enabled`——
+// `-sandbox=false` **压不过**文件里的 enabled=true（"||" 只会把 false 变成 true）。
+// 口径统一成"显式 flag 优先"：显式设了 flag 就是用户说了，文件让位。
+//
+// 参数 explicit 由各命令自己判定（hubFlags 走 f.explicitlySet；run/resume 走 flagSet）。
+func sandboxEnabledFlag(explicit bool, flagVal bool, fc *host.FileConfig) bool {
+	if explicit {
+		return flagVal
+	}
+	return fc.Sandbox.Enabled
+}
+
+// flagSet 报告某个 flag 是否被**显式**设置（区别于"用了默认值"）。
+//
+// run / resume 各自有自己的 FlagSet（不是 hubFlags），所以需要这个通用版；
+// 口径与 hubFlags.explicitlySet 一致（fs.Visit 只回调被显式设置过的 flag）。
+func flagSet(fs *flag.FlagSet, name string) bool {
+	if fs == nil {
+		return false
+	}
+	set := false
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == name {
+			set = true
+		}
+	})
+	return set
+}
+
+// sandboxWriteDirs 解析沙箱允许写根（v2-S4）：显式 flag（逗号分隔）> 文件（列表）。
+func sandboxWriteDirs(f *hubFlags, fc *host.FileConfig) []string {
+	if f.explicitlySet("sandbox-write-dirs") {
+		return splitList(*f.sandboxWriteDirs)
+	}
+	if len(fc.Sandbox.WriteDirs) > 0 {
+		return fc.Sandbox.WriteDirs
 	}
 	return nil
 }

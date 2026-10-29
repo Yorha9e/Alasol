@@ -53,6 +53,13 @@ type hubFlags struct {
 	graphMaxResults   *int
 	graphCore         *string
 	graphEscalate     *int
+
+	// ---- v2-S4 沙箱（K8/H9）----
+	sandbox              *bool
+	sandboxWriteDirs     *string
+	sandboxMaxActive     *int
+	sandboxACLMaxObjects *int
+	sandboxStrictGroups  *bool
 	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
 	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
 	set map[string]bool
@@ -96,6 +103,27 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		graphMaxResults:   fs.Int("graph-max-results", 0, "多跳遍历结果上限（0=默认 5000，G18）"),
 		graphCore:         fs.String("graph-core", "", "核心接口节点声明（逗号分隔；`*` 结尾=字节前缀，如 core/*,contracts/*；W16）"),
 		graphEscalate:     fs.Int("graph-escalate-reachable", 0, "change_impact 的 escalate 阈值：可达节点数超过它才触发（0=默认 50，W15）"),
+
+		// 沙箱（v2-S4，K8/H9）：默认关（与 v1 等价）。开了之后 bash 写允许目录之外
+		// 会被 **OS 拒**（Windows: job object + 受限 token + 目录 ACL）。
+		//
+		// 诚实边界（写进帮助里，别让用户以为"开了沙箱 = 系统更干净"）：
+		//   - 沙箱会**改写允许根的 DACL**（追加可继承 ACE）且**不还原**；
+		//   - 默认模式下装在 Program Files 的工具（go/git/python）**可正常运行**
+		//     （它们读自己的资源靠 BUILTIN\Users，而默认模式保留该组）；
+		//     只有 -sandbox-strict-groups 才会让它们读不到自己的资源。
+		sandbox: fs.Bool("sandbox", false,
+			"启用 SandboxedExecutionEnv（v2-S4，K8/H9；默认关=走 local，与 v1 等价）。"+
+				"注意：会改写允许根的 DACL 且不还原"),
+		sandboxWriteDirs: fs.String("sandbox-write-dirs", "",
+			"沙箱允许写根（逗号分隔）。口径：显式列出的根 **+ CWD** 一起进允许集（沙箱自管的临时根也在内）。"+
+				"根之外的写被内核拒绝（用户私有文件也读不到；系统位置默认仍可读）"),
+		sandboxMaxActive:     fs.Int("sandbox-max-active", 0, "沙箱 job object 活动进程上限（0=默认 64；fork 炸弹有界化）"),
+		sandboxACLMaxObjects: fs.Int("sandbox-acl-max-objects", 0, "沙箱施加 ACL 前数子树对象的上限（0=默认 20 万；超限即拒，防误配成大根）"),
+		sandboxStrictGroups: fs.Bool("sandbox-strict-groups", false,
+			"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）。"+
+				"开了能堵上 C:\\ProgramData 这类只授予 Users 写权限的目录；"+
+				"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去"),
 	}
 }
 

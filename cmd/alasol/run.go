@@ -28,6 +28,17 @@ func runMain(args []string) int {
 	checkpointEvery := fs.Int("checkpoint-every", 0, "每 N 轮自动 checkpoint（X3；0=只手动）")
 	system := fs.String("system", "", "系统提示")
 	configPath := fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15）")
+
+	sandboxEnabled := fs.Bool("sandbox", false,
+		"启用 SandboxedExecutionEnv（v2-S4，K8/H9；默认关=走 local）。注意：会改写允许根的 DACL 且不还原")
+	sandboxWriteDirs := fs.String("sandbox-write-dirs", "",
+		"沙箱允许写根（逗号分隔）。口径：显式列出的根 **+ CWD** 一起进允许集（沙箱自管的临时根也在内）")
+	sandboxMaxActive := fs.Int("sandbox-max-active", 0, "沙箱 job object 活动进程上限（0=默认 64）")
+	sandboxACLMaxObjects := fs.Int("sandbox-acl-max-objects", 0, "沙箱施加 ACL 前数子树对象的上限（0=默认 20 万）")
+	sandboxStrictGroups := fs.Bool("sandbox-strict-groups", false,
+		"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）。"+
+			"开了能堵上 C:\\ProgramData 这类只授予 Users 写权限的目录；"+
+			"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去")
 	_ = fs.Parse(args)
 	if *prompt == "" {
 		fmt.Fprintln(os.Stderr, "-prompt 不能为空")
@@ -59,16 +70,21 @@ func runMain(args []string) int {
 	defer stop()
 
 	r, err := newRunner(runnerOpts{
-		Model:           modelName,
-		BaseURL:         baseURLVal,
-		APIKey:          apiKey, // env>文件 已收敛；永不进 argv/事件/日志
-		Approval:        *approval,
-		Allow:           *allow,
-		DBPath:          *dbPath,
-		MaxTurns:        *maxTurns,
-		CheckpointEvery: *checkpointEvery,
-		System:          *system,
-		SessionEnv:      sessionEnvFromProcess(),
+		Model:                     modelName,
+		BaseURL:                   baseURLVal,
+		APIKey:                    apiKey, // env>文件 已收敛；永不进 argv/事件/日志
+		Approval:                  *approval,
+		Allow:                     *allow,
+		DBPath:                    *dbPath,
+		MaxTurns:                  *maxTurns,
+		CheckpointEvery:           *checkpointEvery,
+		System:                    *system,
+		SessionEnv:                sessionEnvFromProcess(),
+		Sandbox:                   sandboxEnabledFlag(flagSet(fs, "sandbox"), *sandboxEnabled, fc),
+		SandboxWriteDirs:          sandboxRunDirs(fs, *sandboxWriteDirs, fc),
+		SandboxMaxActiveProcesses: pickInt(*sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
+		SandboxACLMaxObjects:      pickInt(*sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
+		SandboxStrictGroups:       pickBoolFlag(flagSet(fs, "sandbox-strict-groups"), *sandboxStrictGroups, fc.Sandbox.StrictGroups),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)
@@ -90,5 +106,22 @@ func runMain(args []string) int {
 // v0 不给模型看任何 env；这里只装配**执行 env** 的 session 级部分。
 func sessionEnvFromProcess() map[string]string {
 	// v0：session 级注入留空——需要时按 H21 由配置显式声明，不隐式继承。
+	return nil
+}
+
+// sandboxRunDirs 解析 `alasol run` 的沙箱允许写根（v2-S4）：显式 flag > 文件。
+//
+// 与 serve/chat 的 sandboxWriteDirs 同口径（splitList / pickInt 都是 cmd 包里现成的
+// helper，不另造一份——D21：口径只在源头定义一次）。
+//
+// 注意：**显式 flag 优先于文件**（F20）——`-sandbox-write-dirs ""` 也能压掉文件里的
+// write_dirs（flag 显式设了就是"用户说了"）。
+func sandboxRunDirs(fs *flag.FlagSet, flagVal string, fc *host.FileConfig) []string {
+	if flagSet(fs, "sandbox-write-dirs") {
+		return splitList(flagVal)
+	}
+	if len(fc.Sandbox.WriteDirs) > 0 {
+		return fc.Sandbox.WriteDirs
+	}
 	return nil
 }

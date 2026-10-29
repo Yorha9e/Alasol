@@ -15,6 +15,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
@@ -49,6 +50,20 @@ func resumeMain(args []string) int {
 	model := fs.String("model", "", "模型名（续跑时用；缺省回落 env ALASOL_MODEL）")
 	baseURL := fs.String("base-url", "", "OpenAI 兼容端点（续跑时用；空=官方）")
 	apiKeyEnv := fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名（续跑时用）")
+
+	// 沙箱（v2-S4）：**重放同样要受约束**（F9）。
+	//
+	// 之前 resume 一律用 local 执行重放的工具调用——于是"当初在沙箱里跑过的操作"
+	// 在恢复时以宿主身份真的执行一遍（fail-open）。口径与 run/serve 一致：
+	// 显式 flag > 配置文件 > 默认关。
+	sandboxEnabled := fs.Bool("sandbox", false, "启用 SandboxedExecutionEnv（v2-S4；重放同样受约束）")
+	sandboxWriteDirs := fs.String("sandbox-write-dirs", "",
+		"沙箱允许写根（逗号分隔）。口径：显式列出的根 **+ CWD** 一起进允许集")
+	sandboxMaxActive := fs.Int("sandbox-max-active", 0, "沙箱 job object 活动进程上限（0=默认 64）")
+	sandboxACLMaxObjects := fs.Int("sandbox-acl-max-objects", 0, "沙箱施加 ACL 前数子树对象的上限（0=默认 20 万）")
+	sandboxStrictGroups := fs.Bool("sandbox-strict-groups", false,
+		"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）")
+	configPath := fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15）")
 	_ = fs.Parse(args)
 
 	if *session == "" {
@@ -68,11 +83,34 @@ func resumeMain(args []string) int {
 	}
 	defer st.Close()
 
+	// 配置文件（H15）：沙箱开关/允许根可以写在文件里（与 run/serve 同口径）。
+	fc, err := host.LoadFileConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if fc == nil {
+		fc = &host.FileConfig{}
+	}
+
 	// registry：内置 read/write/bash（resume 重放工具用）。
+	//
+	// 沙箱：重放**真的执行**工具调用，必须与当初一样受约束（F9：fail-open 的修法）。
 	reg := registry.New(registry.NewPolicyAdjudicator(policy.New()))
-	if err := registerBuiltinTools(reg); err != nil {
+	sbEnv, err := registerBuiltinTools(reg, runnerOpts{
+		Sandbox:                   sandboxEnabledFlag(flagSet(fs, "sandbox"), *sandboxEnabled, fc),
+		SandboxWriteDirs:          sandboxResumeDirs(fs, *sandboxWriteDirs, fc),
+		SandboxMaxActiveProcesses: pickInt(*sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
+		SandboxACLMaxObjects:      pickInt(*sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
+		SandboxStrictGroups:       pickBoolFlag(flagSet(fs, "sandbox-strict-groups"), *sandboxStrictGroups, fc.Sandbox.StrictGroups),
+	})
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配工具注册表:", err)
 		return 1
+	}
+	// 沙箱必须收掉（WER 排除项是持久的用户级注册表写入，F8）。
+	if sbEnv != nil {
+		defer func() { _ = sbEnv.Close() }()
 	}
 
 	// provider：恢复流程本身只重放工具、不调模型（noop）；要**续跑对话**时才用真 provider。
@@ -167,6 +205,19 @@ func resumeMain(args []string) int {
 	fmt.Println(res.Text)
 	fmt.Fprintf(os.Stderr, "[resume] 续跑 turns=%d tool_calls=%d events=%d\n", res.Turns, res.ToolCalls, res.Events)
 	return 0
+}
+
+// sandboxResumeDirs 解析 `alasol resume` 的沙箱允许写根（v2-S4）：显式 flag > 文件。
+//
+// 与 run 的 sandboxRunDirs 同口径（F20/F21：同一个解析规则）。
+func sandboxResumeDirs(fs *flag.FlagSet, flagVal string, fc *host.FileConfig) []string {
+	if flagSet(fs, "sandbox-write-dirs") {
+		return splitList(flagVal)
+	}
+	if len(fc.Sandbox.WriteDirs) > 0 {
+		return fc.Sandbox.WriteDirs
+	}
+	return nil
 }
 
 // dumpReport 把 ResumeReport 打印成缩进 JSON（单命令一行输出）。

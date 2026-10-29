@@ -59,6 +59,8 @@ type FileConfig struct {
 	ContextRules string `toml:"context_rules"`
 	// Graph 图投影（v2-S2，G2f 可选投影；默认关 = 零图开销）。
 	Graph GraphFileConfig `toml:"graph"`
+	// Sandbox 沙箱执行环境（v2-S4，K8/H9；默认关 = 走 local，与 v1 等价）。
+	Sandbox SandboxFileConfig `toml:"sandbox"`
 }
 
 // GraphFileConfig 是图投影的文件级配置（v2-S2）。
@@ -91,6 +93,44 @@ type GraphFileConfig struct {
 	Core []string `toml:"core"`
 	// EscalateReachable change_impact 的 escalate 阈值（可达节点数；0 = 默认 50）。
 	EscalateReachable int `toml:"escalate_reachable"`
+}
+
+// SandboxFileConfig 是沙箱执行环境的文件级配置（v2-S4，K8/H9）。
+//
+// 形如：
+//
+//	[sandbox]
+//	enabled = true
+//	write_dirs = ["D:\\repo"]
+//	max_active_processes = 64
+//	acl_max_objects = 200000
+//
+// 口径：**enabled 为 false（默认）= 未启用沙箱**，工具执行环境走 runtime/cap/local
+// （与 v1 等价，零沙箱开销）。开了之后：
+//
+//   - bash / cmd 起在**受限 token** 下（用户 SID 转 deny-only + 删危险特权）；
+//   - 子进程纳入 **job object**（KILL_ON_JOB_CLOSE 收容整棵进程树）；
+//   - `write_dirs` 里的根被设 DACL，**根之外的写被内核拒绝**（OS 强制，不是路径守卫；
+//     例外：BUILTIN\Users 有写权限的位置如 C:\ProgramData 在默认模式下仍可写）；
+//   - 根之外的**用户私有文件**（.env/.ssh）读不到；系统位置默认仍可读
+//     （严格模式 strict_groups = true 才连读一起收紧）。
+//
+// `write_dirs` 空 = 只用 CWD + 沙箱自管临时根（子进程的 TMP/TEMP 会指到后者）。
+// 上界 0 = 框架默认（活动进程 64 / ACL 对象 20 万）。
+type SandboxFileConfig struct {
+	// Enabled 是否启用沙箱执行环境（默认 false = 走 local）。
+	Enabled bool `toml:"enabled"`
+	// WriteDirs 允许写根（绝对路径；空 = CWD + 沙箱临时根）。
+	WriteDirs []string `toml:"write_dirs"`
+	// MaxActiveProcesses job object 的活动进程上限（0 = 默认 64）。
+	MaxActiveProcesses int `toml:"max_active_processes"`
+	// ACLMaxObjects 施加 ACL 前数子树对象的上限（0 = 默认 20 万；超限即拒）。
+	ACLMaxObjects int `toml:"acl_max_objects"`
+	// StrictGroups 严格组 SID 模式（默认 false = 保留 BUILTIN 的 Users SID）。
+	//
+	// 严格模式把"只授予 Users 写权限的目录"（典型是 C:\ProgramData）也堵上，
+	// 代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去。
+	StrictGroups bool `toml:"strict_groups"`
 }
 
 // ContextStrategyFileConfig 是上下文装配策略的文件级配置（v2-S1）。
