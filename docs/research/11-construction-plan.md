@@ -200,7 +200,20 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 
 （原清单里的 MCP / 深度压缩 / 评测已在 v3 / v2 / v4 归位，见 `12-roadmap.md`。）
 
+### v2 · 深度压缩与能力增强（施工切分，2026-10-29）
+
+> 每阶段照旧过退出评审循环（critic→reviewer→clean）+ 提交 `refs 07/…`。v2-S1 是 `13-context-system.md`「预备单位」的转正施工：`context_strategy` **可挂可不挂**，不挂时 append 兜底、换策略 core 零改动（酸测试）。压缩两级锚定 **L1≤10% / L2≤1%**（J9，可配初值），级联走 **goal ledger C 案**（J17/J18/J19），缓存定律照 13 §6（J20 量化留实现校准）。
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **v2-S1 深度压缩** | ① `context_strategy` 预备单位装配点（core/loop 装配层；**X1 三段写路径一字不动**、`user.prompt`/`model.turn` 旁路不变）② 两级压缩：L1=摘要**含具体工程操作**+指针→持久化原文、L2=结论+一根指针（13 §5）③ `recall(ref)` 工具取原文（ref=`stage:N`，seq 区间给机器），指针条目自带使用说明；refs **永不指摘要** ④ 阶段边界=验证通过点（critic clean / gate receipt），水位只当兜底护栏 ⑤ 留存策略：已完成阶段不可变尽量留存、预算驱动降级（全文→L1→L2 最老先降、**永不回升**）⑥ 常识区（热区最前）+ 缓存定律（易变贴生长前沿、稳定在最前；ledger 不进最前）⑦ 兜底三级（L1 全降 L2 → 切当前阶段成小段 → W/3 硬预算预防 + prompt 明示"阶段不能过大"）⑧ 级联 C 案：压缩输入=goal ledger+被压区间**全文**（永不读他阶段摘要）；接 J19/X6 ⑨ 压缩模型默认主模型可配；L1/L2 阈值与预算进 `context_strategy.params` **不写死** | 不挂策略时装配行为与 v1 等价（酸测试）；换/摘策略 core 零改动；L1≤10%/L2≤1% 构造负载实测达标（可配初值）；`recall("stage:N")` 取回持久化原文全文、L2 条目自带调用说明；阶段切分只发生在通过点；降级单向且最老先降；压缩后稳定前缀**字节不变**（缓存定律断言）；兜底三级顺序正确、切阶段有诊断事件；压缩输入不含他阶段摘要（断言）；新事件（`context.compacted` 等）F7 只增 + `tools/ts-consumer/sample-events.ndjson` + `contracts_test` 钉子全绿；`context.assembled` parts 出现 `stage:N`/`ledger`/`rules` 来源；13 §9 转正数据观测面（沟通/工作量比、切后回捞率、summary 够用度、阶段大小分布）随实现落 |
+| **v2-S2 图投影简版** | G18 一跳/两跳 SQLite 双向倒排（`edges(src,kind)`/`edges(dst,kind)`）+ 多跳内存 BFS（深度/结果上限 + context 取消）；G19 node id interned（10 万节点/100 万边 ~100–200MB 量级，可配）；G20 闭包缓存简版（内存 map + 图写入失效，不做复杂淘汰）；G21 用途链落地：依赖图可达性 → `change_impact` → escalate 客观依据（W16）；G2f 图=**可选投影**、不进 core 必经路径 | 一跳/两跳走 SQLite、多跳 BFS 结果正确且上限/取消生效；闭包缓存命中与图写入失效正确；change_impact 产出影响面供 escalate 判定；未启用图的工作流零图开销（可选投影酸测试） |
+| **v2-S3 门禁增强** | V4 内容寻址共享只读缓存（无锁竞争、无污染）；V6 review-tip 失效检测（review 后分支 tip 变 → 结论失效 → 要求重审）；V7 合并后冲突预测（依赖图可达性，比三点 diff 求交集更准） | 缓存键内容寻址、命中不重复构建、只读无污染；review-tip 变更触发失效并要求重审；冲突预测能基于依赖图对未合并 mission 预警撞车 |
+| **v2-S4 沙箱** | K8/H9 SandboxedExecutionEnv：Windows **job object + 受限 token + 目录 ACL** 务实组合；**可拓展埋点**（Linux/mac seatbelt/bwrap 后续挂）；V8 写保护由此收口 | 工具子进程纳入 job object（进程树清理）；目录外写被 ACL 拒；受限 token 下提权受限；换沙箱 env 不动 agent 逻辑（可插拔酸测试）；埋点接口留出 Linux/mac 挂点 |
+| **v2-S5 存储接口收口** | G1/G2「一组可组合的存储接口」随图/blob 落地收口：事件日志/文档/blob/图接口分立、各自多实现可组合（blob/向量实现留 v4）；v1 挂账能清则清 | 接口分立且可组合（换实现零改动酸测试）；图/blob 接口签名与 G18-G21 实现对齐；07 收口注记 + 合计同步 |
+
 ---
+
 
 ## 3. 施工期陷阱清单（照着抄，别自己发明）
 
