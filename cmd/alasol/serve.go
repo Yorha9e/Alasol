@@ -46,6 +46,13 @@ type hubFlags struct {
 	contextWindow     *int64
 	contextL1Pct      *float64
 	contextL2Pct      *float64
+	graph             *bool
+	graphMaxNodes     *int
+	graphMaxEdges     *int
+	graphMaxDepth     *int
+	graphMaxResults   *int
+	graphCore         *string
+	graphEscalate     *int
 	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
 	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
 	set map[string]bool
@@ -82,6 +89,13 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		contextWindow:     fs.Int64("context-window", 0, "tiered 策略的上下文窗口预算 W（token；0=默认 1M；须 ≥256k）"),
 		contextL1Pct:      fs.Float64("context-l1-pct", 0, "tiered 策略的 L1（浅摘要）目标残留占窗口百分比（0=默认 10）"),
 		contextL2Pct:      fs.Float64("context-l2-pct", 0, "tiered 策略的 L2（深压缩）目标残留占窗口百分比（0=默认 1）"),
+		graph:             fs.Bool("graph", false, "启用图投影（v2-S2，G2f 可选投影；默认关=零图开销：不建图表/不建引擎）"),
+		graphMaxNodes:     fs.Int("graph-max-nodes", 0, "内存图节点上界（0=默认 10 万，G19；触界即停并报错）"),
+		graphMaxEdges:     fs.Int("graph-max-edges", 0, "内存图边上界（0=默认 100 万，G19）"),
+		graphMaxDepth:     fs.Int("graph-max-depth", 0, "多跳遍历深度上限（0=默认 8，G18）"),
+		graphMaxResults:   fs.Int("graph-max-results", 0, "多跳遍历结果上限（0=默认 5000，G18）"),
+		graphCore:         fs.String("graph-core", "", "核心接口节点声明（逗号分隔；`*` 结尾=字节前缀，如 core/*,contracts/*；W16）"),
+		graphEscalate:     fs.Int("graph-escalate-reachable", 0, "change_impact 的 escalate 阈值：可达节点数超过它才触发（0=默认 50，W15）"),
 	}
 }
 
@@ -161,7 +175,7 @@ func serveHub(ctx context.Context, h *host.Hub) error {
 	if err != nil {
 		return fmt.Errorf("监听 %s: %w", h.Addr(), err)
 	}
-	printBanner(ln.Addr().String())
+	printBanner(ln.Addr().String(), h.GraphEnabled())
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
@@ -181,7 +195,7 @@ func serveHub(ctx context.Context, h *host.Hub) error {
 }
 
 // printBanner 打印就绪信息（地址从**真实监听器**取，端口是 0 时也能显示实际值）。
-func printBanner(addr string) {
+func printBanner(addr string, graphEnabled bool) {
 	fmt.Printf("[alasol] hub 已就绪\n")
 	fmt.Printf("  Web UI   http://%s/\n", addr)
 	fmt.Printf("  事件流   ws://%s/ws（NDJSON）\n", addr)
@@ -190,6 +204,12 @@ func printBanner(addr string) {
 	fmt.Printf("  可见性   http://%s/api/peers?session_id=...（K11 水平可见性）\n", addr)
 	fmt.Printf("  加 gate  curl -X POST http://%s/api/gates/join -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
 	fmt.Printf("  在线表配置 http://%s/api/online-table/config（GET 读 / POST 运行期调，K15 不重启）\n", addr)
+	if graphEnabled {
+		// 图投影（v2-S2，G2f 可选投影）：启用了才提示——没启用时打这行会让人以为有数据。
+		fmt.Printf("  影响面   http://%s/api/graph/impact?roots=a,b（change_impact，G21/W16）\n", addr)
+	} else {
+		fmt.Printf("  图投影   未启用（-graph 开启后可用 /api/graph/impact，G2f 可选投影）\n")
+	}
 	fmt.Printf("  健康     http://%s/api/health\n", addr)
 	fmt.Printf("  只监听 loopback（N5b）；Ctrl-C 退出\n")
 }

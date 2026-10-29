@@ -114,6 +114,27 @@ type Config struct {
 	// ContextRules 项目规则文本（AGENTS.md 等；稳定前缀的一部分，Q2/Q3）。空 = 不注入。
 	// 注入面：宿主装配 tiered 引擎时调 SetRules（core/compaction 的规则注入口）。
 	ContextRules string
+
+	// ---- v2-S2 图投影（G2f/G18/G19/G20/G21）----
+	//
+	// Graph 是否启用图投影。**默认 false = 零图开销**（不建引擎、不建图表、
+	// 索引器不解析工具产出的边）——图是可选投影，不进 core 必经路径（G2f）。
+	// 由工作流/配置声明是否启用（v3 工作流引擎接管这个开关，这里先落宿主配置面）。
+	Graph bool
+	// GraphMaxNodes / GraphMaxEdges 是内存图的上界（G19：10 万节点/100 万边
+	// ~100–200MB 量级，可配；0 = 用框架默认）。触界即停并报错（fail-close：
+	// 不返回可能不完整的影响面）。
+	GraphMaxNodes int
+	GraphMaxEdges int
+	// GraphMaxDepth / GraphMaxResults 是多跳遍历的深度/结果上限（G18；0 = 默认）。
+	GraphMaxDepth   int
+	GraphMaxResults int
+	// GraphCoreNodes 是"核心接口"节点声明（W16 第二个客观依据：改动是否触及核心接口）。
+	// 形态：精确 id，或以 `*` 结尾的字节前缀（如 "core/*"）。**大小写敏感**（陷阱 17）。
+	GraphCoreNodes []string
+	// GraphEscalateReachable 是 change_impact 的 escalate 阈值（可达节点数超过它才触发；
+	// 0 = 默认 50）。W15：风险闸门，不是预算上限。
+	GraphEscalateReachable int
 }
 
 // validate 校验并归一化配置。
@@ -237,6 +258,22 @@ func (c *Config) validate() error {
 		if err := compaction.ValidateLayout(p); err != nil {
 			return fmt.Errorf("host: tiered 策略的布局不合法: %w", err)
 		}
+	}
+	// 图投影（v2-S2）上限：负值拒绝，0 = 框架默认（G18/G19）。
+	if c.GraphMaxNodes < 0 {
+		return fmt.Errorf("host: Config.GraphMaxNodes 不能为负（得到 %d；0 = 框架默认）", c.GraphMaxNodes)
+	}
+	if c.GraphMaxEdges < 0 {
+		return fmt.Errorf("host: Config.GraphMaxEdges 不能为负（得到 %d；0 = 框架默认）", c.GraphMaxEdges)
+	}
+	if c.GraphMaxDepth < 0 {
+		return fmt.Errorf("host: Config.GraphMaxDepth 不能为负（得到 %d；0 = 框架默认）", c.GraphMaxDepth)
+	}
+	if c.GraphMaxResults < 0 {
+		return fmt.Errorf("host: Config.GraphMaxResults 不能为负（得到 %d；0 = 框架默认）", c.GraphMaxResults)
+	}
+	if c.GraphEscalateReachable < 0 {
+		return fmt.Errorf("host: Config.GraphEscalateReachable 不能为负（得到 %d；0 = 框架默认）", c.GraphEscalateReachable)
 	}
 	return nil
 }

@@ -211,3 +211,73 @@ func TestBuildConfigContextInjectionBudgets(t *testing.T) {
 		t.Errorf("文件的 common_sense_budget 应生效: %d", hc.ContextStrategyCommonSenseBudget)
 	}
 }
+
+// TestBuildConfigGraphPrecedence：图投影开关与参数的 flag>文件 优先级（v2-S2，G2f）。
+//
+// 默认关 = 零图开销（不进 core 必经路径）；显式 flag 可开，配置文件也能开。
+func TestBuildConfigGraphPrecedence(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := "model = \"m\"\n" +
+		"[graph]\n" +
+		"enabled = true\n" +
+		"max_nodes = 200000\n" +
+		"max_edges = 2000000\n" +
+		"max_depth = 4\n" +
+		"max_results = 800\n" +
+		"escalate_reachable = 20\n" +
+		"core = [\"core/*\", \"contracts/event.go\"]\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+
+	// ① 只有文件 → 用文件的开关与参数。
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("① 意外错误: %v", err)
+	}
+	if !hc.Graph {
+		t.Fatal("① 文件的 graph.enabled 应生效")
+	}
+	if hc.GraphMaxNodes != 200000 || hc.GraphMaxEdges != 2000000 {
+		t.Errorf("① 文件的上界应生效: %d/%d", hc.GraphMaxNodes, hc.GraphMaxEdges)
+	}
+	if hc.GraphMaxDepth != 4 || hc.GraphMaxResults != 8*100 {
+		t.Errorf("① 文件的遍历上限应生效: %d/%d", hc.GraphMaxDepth, hc.GraphMaxResults)
+	}
+	if hc.GraphEscalateReachable != 20 {
+		t.Errorf("① 文件的 escalate 阈值应生效: %d", hc.GraphEscalateReachable)
+	}
+	if len(hc.GraphCoreNodes) != 2 || hc.GraphCoreNodes[0] != "core/*" {
+		t.Errorf("① 文件的核心接口声明应生效: %v", hc.GraphCoreNodes)
+	}
+
+	// ② 什么都不给 → 默认关（G2f：可选投影，零图开销）。
+	noneFile := filepath.Join(t.TempDir(), "none.toml")
+	if err := os.WriteFile(noneFile, []byte("model = \"m\"\n"), 0o600); err != nil {
+		t.Fatalf("写空配置: %v", err)
+	}
+	hc2, err := buildConfigFrom(t, "-config", noneFile)
+	if err != nil {
+		t.Fatalf("② 意外错误: %v", err)
+	}
+	if hc2.Graph {
+		t.Error("② 无配置时图投影应默认关闭")
+	}
+
+	// ③ 显式 flag 覆盖文件（flag > 文件）。
+	hc3, err := buildConfigFrom(t, "-config", cfgFile,
+		"-graph", "-graph-max-depth", "9", "-graph-escalate-reachable", "77",
+		"-graph-core", "host/*,runtime/graph/*")
+	if err != nil {
+		t.Fatalf("③ 意外错误: %v", err)
+	}
+	if !hc3.Graph {
+		t.Error("③ flag -graph 应生效")
+	}
+	if hc3.GraphMaxDepth != 9 || hc3.GraphEscalateReachable != 77 {
+		t.Errorf("③ flag 的上限/阈值应覆盖文件: %d/%d", hc3.GraphMaxDepth, hc3.GraphEscalateReachable)
+	}
+	if len(hc3.GraphCoreNodes) != 2 || hc3.GraphCoreNodes[0] != "host/*" {
+		t.Errorf("③ flag 的核心接口声明应覆盖文件: %v", hc3.GraphCoreNodes)
+	}
+}

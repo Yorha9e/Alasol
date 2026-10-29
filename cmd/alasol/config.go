@@ -116,6 +116,15 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		ContextStrategyCommonSenseBudget: pickInt64(0, fc.ContextStrategy.CommonSenseBudget),
 		// 项目规则文本（稳定前缀的一部分；只有配置文件面提供——多行文本不适合走 flag）。
 		ContextRules: fc.ContextRules,
+
+		// 图投影（v2-S2，G2f 可选投影）：显式 flag > 文件。默认关（零图开销）。
+		Graph:                  graphEnabled(f, fc),
+		GraphMaxNodes:          pickInt(*f.graphMaxNodes, fc.Graph.MaxNodes),
+		GraphMaxEdges:          pickInt(*f.graphMaxEdges, fc.Graph.MaxEdges),
+		GraphMaxDepth:          pickInt(*f.graphMaxDepth, fc.Graph.MaxDepth),
+		GraphMaxResults:        pickInt(*f.graphMaxResults, fc.Graph.MaxResults),
+		GraphCoreNodes:         graphCoreNodes(f, fc),
+		GraphEscalateReachable: pickInt(*f.graphEscalate, fc.Graph.EscalateReachable),
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
@@ -190,4 +199,26 @@ func contextStrategyValue(f *hubFlags, fc *host.FileConfig) string {
 		return strings.TrimSpace(*f.contextStrategy)
 	}
 	return strings.TrimSpace(fc.ContextStrategy.Kind)
+}
+
+// graphEnabled 解析图投影开关（v2-S2）：**显式 flag > 文件 > 默认 false**。
+//
+// 默认 false = 图投影未启用（G2f：可选投影，不进 core 必经路径 → 零图开销）。
+// 只有显式设了 -graph 才可能为 true；配置文件里 enabled = true 也能开。
+func graphEnabled(f *hubFlags, fc *host.FileConfig) bool {
+	if f.explicitlySet("graph") {
+		return *f.graph
+	}
+	return fc.Graph.Enabled
+}
+
+// graphCoreNodes 解析核心接口节点声明（v2-S2）：显式 flag（逗号分隔）> 文件（列表）。
+func graphCoreNodes(f *hubFlags, fc *host.FileConfig) []string {
+	if f.explicitlySet("graph-core") {
+		return splitList(*f.graphCore)
+	}
+	if len(fc.Graph.Core) > 0 {
+		return fc.Graph.Core
+	}
+	return nil
 }

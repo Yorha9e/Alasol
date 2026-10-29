@@ -17,11 +17,13 @@ import (
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
+	coregraph "github.com/Yorha9e/alasol/core/graph"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
+	"github.com/Yorha9e/alasol/runtime/graph"
 	"github.com/Yorha9e/alasol/runtime/indexer"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
@@ -65,6 +67,9 @@ type Hub struct {
 	monitor *Monitor
 	// worktrees 是 v1-S5 D 多 worktree 隔离管理器（并行任务各占一个工作区）。
 	worktrees *worktree.Manager
+	// graphEngine 是 v2-S2 图投影的读引擎（G2f：**可选投影**；nil = 未启用）。
+	// 未启用时宿主不建它、不驻留内存，索引器也不建图表（零图开销，酸测试）。
+	graphEngine *graph.Engine
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -108,7 +113,29 @@ func New(cfg Config) (*Hub, error) {
 		return nil, fmt.Errorf("host: 打开事件库: %w", err)
 	}
 
-	ix, err := sqlite.NewIndexer(st, cfg.IndexerBatch)
+	// 图投影（v2-S2，G2f 可选投影）：**默认不启用**——不建引擎、不驻留内存。
+	// 启用时先建读引擎（它只被查询时加载），再把它接成索引器写面的失效通知目标
+	// （G20：索引器提交写了边的批次后 → 引擎失效闭包缓存）。
+	var graphEngine *graph.Engine
+	var graphProj coregraph.GraphProjection
+	if cfg.Graph {
+		eng, gerr := sqlite.NewGraphEngine(st, cfg.graphLimits())
+		if gerr != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("host: 建图查询引擎: %w", gerr)
+		}
+		graphEngine = eng
+		// 写面**自建表**（F6：DDL 归实现侧，不塞进索引器的事务）→ 它需要自己的
+		// 执行句柄（由存储实现给，外部拿不到裸 *sql.DB，G17 同款纪律）。
+		proj, gerr := sqlite.NewGraphProjection(st, eng)
+		if gerr != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("host: 建图投影写面: %w", gerr)
+		}
+		graphProj = proj
+	}
+
+	ix, err := sqlite.NewIndexer(st, cfg.IndexerBatch, indexer.WithGraphProjection(graphProj))
 	if err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("host: 建索引器: %w", err)
@@ -229,6 +256,7 @@ func New(cfg Config) (*Hub, error) {
 		autoGates:    make(map[contracts.Ulid]bool),
 		onlineConfig: onlineCfg,
 		onlineSource: &discoveryOnlineSource{table: disc, feed: discFeed},
+		graphEngine:  graphEngine,
 	}
 
 	// 播种内存投影：把库里已有的事件扫进来（重开进程后在线表立刻有内容）。
@@ -344,6 +372,20 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 	if _, cerr := h.discFeed.catchUp(ctx); cerr != nil {
 		hubLog.Warn("host: Run 后发现表 catch-up 失败（下次 API 请求会重试）",
 			"session_id", string(sessionID), "err", cerr.Error())
+	}
+	// 图投影 catch-up（v2-S2）：**自然的 catch-up 点**（与投影/发现表同一处）。
+	// 同进程写入靠写面的 Committed() 失效闭包缓存即可；这里补的是**跨进程**写入
+	// （另一个索引器写进同一个库）的可见性——请求路径不再每次 Sync（F13）。
+	//
+	// **冷启动成本落在第一轮 Run 上**（N3）：这一步会 Sync → 首次就把整张图灌进
+	// 内存（20 万边 ~0.4s + G19 量级内存；无 seq 索引时 ~1.4s，F4 后走索引区间扫）。
+	// 所以"没人查过图"并不等于"不加载"——
+	// 启用图投影就意味着接受这份成本（图是**可选投影**，不启用则零开销，G2f）。
+	if h.graphEngine != nil {
+		if gerr := h.graphEngine.Sync(ctx); gerr != nil {
+			hubLog.Warn("host: Run 后图投影 catch-up 失败（下次 API 请求会重试）",
+				"session_id", string(sessionID), "err", gerr.Error())
+		}
 	}
 	return res, err
 }

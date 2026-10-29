@@ -36,6 +36,12 @@ var httpLog = slog.Default()
 //	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
 //	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
 //
+// 图投影（v2-S2，G2f **可选投影**，默认关闭）：
+//
+//	GET /api/graph/impact?roots=a,b&kind=…&depth=…&limit=…&core=…&diff_files=…&diff_added=…&diff_deleted=…
+//	  → ImpactReport（change_impact 影响面：一跳/传递下游 + 触及的核心接口 + diff 规模
+//	     + Scale + suggest_escalate；G21/W16）。未启用 → 503 graph_disabled
+//
 // 多 worktree 隔离（v1-S5 D：并行任务各占一个工作区）：
 //
 //	GET    /api/worktrees          → [Worktree, ...]（已登记，按 name 排序）
@@ -79,6 +85,10 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
 	mux.HandleFunc("GET /api/peers", h.servePeers)
 	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
+
+	// 图投影（v2-S2，G2f 可选投影）：change_impact 影响面报告（G21/W16）。
+	// 未启用时 503（明说"没开"，不返回空影响面——"没有影响面"对 escalate 是危险答案）。
+	mux.HandleFunc("GET /api/graph/impact", h.serveGraphImpact)
 
 	// 多 worktree 隔离（v1-S5 D）：创建 / 列表 / 删除。
 	mux.HandleFunc("GET /api/worktrees", h.serveWorktreesList)

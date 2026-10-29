@@ -21,6 +21,19 @@
 // 外部包拿不到它 → 除索引器外没有别的包能写派生表。派生表的**读**也走索引器
 // （ReadLedger / ReadBoard / ReadCostStats / ReadSession）。
 //
+// # 图投影（v2-S2，G2f/G22）
+//
+// 图（graph_nodes / graph_edges）是**可选投影**：由工作流/配置声明是否启用
+// （WithGraphProjection）。**未启用时不建图表、不解析工具产出的边、零图开销**
+// （酸测试钉住）——它不进 core 必经路径。启用后：tool.call.completed 里的
+// ToolResult.GraphEdges 由本索引器写进投影事务（G22 定案 A：边来自工具产出，
+// 不按 tool kind 猜、不让 agent 维护图结构），读侧是 runtime/graph.Engine
+// （一跳/两跳直查倒排、多跳走内存图）。Rebuild 连图一起清空。
+//
+// **依赖方向**：本包只认 core/graph 的**形状**（GraphProjection / Tx）——不 import
+// runtime/graph（F7）。SQL 适配（*sql.Tx → coregraph.Tx）在本包内就地做（graphTx），
+// 图投影的 SQL 文本与实现都在 runtime/graph 那边。
+//
 // # 并发
 //
 // **单索引器实例内部串行**：Step 的「读水位→读事件→应用→推水位」整段由一把锁串起来
@@ -40,6 +53,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	coregraph "github.com/Yorha9e/alasol/core/graph"
 )
 
 // defaultBatch 是 Step 单批默认处理上限。
@@ -50,10 +64,11 @@ const pollInterval = 50 * time.Millisecond
 
 // 事件 kind 常量（索引器只对这些 kind 做专属投影；其余忽略但计数，D7）。
 const (
-	kindLedgerUpdated  = "ledger.updated"
-	kindBoardWritten   = "board.written"
-	kindModelTurn      = "model.turn"
-	kindContextCompact = "context.compacted"
+	kindLedgerUpdated     = "ledger.updated"
+	kindBoardWritten      = "board.written"
+	kindModelTurn         = "model.turn"
+	kindContextCompact    = "context.compacted"
+	kindToolCallCompleted = "tool.call.completed"
 )
 
 // badPayloadKind 是「坏载荷」的诊断名（**只出现在告警里**，不进 by_kind ——
@@ -84,17 +99,42 @@ type Indexer struct {
 	w     Writer
 	batch int
 
+	// graph 是图投影写面（v2-S2；nil = 图投影未启用，G2f 可选投影）。
+	// 启用后索引器才建 graph_nodes/graph_edges 表、才在 tool.call.completed 里建边。
+	graph coregraph.GraphProjection
+
 	// mu 串行化 Step 的整段「读水位→读事件→应用→推水位」（P1-3）：
 	// 单索引器实例内部串行；**多个索引器指向同一个库不支持**。
 	mu sync.Mutex
 }
 
+// Option 配置索引器（v2-S2 起引入；老调用方不传选项 = 行为与之前完全一致）。
+type Option func(*options)
+
+// options 是索引器的可选项（零值 = 全关）。
+type options struct {
+	graph coregraph.GraphProjection
+}
+
+// WithGraphProjection 启用图投影（G2f/G17/G22）。
+//
+// p 为 nil 或**不传**这个选项 = 图投影未启用：不建图表、不解析工具产出的边、
+// 零图开销（酸测试钉住）。p 非 nil 时：
+//   - 建表走 p.EnsureSchema（只建图那两张表，其余派生表不变）；
+//   - 每个 tool.call.completed 事件里的 ToolResult.GraphEdges 由 p.ApplyEdges 写进
+//     投影事务（与水位推进同事务，G24）；
+//   - 批次提交成功后调 p.Committed() → 读侧失效闭包缓存（G20）。
+func WithGraphProjection(p coregraph.GraphProjection) Option {
+	return func(o *options) { o.graph = p }
+}
+
 // New 建索引器并确保投影表 + 水位行存在。
 //
 // store 读事件；w 写派生表（窄 SQL 面，只归索引器）；batch<=0 取默认 1000。
+// opts 是可选项（目前只有图投影开关）。
 //
 // 真实存储的装配点用 sqlite.NewIndexer（它把写句柄留在存储实现内部，不外泄）。
-func New(store core.Store, w Writer, batch int) (*Indexer, error) {
+func New(store core.Store, w Writer, batch int, opts ...Option) (*Indexer, error) {
 	if store == nil {
 		return nil, errors.New("indexer: 需要非 nil 的 core.Store")
 	}
@@ -104,7 +144,13 @@ func New(store core.Store, w Writer, batch int) (*Indexer, error) {
 	if batch <= 0 {
 		batch = defaultBatch
 	}
-	ix := &Indexer{store: store, w: w, batch: batch}
+	var o options
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	ix := &Indexer{store: store, w: w, batch: batch, graph: o.graph}
 	if err := ix.ensureSchema(context.Background()); err != nil {
 		return nil, err
 	}
@@ -187,8 +233,26 @@ func (ix *Indexer) Run(ctx context.Context) error {
 }
 
 // Rebuild 重建（G24②）：清空五张派生表 + 水位归零，再从 0 重放到追平。
+// 启用图投影时连 graph_nodes/graph_edges 一起清空（v2-S2）。
 // 清空与归零在同一事务内原子完成；重放走 Step（同一把锁内），崩溃后可再次
 // Rebuild 或续跑。
+//
+// # 重建窗口：影响面可能"干净地为空"（fail-open 窗口，N2）
+//
+// Rebuild 的清空与重放**不是原子的**：清空先提交（投影变空），重放再逐批补回。
+// 窗口内读侧会看到**空/半满**的投影 → change_impact 给出一份
+// "Direct=[]、Escalate=false、无错误无告警"的报告——消费端**无法分辨**
+// "真没影响" 与 "正在重建"（少报影响面 → escalate 闸门被蒙）。
+//
+// 现状与取舍（写清楚免得后人以为它已被设防）：
+//
+//   - Rebuild **没有生产调用方**（本刀只有 API，无 CLI/UI 入口）→ 窗口当前不会
+//     被触发，暂不设防（设防要加"重建中"标记：graph_meta 一列、写面多两个动作、
+//     读侧 fail-close 报错——属于接口形状改动，留 v3 接线时一并处理）。
+//   - 读侧已有的两道护栏：同进程重建会发 Committed()（闭包缓存必失效，不会拿
+//     旧闭包当新答案）；读侧 Sync 发现**重建代**变了就整体重载（不会用旧图答题）。
+//   - **v3 把 change_impact 喂给 escalate 闸门之前，必须补这条口径**：
+//     消费端要么在重建期间拒绝采信影响面，要么框架先补上"重建中"标记。
 func (ix *Indexer) Rebuild(ctx context.Context) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -198,6 +262,12 @@ func (ix *Indexer) Rebuild(ctx context.Context) error {
 		return fmt.Errorf("indexer: rebuild begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if ix.graph != nil {
+		// 图表清空走写面（它会顺带推进重建代 → 读侧引擎下次 Sync 整体重载）。
+		if err := ix.graph.Clear(ctx, graphTx{tx: tx}); err != nil {
+			return fmt.Errorf("indexer: rebuild clear graph: %w", err)
+		}
+	}
 	for _, table := range []string{"sessions", "ledger_state", "board_state", "cost_stats", "cost_tokens"} {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM "+table); err != nil {
 			return fmt.Errorf("indexer: rebuild clear %s: %w", table, err)
@@ -208,6 +278,13 @@ func (ix *Indexer) Rebuild(ctx context.Context) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("indexer: rebuild commit: %w", err)
+	}
+	if ix.graph != nil {
+		// **重建也要发失效通知**（F14）：Rebuild 清空了图投影，读侧引擎的闭包缓存
+		// 里还温着"重建前"的闭包——不通知的话，下一次查询会拿旧答案当新答案
+		// （影响面少报 → escalate 闸门被蒙）。写面已推进重建代，读侧下次 Sync
+		// 会发现代数变了 → 丢掉内存图从 0 重载。
+		ix.graph.Committed()
 	}
 	for {
 		n, err := ix.stepLocked(ctx)
@@ -222,6 +299,8 @@ func (ix *Indexer) Rebuild(ctx context.Context) error {
 
 // applyBatch 在一个事务内应用整批投影，并把水位推进到最后一条的 seq（G24①：
 // 投影 + 水位原子，崩溃整体回滚，不丢不重）。
+//
+// 图投影（v2-S2）也在这一个事务里写边；提交成功后通知读侧失效闭包缓存（G20）。
 func (ix *Indexer) applyBatch(ctx context.Context, events []contracts.Event) error {
 	tx, err := ix.w.BeginTx(ctx, nil)
 	if err != nil {
@@ -229,9 +308,14 @@ func (ix *Indexer) applyBatch(ctx context.Context, events []contracts.Event) err
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	wroteEdges := false
 	for i := range events {
-		if err := applyEvent(ctx, tx, &events[i]); err != nil {
+		w, err := applyEvent(ctx, tx, &events[i], ix.graph)
+		if err != nil {
 			return err
+		}
+		if w {
+			wroteEdges = true
 		}
 	}
 	last := events[len(events)-1]
@@ -244,12 +328,17 @@ func (ix *Indexer) applyBatch(ctx context.Context, events []contracts.Event) err
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("indexer: apply commit: %w", err)
 	}
+	if wroteEdges && ix.graph != nil {
+		// 提交成功才通知（回滚的批次不算"图写入"——缓存不该被无效清空）。
+		ix.graph.Committed()
+	}
 	return nil
 }
 
 // applyEvent 把单条事件应用到投影。每个事件都更新 sessions + cost_stats；
-// ledger.updated / board.written / model.turn 额外更新对应当前态/成本；未知 kind 忽略但已计数（D7）。
-// ledger.updated / board.written 额外更新对应当前态；未知 kind 忽略但已计数（D7）。
+// ledger.updated / board.written / model.turn / context.compacted / tool.call.completed
+// 额外更新对应当前态/成本/图边；未知 kind 忽略但已计数（D7）。
+// 返回本事件是否写了图边（供调用方决定要不要通知读侧失效）。
 //
 // **坏载荷隔离**（P1-2）：已知 kind 的载荷不可解析时**不致命**——记一条告警、
 // 在 cost_stats 的**独立列** bad_payload_count 里计一次，跳过该事件的专属投影，
@@ -257,32 +346,33 @@ func (ix *Indexer) applyBatch(ctx context.Context, events []contracts.Event) err
 //
 // 坏载荷计数**不进 by_kind**：by_kind 的划分语义是「每个事件恰好落一个 kind」
 // （各 kind 之和 == event_count），把隔离标记塞进去会让求和失真。
-func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
+func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event, gp coregraph.GraphProjection) (bool, error) {
 	if ev.Seq == nil {
-		return fmt.Errorf("indexer: event id=%s has no seq", ev.ID)
+		return false, fmt.Errorf("indexer: event id=%s has no seq", ev.ID)
 	}
 	sid := string(ev.SessionID)
 	seq := *ev.Seq
 
 	// 1) sessions 目录（session 亲和；first_seq 只在中止/首插时定）。
 	if _, err := tx.ExecContext(ctx, upsertSessionSQL, sid, seq, seq, ev.Kind, ev.TS); err != nil {
-		return fmt.Errorf("indexer: sessions projection: %w", err)
+		return false, fmt.Errorf("indexer: sessions projection: %w", err)
 	}
 
 	// 2) kind 专属当前态（坏载荷 → 隔离，不致命）。
 	badPayload := false
+	wroteEdges := false
 	switch ev.Kind {
 	case kindLedgerUpdated:
 		if err := applyLedger(ctx, tx, ev); err != nil {
 			if !errors.Is(err, errBadPayload) {
-				return err
+				return false, err
 			}
 			badPayload = true
 		}
 	case kindBoardWritten:
 		if err := applyBoard(ctx, tx, ev); err != nil {
 			if !errors.Is(err, errBadPayload) {
-				return err
+				return false, err
 			}
 			badPayload = true
 		}
@@ -290,7 +380,7 @@ func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 		// token 成本（J21）：usage 只进成本统计，绝不回填 context 快照/预算。
 		if err := applyModelTurn(ctx, tx, ev); err != nil {
 			if !errors.Is(err, errBadPayload) {
-				return err
+				return false, err
 			}
 			badPayload = true
 		}
@@ -299,10 +389,22 @@ func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 		// 载荷里没有 usage（老事件/未带 usage）→ 不计 token（同 model.turn 的口径）。
 		if err := applyContextCompacted(ctx, tx, ev); err != nil {
 			if !errors.Is(err, errBadPayload) {
-				return err
+				return false, err
 			}
 			badPayload = true
 		}
+	case kindToolCallCompleted:
+		// 图投影（G22 定案 A）：边来自**工具产出**——tool.call.completed 的
+		// ToolResult.GraphEdges。不按 tool kind 猜、不让 agent 维护图结构。
+		// 未启用图投影（gp == nil）时整段跳过：零图开销（G2f 酸测试）。
+		w, err := applyGraphEdges(ctx, tx, ev, gp)
+		if err != nil {
+			if !errors.Is(err, errBadPayload) {
+				return false, err
+			}
+			badPayload = true
+		}
+		wroteEdges = w
 	default:
 		// 未知 kind（如 tool.call.intent）：宽容忽略（D7），但已在 sessions 计数。
 	}
@@ -314,9 +416,43 @@ func applyEvent(ctx context.Context, tx *sql.Tx, ev *contracts.Event) error {
 
 	// 3) cost_stats（事件数按 kind 计数；坏载荷另计独立列 bad_payload_count）。
 	if err := bumpCost(ctx, tx, sid, ev.Kind, badPayload); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return wroteEdges, nil
+}
+
+// applyGraphEdges 投影 tool.call.completed 里的图边（G22）。
+//
+// 返回本事件是否真的写了边（供调用方决定要不要通知读侧失效闭包缓存，G20）。
+// 载荷不可解析 → errBadPayload（隔离，不致命，P1-2）。
+func applyGraphEdges(ctx context.Context, tx *sql.Tx, ev *contracts.Event, gp coregraph.GraphProjection) (bool, error) {
+	if gp == nil {
+		return false, nil // 图投影未启用：连载荷都不解析（零开销）
+	}
+	var p contracts.ToolCallCompletedPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		return false, fmt.Errorf("%w: tool.call.completed payload id=%s: %v", errBadPayload, ev.ID, err)
+	}
+	if len(p.Result.GraphEdges) == 0 {
+		return false, nil
+	}
+	if err := gp.ApplyEdges(ctx, graphTx{tx: tx}, *ev.Seq, p.Result.GraphEdges); err != nil {
+		return false, fmt.Errorf("indexer: 图投影边 id=%s: %w", ev.ID, err)
+	}
+	return true, nil
+}
+
+// graphTx 把 *sql.Tx 适配成 core/graph.Tx（写面在**本索引器的事务**里写边）。
+//
+// 为什么适配器放在这里而不是 runtime/graph（F7）：索引器**只认 core/graph 的形状**
+// ——不 import runtime/graph（依赖单向：runtime/graph ← runtime/indexer 反向不成立）。
+// 语句文本仍由实现侧（runtime/graph）持有并传进来，core 契约里没有 SQL。
+type graphTx struct{ tx *sql.Tx }
+
+// Exec 执行一条参数化语句（core/graph.Tx 的最小面）。
+func (t graphTx) Exec(ctx context.Context, query string, args ...any) error {
+	_, err := t.tx.ExecContext(ctx, query, args...)
+	return err
 }
 
 // bumpCost 累加 cost_stats：读-改-写 by_kind JSON map（事务内可见自身未提交写）。
@@ -712,9 +848,18 @@ func decodeStrings(s string) []string {
 }
 
 // ensureSchema 建投影表 + 水位表，并播种水位行（seq=0）。
+// 启用图投影时**额外**建图那两张表（G2f：不启用就一张都不建——零图开销）。
+//
+// 图那两张表**由写面自建**（F6/G2b）：DDL 文本与它的事务边界归实现侧，
+// 索引器不替它决定建表落在哪个事务里（core 契约里没有 SQL 文本）。
 func (ix *Indexer) ensureSchema(ctx context.Context) error {
 	if _, err := ix.w.ExecContext(ctx, indexerSchemaSQL); err != nil {
 		return fmt.Errorf("indexer: create schema: %w", err)
+	}
+	if ix.graph != nil {
+		if err := ix.graph.EnsureSchema(ctx); err != nil {
+			return fmt.Errorf("indexer: 建图投影表: %w", err)
+		}
 	}
 	return nil
 }

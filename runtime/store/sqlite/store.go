@@ -16,6 +16,8 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	coregraph "github.com/Yorha9e/alasol/core/graph"
+	"github.com/Yorha9e/alasol/runtime/graph"
 	"github.com/Yorha9e/alasol/runtime/indexer"
 
 	// 注册 database/sql 驱动 "sqlite3"（G2b：ncruces/go-sqlite3，纯 Go wasm2go 真 SQLite）。
@@ -115,12 +117,65 @@ func Open(path string, opts Options) (*Store, error) {
 // 单写者纪律就守不住了。写句柄只在本包内部流转 → 外部包（indexer 之外）
 // 既拿不到写句柄，也读不到派生表（读走索引器的 Read* 方法）。
 //
-// batch<=0 取索引器默认批大小。
-func NewIndexer(st *Store, batch int) (*indexer.Indexer, error) {
+// batch<=0 取索引器默认批大小。op 透传索引器选项（v2-S2：图投影开关）。
+func NewIndexer(st *Store, batch int, opts ...indexer.Option) (*indexer.Indexer, error) {
 	if st == nil {
 		return nil, errors.New("sqlite: NewIndexer 需要非 nil 的 Store")
 	}
-	return indexer.New(st, st.db, batch)
+	return indexer.New(st, st.db, batch, opts...)
+}
+
+// NewGraphEngine 开一个图查询引擎（v2-S2；G2f：图是**可选投影**）。
+//
+// 读句柄同样由**本包内部**交给引擎（G17 同款纪律：不暴露裸 *sql.DB）。
+// 引擎**不在构造时加载**（懒加载）：这一步只备好内存图骨架与空缓存；
+// 未启用图的宿主压根不会调这个函数（不建引擎、不驻留内存——酸测试）。
+//
+// **冷启动的实际时机（N3）**：第一次 Sync 才加载——第一次多跳查询，或宿主在**一轮
+// Run 结束后**的图投影 catch-up（那一步也会 Sync → 第一轮 Run 就把整张图灌进
+// 内存）。所以"没人查询"不等于"不加载"：启用图投影就接受这份成本。
+//
+// 装配顺序：先建索引器（带 WithGraphProjection，它负责建图表）再建引擎；
+// 引擎的读只在查询时发生，所以先后无所谓，但**图投影表必须已存在**，
+// 否则查询显式报错（不静默当空图——"没有影响面"对 escalate 闸门是危险答案）。
+func NewGraphEngine(st *Store, limits graph.Limits) (*graph.Engine, error) {
+	if st == nil {
+		return nil, errors.New("sqlite: NewGraphEngine 需要非 nil 的 Store")
+	}
+	return graph.NewEngine(dbQuerier{db: st.db}, limits)
+}
+
+// NewGraphProjection 开一个图投影**写面**（v2-S2；G2f：图是可选投影）。
+//
+// 写面的 DDL **自建**（F6/G2b）：所以它需要自己的执行句柄——本包把 *sql.DB
+// 适配成 graph.SQLExecTx 交给它（外部包拿不到裸句柄，G17 同款纪律）。
+// 写边本身仍在**索引器的事务**里执行（写面只拿 core/graph.Tx 形状）。
+//
+// inv 是写入后要通知的读侧（通常是 graph.Engine：闭包缓存随之失效，G20）；nil = 不通知。
+func NewGraphProjection(st *Store, inv coregraph.Invalidator) (*graph.Projection, error) {
+	if st == nil {
+		return nil, errors.New("sqlite: NewGraphProjection 需要非 nil 的 Store")
+	}
+	return graph.NewProjection(inv, dbQuerier{db: st.db}), nil
+}
+
+// dbQuerier 把 *sql.DB 适配成 graph.Querier（只读查询那两件事）。
+//
+// 同时满足 graph.SQLExecTx（建表用：图写面自建 DDL，F6）——同一个适配器两用，
+// 外部包始终拿不到裸 *sql.DB。
+type dbQuerier struct{ db *sql.DB }
+
+func (q dbQuerier) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return q.db.QueryContext(ctx, query, args...)
+}
+
+func (q dbQuerier) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return q.db.QueryRowContext(ctx, query, args...)
+}
+
+// ExecContext 执行一条语句（**只给图写面建表用**：DDL 幂等，不占索引器的事务）。
+func (q dbQuerier) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return q.db.ExecContext(ctx, query, args...)
 }
 
 // Close 关闭连接池（幂等）：先放掉 keepalive，再关池。重复调用返回 nil。

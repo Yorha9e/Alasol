@@ -57,6 +57,40 @@ type FileConfig struct {
 	ContextStrategy ContextStrategyFileConfig `toml:"context_strategy"`
 	// ContextRules 项目规则文本（AGENTS.md 等；稳定前缀的一部分，Q2/Q3）。空 = 不注入。
 	ContextRules string `toml:"context_rules"`
+	// Graph 图投影（v2-S2，G2f 可选投影；默认关 = 零图开销）。
+	Graph GraphFileConfig `toml:"graph"`
+}
+
+// GraphFileConfig 是图投影的文件级配置（v2-S2）。
+//
+// 形如：
+//
+//	[graph]
+//	enabled = true
+//	max_nodes = 100000
+//	max_edges = 1000000
+//	max_depth = 8
+//	max_results = 5000
+//	core = ["core/*", "contracts/*"]
+//	escalate_reachable = 50
+//
+// 口径：**enabled 为 false（默认）= 图投影未启用**——不建图表、不建引擎、索引器连
+// tool.call.completed 的载荷都不解析（G2f：图不进 core 必经路径，零图开销）。
+// 上界 0 = 框架默认（G19 量级口径：10 万节点/100 万边）。core 里 `*` 结尾的是
+// **字节前缀**（大小写敏感，陷阱 17）。
+type GraphFileConfig struct {
+	// Enabled 是否启用图投影（可选投影，G2f）。
+	Enabled bool `toml:"enabled"`
+	// MaxNodes / MaxEdges 内存图上界（0 = 框架默认 10 万/100 万）。
+	MaxNodes int `toml:"max_nodes"`
+	MaxEdges int `toml:"max_edges"`
+	// MaxDepth / MaxResults 多跳遍历上限（0 = 框架默认 8 / 5000）。
+	MaxDepth   int `toml:"max_depth"`
+	MaxResults int `toml:"max_results"`
+	// Core "核心接口"节点声明（`*` 结尾 = 前缀；W16 第二个客观依据）。
+	Core []string `toml:"core"`
+	// EscalateReachable change_impact 的 escalate 阈值（可达节点数；0 = 默认 50）。
+	EscalateReachable int `toml:"escalate_reachable"`
 }
 
 // ContextStrategyFileConfig 是上下文装配策略的文件级配置（v2-S1）。
