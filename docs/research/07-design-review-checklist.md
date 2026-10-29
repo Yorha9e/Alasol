@@ -21,8 +21,8 @@
 |---|---|---|---|---|
 | B1 | 核心语言 | Go | — | ✅（独立产品 + Windows 一等 → 翻转） |
 | B2 | TUI | Go + bubbletea / lipgloss。**选型落地（2026-10-28 v1-S5）**：`ui/tui` 独立包（O6）——对话/审批/在线表三面，进程内 hub 后端；依赖 bubbletea+lipgloss（手写输入框，未引 bubbles） | — | ✅ |
-| B3 | GUI / IDE 插件 | 语言自由，通过协议接入 hub | — | · |
-| B4 | 解释型扩展运行时 | v1 再说；候选 Starlark / CEL / goja / WASM。v0 未做——v3（解释型扩展运行时选型，12 路线图）再定 | — | ★ |
+| B3 | GUI / IDE 插件 | 语言自由，通过协议接入 hub （2026-10-28）：v2/v3 做完后**外包给另一个 session 模拟第三方制作 UI** 的场景，验收协议面 | — | · |
+| B4 | 解释型扩展运行时 | v1 再说；候选 Starlark / CEL / goja / WASM。v0 未做——v3（解释型扩展运行时选型，12 路线图）再定 **拍板（2026-10-28 用户）**：**继续保留候选、暂不选型**——后续有真实需求再定（保留位不废，E1 的 C 型=A 的特殊实现） | — | ✅ |
 | B5 | 依赖约束 | 避免 cgo（纯 Go SQLite）；go modules | — | · |
 
 ## C. 架构分层与依赖
@@ -94,13 +94,13 @@
 
 | ID | 决策项 | 我的主张 | 备选 | 状态 |
 |---|---|---|---|---|
-| G1 | Store 形态 | 事件日志（追加）+ 投影（读模型）；**不是一个引擎，是一组可组合的存储接口**。实现与提案有出入：v0 只有事件日志接口（`core.Store`：Append/ReadFrom）+ 索引器窄投影写面（`indexer.Writer`，不暴露裸 *sql.DB），"一组可组合的存储接口"（文档/blob/图/向量）未做，待确认 | — | ★ |
-| G2 | 存储抽象层 | 按用途分若干接口，各自多个实现，可组合：事件日志 / 文档 / blob / 图 / 向量。实现与提案有出入：只落地"事件日志"一类（`core.Store` + sqlite 实现），文档/blob/图/向量接口未做（blob→v4、图→v2、向量→v4），待确认 | — | ★ |
+| G1 | Store 形态 | 事件日志（追加）+ 投影（读模型）；**不是一个引擎，是一组可组合的存储接口**。实现与提案有出入：v0 只有事件日志接口（`core.Store`：Append/ReadFrom）+ 索引器窄投影写面（`indexer.Writer`，不暴露裸 *sql.DB），"一组可组合的存储接口"（文档/blob/图/向量）未做，待确认 **收口拍板（2026-10-28）**：v2 随图/blob 接口落地收口 | — | ✅ |
+| G2 | 存储抽象层 | 按用途分若干接口，各自多个实现，可组合：事件日志 / 文档 / blob / 图 / 向量。实现与提案有出入：只落地"事件日志"一类（`core.Store` + sqlite 实现），文档/blob/图/向量接口未做（blob→v4、图→v2、向量→v4），待确认 同 G1：v2 随图/blob 落地收口（2026-10-28） | — | ✅ |
 | G2b | 引擎路线 | ✅ **定案**：`github.com/ncruces/go-sqlite3` v0.35.6 + `_txlock=immediate` + `busy_timeout`（实测并发写 1000/1000 零失败、5852 tps、跨进程已验证）；`modernc.org/sqlite` v1.61.0 为备选（高并发写 3% SQLITE_BUSY 失败、274 tps）。**后续要上正经数据库** → 接口必须不泄漏 SQLite 特性 | ✅ |
 | G2c | 图引擎 | ✅ **SQLite 的 node/edge 表做持久化 + 自己写内存图做多跳**（规模会超万节点，长程工作必然碰到 → 现在就设计）。Kuzu（cgo + Windows 需 MSYS2/UCRT64 + 项目正在被归档）、Oxigraph（RDF/SPARQL 语义不对口）、Cozo（2023 停更）均排除。图是**可选投影**，换引擎不影响 core | — | ✅ |
 | G2d | 向量引擎 | 未来 RAG，**独立于指针解析**（概率性，可选）。v0 未做——v4（RAG/向量检索，Retriever.retrieve 保留位接入）再定 | — | ★ |
 | G2e | blob 引擎 | 大工具输出、原始条目（`Event.binary_ref` 外置）；v0 文件系统 → 后期对象存储 / DB 大字段。v0 未做——v4（blob/对象存储）再定 | — | ★ |
-| G2f | 图不是硬依赖 | 图作为**可选投影**，由工作流声明是否启用；**不进 core 必经路径**（否则每个 session 都要起图库）。v0 未做——v2（图投影点亮，图作可选投影）再定 | — | ★ |
+| G2f | 图不是硬依赖 | 图作为**可选投影**，由工作流声明是否启用；**不进 core 必经路径**（否则每个 session 都要起图库）。v0 未做——v2（图投影点亮，图作可选投影）再定 图=**可选投影**、不进 core 必经路径；随 v2 图投影点亮落地（2026-10-28 拍板） | — | ✅ |
 | G8 | goal ledger 落地 | ✅ **事件化**：`ledger.updated` 作为 durable 事件追加，**当前态 = 索引器物化的投影**（不再 CAS 直写可变存储）；**在上下文之外** | ✅ |
 | G9 | 多写者 | ✅ **Kafka 模式：多写者 append + 单索引写者**。写者只管 append（幂等 `id` UNIQUE；`seq` 由 SQLite AUTOINCREMENT 原子分配 = 全局单调且无需应用层仲裁；事务保证一批 append 原子；`_txlock=immediate` + `busy_timeout` 处理冲突，实测跨进程 1000/1000）。**session 目录 / 图投影等派生索引由单独的索引器消费事件流维护**（最终一致，毫秒级延迟，UI 可接受） | — | ✅ |
 | G10 | seq 语义 | `seq` 由 SQLite AUTOINCREMENT 全局单调分配（原子、无需应用层仲裁），per-session 单调自然成立；`(session_id, seq)` 索引供 UI 取本 session 视图。seq 全局单调但不保证稠密（冲突序号不回收），消费端不得用 max(seq) 当事件数（实现：runtime/store/sqlite） | — | ✅ |
@@ -112,10 +112,10 @@
 | G16 | 排除的候选 | `tursodatabase/limbo`（Go module 内 0 个 `.go` 文件，Go 侧无 API）；`surrealdb.go`（cgo + Rust 工具链，嵌入式不"轻"）；`embedded-postgres`（多一个 PG 进程，与"零外部进程"硬约束冲突）；`kuzudb/kuzu`（cgo + Windows 需 MSYS2/UCRT64 + 项目正在被归档）；`oxigraph`（RDF/SPARQL 语义不对口）；`cozodb/cozo`（2023 停更） | — | ✅ |
 | G17 | **索引器角色** | 独立角色：`runtime/indexer` 消费全局事件流、增量维护**持久投影**（sessions 目录 / ledger 当前态 / 黑板当前态 / 成本统计），是**唯一写持久派生表的人**——经窄 SQL 面（Writer，不暴露裸 *sql.DB）写、读也走索引器，投影+水位同事务原子。图投影/快照当前态等留待对应机制落地（v2）（实现：runtime/indexer） | — | ✅ |
 | G17b | 持久 vs 活状态 | **持久投影**（落库）：session 目录、图、成本、ledger、快照当前态。**活状态**（只在 core 内存，进程结束自行消失）：presence / 在线状态 / gate 成员。**不需要租约、不需要心跳、不需要"离线 session 保留"**——session 生命周期 = 进程生命周期 | — | ✅ |
-| G18 | 图查询分层 | **一跳/两跳走 SQLite 索引**（`edges(src,kind)` / `edges(dst,kind)` 双向倒排）快查；**多跳走内存图 BFS/DFS**（邻接表 + visited set + 深度上限 + 结果上限 + context 取消）。传递闭包在内存图上是 O(V+E)，SQL 递归 CTE 在大图上不可用。v0 未做——v2（图投影）再定 | — | ★ |
-| G19 | 图内存预算 | node id 用**整数或 interned string**（不用原始长字符串）→ 10 万节点 / 100 万边的邻接表控制在 ~100–200MB 量级；邻接表常驻或 LRU，冷启动从 SQLite 流式加载。v0 未做——v2（图投影）再定 | — | ★ |
-| G20 | 闭包缓存 | 同一查询反复问很常见（"这次改动的下游影响面"）→ 按 `(起点, kind, 深度)` 缓存闭包结果。v0 未做——v2（图投影）再定 | — | ★ |
-| G21 | 图的用途链 | 图不是"未来可能用"，而是 **W16 `change_impact` 的底层实现**：依赖图可达性查询 → 改动影响面 → agent 判断"是否大范围架构改动"的客观依据 → escalate 闸门。**三者是一条链，不是三件事**。v0 未做——v2（图投影 → change_impact）再定 | — | ★ |
+| G18 | 图查询分层 | **一跳/两跳走 SQLite 索引**（`edges(src,kind)` / `edges(dst,kind)` 双向倒排）快查；**多跳走内存图 BFS/DFS**（邻接表 + visited set + 深度上限 + 结果上限 + context 取消）。传递闭包在内存图上是 O(V+E)，SQL 递归 CTE 在大图上不可用。v0 未做——v2（图投影）再定 **照主张落地（v2，2026-10-28 拍板）**：一跳/两跳走 SQLite 双向倒排、多跳内存 BFS（深度/结果上限+context 取消） | — | ✅ |
+| G19 | 图内存预算 | node id 用**整数或 interned string**（不用原始长字符串）→ 10 万节点 / 100 万边的邻接表控制在 ~100–200MB 量级；邻接表常驻或 LRU，冷启动从 SQLite 流式加载。v0 未做——v2（图投影）再定 照主张（2026-10-28）：node id interned；10 万节点/100 万边邻接表 ~100–200MB 量级，可配 | — | ✅ |
+| G20 | 闭包缓存 | 同一查询反复问很常见（"这次改动的下游影响面"）→ 按 `(起点, kind, 深度)` 缓存闭包结果。v0 未做——v2（图投影）再定 **先做简版**（内存 map + 图写入失效，不做复杂淘汰；2026-10-28 用户拍板） | — | ✅ |
+| G21 | 图的用途链 | 图不是"未来可能用"，而是 **W16 `change_impact` 的底层实现**：依赖图可达性查询 → 改动影响面 → agent 判断"是否大范围架构改动"的客观依据 → escalate 闸门。**三者是一条链，不是三件事**。v0 未做——v2（图投影 → change_impact）再定 用途链照主张：change_impact → escalate 客观依据（W16）；v2 实现（2026-10-28） | — | ✅ |
 | G23 | **状态源收口** | ✅ **ledger 与黑板一律事件化**：`ledger.updated` / `board.written` 作为 durable 事件追加（**事件版本号 = 全局 seq，天然实现 CAS 语义**）；**当前态 = 索引器物化的投影**。消除 F5 / G8 / K22 / 06§7.1 的四方矛盾，保住「事件流是唯一事实源」 | ✅ |
 | G24 | **索引器恢复语义** | 四项全落地：① 水位持久化在 `indexer_watermark` 单行表，崩溃后从 N 续跑；② `Rebuild` = 清空派生表 + 从 0 重放；③ `Watermark()` 可查（UI 显示「索引已追至 seq N」，最终一致可见）；④ 单索引器实例内部串行、单写者纪律（多索引器指向同一库不支持），归属随 hub 进程。投影+水位同事务原子，崩溃整体回滚（实现：runtime/indexer） | ✅ |
 | G25 | **session 亲和写** | 多写者跨进程时**全局 seq = 提交序 ≠ 因果序** → 规定**一个 session 的事件只由其宿主进程 append**（session 亲和写）→ 单 session 内提交序≈因果序，`causation_id` + seq 足够，**不需要 span 模型**。v0 单进程宿主天然满足；作为部署层约束文档化在 core/store.go 与 bus.go（实现：约束文档化于 core/bus、core/store） | ✅ |
@@ -138,18 +138,18 @@
 | H6 | 权限模式 | read-only / workspace-write / danger-full-access 类预设 | · |
 | H7 | 无人值守 | 审批缺席即拒绝 **+ 注入拒绝话术**（照 omkc auto 模式） | · |
 | H8 | 缺席默认 | 审批服务不可用 → **deny**（不是 approve） | · |
-| H9 | 沙箱时机 | v0 不做；v1 起 seatbelt / bwrap / Win32 原生 / 容器 | · |
+| H9 | 沙箱时机 | v0 不做；v1 起 seatbelt / bwrap / Win32 原生 / 容器 **拍板（2026-10-28 用户）**：Windows 无原生沙箱可行面——现在走 **job object + 受限 token + 目录 ACL** 务实组合，**可拓展埋点**留 Linux/mac 沙箱（seatbelt/bwrap 后续挂）；V8 写保护由此收口。实现 v2 | ✅ |
 | H10 | 网络 | 默认拒绝 + 域名白名单 | · |
 | H11 | 子 agent 权限 | 只能收窄，deny 强制继承（omkc 的"只继承不收窄"是反例）；**工作流声明的 scope 是"请求"，实际 = 请求 ∩ 策略上限 ∩ 父级授予** | · |
 | H12 | 凭据 | 按作用域注入 + 日志脱敏 | · |
 | H13 | 不可信输入 | 工具输出/网页标注来源，视为数据非指令 | · |
-| H14 | env 分层 | 四层分离：**凭据 env**（进 provider）/ **执行 env**（进工具进程）/ **上下文 env**（给模型看，默认不给）/ **作用域覆盖**。v0 未做——v1（env 全分层）再定；v0 只做执行 env（H16/H17/H18） | ★ |
+| H14 | env 分层 | 四层分离：**凭据 env**（进 provider）/ **执行 env**（进工具进程）/ **上下文 env**（给模型看，默认不给）/ **作用域覆盖**。v0 未做——v1（env 全分层）再定；v0 只做执行 env（H16/H17/H18） → **挪 v2**（2026-10-28 重新标注：原注 v1 未做） | ★ |
 | H15 | 凭据来源 | ✅ **拍板（2026-10-28 用户）**：进程 env + **TOML 配置文件**（Windows `%APPDATA%\alasol\config.toml`，其他平台 XDG），**优先级：进程 env > 配置文件**；永不进 prompt/事件/日志（H18/H21 纪律不变）。**落地（2026-10-28 v1-S5）**：`host/config_file.go`（BurntSushi/toml，零传递依赖）+ `Precedence(flag,env,file)` 唯一优先级实现处；`FileConfig.Redacted()` 打码、解析错误不回显值；实测 secret 不进事件/HTTP/日志 | ✅ |
 | H16 | 执行 env 默认 | 工具默认继承**净化后**的父 env（凭据类剥离）；普通 env（PATH/HOME 等）保留。落地：`core.ScrubEnv` 剥离凭据类键（`IsCredentialKey`）与凭据形态值（`IsCredentialValue`：sk-/ghp_/gho_/JWT），普通 env 保留；显式注入的 required_env 在 ScrubEnv 之后叠加（获批凭据不被剥）（实现：core/env.go + core/loop/env.go） | ✅ |
 | H17 | 凭据按需注入 | 工具显式声明 `required_env`，由策略引擎裁决后注入该次调用。落地：工具 `RequiredEnv` 声明的键每个当能力过同一套策略求值（`Query{Tool:"env:"+key}`，E3），allow 才从进程 env 取值注入；deny/ask 未放行 → 不注入（fail-close），注入值进 secrets 供输出脱敏（实现：core/loop/env.go） | ✅ |
 | H18 | 脱敏规则 | deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`）+ 值形态匹配（`sk-`/`ghp_`/JWT）。落地：deny 名单（`*_KEY`/`*_TOKEN`/`*_SECRET`/`*_PASSWORD`/`*_CREDENTIAL*`，`IsCredentialKey`）+ 值形态（`sk-`/`ghp_`/`gho_`/JWT，`IsCredentialValue`）；框架注入的秘密值在工具输出进事件/下一轮 prompt 前被 `redactResult`/`redactSecrets` 逐个精确替换成 `***`（零误伤，非法 JSON 退化为 `"***"`）（实现：core/env.go + core/loop/toolcall.go） | ✅ |
 | H19 | 事件记录 | 只记录 env **键名**，不记值 | · |
-| H20 | 注入作用域 | global / session / agent / task / 单次调用。v0 未做——v1（global/agent/task 作用域）再定；v0 只做 session + 单次调用两级（H21） | ★ |
+| H20 | 注入作用域 | global / session / agent / task / 单次调用。v0 未做——v1（global/agent/task 作用域）再定；v0 只做 session + 单次调用两级（H21） → **挪 v2**（2026-10-28 重新标注） | ★ |
 | H21 | env 注入 v0 子集 | ✅ **v0 只做两级作用域（session + 单次调用）+ 不给模型看任何 env**。凭据来源：进程 env + 用户级配置文件，**永不进 prompt / 事件 / 日志**；执行 env 默认继承**净化后**的父 env（凭据类剥离），工具声明 `required_env` → 策略裁决后注入；上下文 env **v0 完全不给模型**（连 allow 名单都不做，最小化）；脱敏 deny 名单 `*_KEY` `*_TOKEN` `*_SECRET` `*_PASSWORD` `*_CREDENTIAL*` + 值形态 `sk-` `ghp_` `gho_` + JWT；事件只记 env **键名**。global / agent / task 级作用域与上下文 env 的 allow 名单留 v1 | ✅ |
 
 | H22 | 权限语义（工作流侧） | `permission_request` / `grants` 是**请求**；实际 = 请求 ∩ 策略上限 ∩ 父级授予。v0 未做——v3（workflow 权限语义）再定；v0 已有等价的 agent 树权限收窄（K17 闸门③ = 请求 ∩ ceiling ∩ 父授予，core/agents/perm.go） | ★ |
@@ -163,7 +163,7 @@
 | I1 | provider 契约 | 自研，不借 pi-ai（kosong 独立佐证可自研） | · |
 | I2 | Go SDK | anthropic/v2、openai/v3、genai（已实测活跃） | ✅ |
 | I3 | 统一事件 | 12 类（text/thinking/toolcall 各 start-delta-end）+ done/error | · |
-| I4 | 跨 provider 上下文交接 | **必做**：行业真空（kosong 静默丢弃、pi 不完整） | · |
+| I4 | 跨 provider 上下文交接 | **必做**：行业真空（kosong 静默丢弃、pi 不完整） **改口降级（2026-10-28 用户）**：不立专项——压缩产物（13 号 L1/L2）是 provider 中立表达，换模型人工/半自动重喂即可；原“必做”降为“随压缩自然可得” | ✅ |
 | I5 | 模型目录 | 内置静态快照 + 在线拉取（models.dev 形态）+ 周期刷新。**落地（2026-10-28 v1-S5）**：`runtime/models`（BuiltinSnapshot + FetchFunc + Catalog.Run 周期刷新 + 内置∪在线合并；刷新失败保留旧值）；`alasol models` 默认在线刷新失败回落内置，`-offline` 只用内置 | ✅ |
 | I6 | 模型绑定 | per-agent 持久化，subagent/fork 继承 | · |
 | I7 | 路由 | 作为扩展点（RoutingPolicy） | · |
@@ -182,18 +182,18 @@
 | J6 | 可回溯 | 压缩后原文仍可按指针回捞 | · |
 | J7 | 溢出处理 | 自动压缩并重试一次 | · |
 | J8 | 上下文策略枚举 | `append`（默认）/ `stage_scoped`（阶段独立 + 交接摘要）/ `sliding_window`（热区滑动）/ **`tiered`**（分级压缩）；**用户可再写自己的** | ✅ |
-| J9 | 压缩等级定义 | **压缩等级 = 目标占用上下文窗口的百分比档位**（非离散编号）；最低档位如 0.1% → 500 个阶段占 50%。v0 未做——v2（深度压缩）再定 | ★ |
-| J10 | 多阶段权衡 | 阶段数多时（500 个），每个阶段的摘要只能是"对当前阶段的简要概括"；深度压缩单阶段时才有更细摘要。v0 未做——v2（深度压缩）再定 | ★ |
+| J9 | 压缩等级定义 | **压缩等级 = 目标占用上下文窗口的百分比档位**（非离散编号）；最低档位如 0.1% → 500 个阶段占 50%。v0 未做——v2（深度压缩）再定 **拍板（2026-10-28 用户）**：两级锚定——L1（浅层摘要）目标 ≤**10%** 窗口、深度压缩 L2 ≤**1%**（L2=summary+一根指针，天然极小）；数字为**可配初值**，真实负载数据回头校准。实现 v2 | ✅ |
+| J10 | 多阶段权衡 | 阶段数多时（500 个），每个阶段的摘要只能是"对当前阶段的简要概括"；深度压缩单阶段时才有更细摘要。v0 未做——v2（深度压缩）再定 由两级设计吸收（13 号：L1=阶段简要概括、L2=深度压缩结论+指针；2026-10-28 拍板） | ✅ |
 | J11 | tier 标签作用 | **给机械化流程的定位标记**：让框架识别出"LLM 要求压缩的范围"→ 取出该范围 → 交 LLM 压缩 → 取回摘要放回上下文 | ✅ |
 | J12 | v0 策略 | **只预留接口**，每阶段先做**最浅层压缩**；不做深度压缩、不做级联 | ✅ |
 | J13 | 触发点 | 占用到 **50%** 时压缩（实测：30~50% 区间 LLM 能力损失较小）；**数值用户可调** | ✅ |
 | J14 | 原文与 trace | 原文永远在持久存储；摘要记录覆盖范围 → **全过程可作完整 trace** | ✅ |
 | J15 | 检索扩展点 | **指针解析 = core 的确定性基础能力**（`Resolve(ref)`，不是扩展点）；**RAG = 独立的概率性扩展点**（`Retriever.retrieve(query)`），通过 `Assembler` 注入 | ✅ |
 | J16 | 解决的根因 | 长时程任务必超窗口；多次压缩破坏摘要 → **目标与约束偏移**（当前 goal 交付率偏低的根因） | ✅ |
-| J17 | **级联问题（未解）** | 深度压缩阶段 A 需"总体局势"+A 全文；若总体局势来自其他阶段摘要，压缩 A 又改变 A 摘要 → 级联失效。v0 未做——v2（深度压缩：级联问题）再定 | ★ |
-| J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算。v0 未做——v2（深度压缩：级联候选解）再定；C 案的 goal ledger 已在 v0 事件化落地（J19/X6）备用 | ★ |
+| J17 | **级联问题（未解）** | 深度压缩阶段 A 需"总体局势"+A 全文；若总体局势来自其他阶段摘要，压缩 A 又改变 A 摘要 → 级联失效。v0 未做——v2（深度压缩：级联问题）再定 **方案落定（2026-10-28）**：13 号两级压缩 + goal ledger C 案切断级联链，v2 实现 | ✅ |
+| J18 | 级联候选解 | A 域隔离（限深 1 层）/ B 结论不可变 / **C 独立全局状态 goal ledger（切断级联链）** / D 级联预算。v0 未做——v2（深度压缩：级联候选解）再定；C 案的 goal ledger 已在 v0 事件化落地（J19/X6）备用 **定案 C 案**（goal ledger 切断级联链，J19/X6 基础已备；2026-10-28 拍板） | ✅ |
 | J19 | goal ledger 提案 | **目标、约束、已完成项、待解项**放在**上下文之外的独立持久存储**，由 agent 在关键点显式更新。压缩任一阶段只读账本 + 目标阶段全文 → 不需要级联；同时根治"目标偏移"。落地：`ledger.updated` durable 事件（全量快照），当前态 = 索引器 `ledger_state` 投影（LWW，seq 守卫），在上下文之外，X6 控制写放大（实现：core/durable/ledger.go + runtime/indexer） | ✅ |
-| J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」**。v0 未做——v2（深度压缩）再定 | ★ |
+| J20 | **压缩触发计入 prompt cache 成本** | 压缩重写历史 = **前缀缓存全失效** → 50% 触发可能比「扛到溢出再压」更贵。**缓解：压缩时保留最前面的稳定段不动**（system / 项目规则 / ledger 留在前缀里），只压中段 → 缓存前缀存活。压缩触发的输入要含「缓存失效成本」；**Q1「编排最后做」改为「与压缩策略联动设计」**。v0 未做——v2（深度压缩）再定 按 13 号缓存定律落地（易变贴生长前沿、压缩不动稳定前缀）；“缓存失效成本进触发输入”的量化留实现时校准（可配）（2026-10-28） | ✅ |
 | J21 | **tiered% 锚定 + token 计量口径** | ✅ **计量口径拍板（2026-10-28 用户）**：`context.assembled` 是**调用前快照 = 正式估算口径**（len/4 自算）；**provider usage 只进成本统计、不回填快照**（原提案"usage 优先"作废——快照生成时 usage 尚不存在）。tiered% 锚定仍留 v2（随深度压缩）。**落点（2026-10-28 v1-S1）**：usage 落 `model.turn` 事件 `ModelTurnUsage`，只进成本统计（实现：core/loop/events.go）。**成本统计落地（2026-10-28 v1-S5）**：`runtime/indexer` 的 `cost_tokens` 派生表 + `GET /api/cost`（总额）/`/api/cost/{id}`（per-session 按模型分组）+ chat `/cost`；`ModelTurnPayload` 增可选 `model` 字段（按模型分组）；实测 usage 未回填快照 | ✅ |
 
 ## K. 进程与多 session
@@ -207,7 +207,7 @@
 | K5 | hub 节奏 | v0 不做 hub，但契约按多进程设计 | · |
 | K6 | 崩溃域 | 单 session 崩溃不影响其他 session，也不拖垮 hub | · |
 | K7 | 并发控制 | 资源冲突调度（非裸并发）+ 配额 + provider 限流指数退避 | · |
-| K8 | **ExecutionEnv 抽象** | agent 的工具执行环境可插拔：`LocalExecutionEnv`（hub 进程内，v0）→ `SandboxedExecutionEnv`（子进程 + 沙箱，v1）→ `RemoteExecutionEnv`（远端 SSH，v2）。**升级到进程隔离只需换 env 实现，不动 agent 逻辑**。v0 未做 SandboxedExecutionEnv/RemoteExecutionEnv——v2（OS 沙箱）/ v3（远端 SSH）再定（12 路线图）；v0 已有可插拔能力抽象（core Exec/Fs/Net/Proc）+ LocalExecutionEnv（runtime/cap/local）作底座 | ★ |
+| K8 | **ExecutionEnv 抽象** | agent 的工具执行环境可插拔：`LocalExecutionEnv`（hub 进程内，v0）→ `SandboxedExecutionEnv`（子进程 + 沙箱，v1）→ `RemoteExecutionEnv`（远端 SSH，v2）。**升级到进程隔离只需换 env 实现，不动 agent 逻辑**。v0 未做 SandboxedExecutionEnv/RemoteExecutionEnv——v2（OS 沙箱）/ v3（远端 SSH）再定（12 路线图）；v0 已有可插拔能力抽象（core Exec/Fs/Net/Proc）+ LocalExecutionEnv（runtime/cap/local）作底座 **拍板（2026-10-28）**：SandboxedExecutionEnv v2 落地——Windows **job object + 受限 token + 目录 ACL** 务实组合 + **可拓展埋点**（Linux/mac 沙箱 seatbelt/bwrap 后续挂）；RemoteExecutionEnv 留后续 | ✅ |
 | K9 | goroutine 隔离的代价（必须对冲） | OS 级崩溃（OOM / 栈溢出 / cgo 崩溃）会带走整个 hub；死循环 goroutine 抢占其他；内存泄漏拖垮 hub。对冲：turn 超时 + 工具超时 + hub 级 CPU/内存监控告警 + 单 agent panic recover 后记事件并标记失败（不影响其他 agent）。**落地（2026-10-28 v1-S5）**：panic 隔离（`executeSafely` recover）+ MaxTurns 截断 + hub 级 CPU/内存/goroutine 三档监控告警（`host/monitor.go`：SampleSource 可注入、周期采样、阈值 flag>env>文件>默认、有界告警环 + `/api/monitor`；告警走 slog+内存环，**未入事件流**——刻意不动契约面，入流/审计留后续） | ✅ |
 | K10 | **发现表（Registry）** | core 的**内存活状态**组件，不是扩展点。属于**容器管理 + subagent 管理**的一部分，不是协议层。事件驱动更新（`agent.started` / `policy.asked` / `workflow.stage.changed` / `agent.finished` → 改内存）。**落地（2026-10-28 v1-S2）**：落 **`core/discovery`**（命名决策：原名"Registry"与扩展注册表 `core/registry`（E3/E5/E6）撞名 → 改 `core/discovery`）；双层语义=事件折叠层（可重建，Apply 幂等）+ 进程本地 live 层（G17b 两分法）；数据流入=**拉式扫描**（跟在线表同口径，防重复计数）；崩溃重启从事件流全量重放重建（真库测试）；来源事件 agent 生命周期已有，`policy.asked`/`workflow.stage.changed` 待 v3 对应 kind 落地后加 case（实现：core/discovery + host/discovery.go） | ✅ |
 | K11 | **可见性 = 两个正交维度** | ✅ **口径定死**：**① 水平（gate）**：只有 **session 的主 agent** 之间互相可见（`gates(A) ∩ gates(B) ≠ ∅`）。**② 垂直（agent 树）**：**父 ↔ 直系子 可见**（每个 agent 可见自己的父 agent + 自己的全部直系子 agent）；**兄弟 subagent 互相不可见**；别 session 的 subagent 完全不可见。**跨层上查 = `Inquiry` 沿父链逐级显式调用**（每跳一次是一次调用），不是「全祖先自动可见」。孤儿防护靠「父可见子 + 异常向上冒泡（K23）」闭环。**落地（2026-10-28 v1-S2）**：水平维 = `discovery.VisiblePeers`（对端主 agent ∩ gates 相交 ∩ 存活），别 session subagent 不泄漏（负例测试） | ✅ |
@@ -219,7 +219,7 @@
 | K17 | **spawn 三道闸门** | 全部**运行时强制**（不靠提示词）：① **深度** `child.depth ≤ max_agent_depth` ② **类型** `child.type ∈ parent.can_spawn` ③ **权限** `child.permission ⊆ parent.permission ∩ policy_ceiling`。类型闸门让 `can_spawn` 有向无环，注册时校验。落地：`Tree.Spawn` 三闸门全运行时强制，闸门③经 perm.go 三维 read/write/exec 只收窄（未知级 fail-close 拒）；任一道拒则落 tool.call.failed、不建节点（实现：core/agents/tree.go + perm.go） | ✅ |
 | K18 | **交流能力做成可复用组件** | `core/agentlink/`（或 comms/）：`Presence`（在线表）+ `Discover`（按 gate / 树查找）+ `Inquiry`（深入查询某 session 的事件窗口）+ `Broadcast`（向 gate / 子树发消息）+ `Handoff`（结构化交接带 payload）。**library 形态，不绑定任何协议**。**落地（2026-10-28 v1-S3）**：`core/agentlink` 五件套（E8 通用组件区；core 不做 IO——EventWindowReader/EventSink 宿主注入）；Broadcast/Handoff 事件化 `agentlink.broadcast`/`agentlink.handoff`（拉模型投递，幂等键含发送方 + store 去重 + 回读归属校验）；**subtree 射程 = 目标子树 ∩ 发送方一跳可见集（父+直系子）**——K27 显式逐跳、不做传递闭包（"子树"命名大于实际射程，要全树广播须另开口子，不得放宽可见集）；Inquiry = 摘要 + 事件窗口 + refs 核验（token 锚定防子串伪造，含空格路径整串核验；K24 端到端成立）；查询面全带 caller 按 K11 裁剪（实现：core/agentlink + host/agentlink.go） | ✅ |
 | K19 | 跨机 | **不做分布式存储 / 分布式发现**。跨机时把 session 暴露成 **ACP agent 端点**，客户端用现成协议接入——不自己发明分布式协议。v0 未做——v4（跨机，session 暴露成 ACP 端点）再定 | ★ |
-| K20 | **层级 3 = 只读型** | **由 type 自行声明**（不硬编码"第 3 层必只读"——某些 workflow 需要可写的 scout）；但**内置的几个 type 默认只读**（`scout`：read/glob/grep）。理由：subagent 是**上下文隔离器**（把大量读取外包出去，避免主 agent 上下文被占满）；只读型的 `can_spawn` 为空 → **第 4 层在类型层面不可达**。v0 未做——v1（层级语义细化）再定；v0 类型系统已支持"只读型"表达（CanSpawn 为空 + 只读 Tools），但无内置只读 type | ★ |
+| K20 | **层级 3 = 只读型** | **由 type 自行声明**（不硬编码"第 3 层必只读"——某些 workflow 需要可写的 scout）；但**内置的几个 type 默认只读**（`scout`：read/glob/grep）。理由：subagent 是**上下文隔离器**（把大量读取外包出去，避免主 agent 上下文被占满）；只读型的 `can_spawn` 为空 → **第 4 层在类型层面不可达**。v0 未做——v1（层级语义细化）再定；v0 类型系统已支持"只读型"表达（CanSpawn 为空 + 只读 Tools），但无内置只读 type → **挪 v3**（2026-10-28 重新标注：随工作流 agent_type 声明一并解） | ★ |
 | K21 | **orchestrator = 一个 type，不是硬编码层级** | "主 agent 下加一个 orchestrator"（它对整个项目 + 自己负责的模块做较完整探索，再分派 subagent）→ 表达为**一个 `coordinator` 类型的 agent_type**（`can_spawn` 指向 worker 类型，权限更高）。**层级数不硬编码**；"4 层"只是某种 type 组合的可达结果。落地：orchestrator 表达为一个 agent_type（其 CanSpawn 指向 worker），root 只是 depth=1，层数由 type 的 can_spawn 组合自然涌现；spawn/complete 按 can_spawn/深度注入，无硬编码"主 agent"概念（实现：core/loop/agenttools.go + core/agents） | ✅ |
 | K22 | **兄弟协作：A + B，不开 C** | 兄弟 subagent **互相不可见**（可见性要动态变就难审计，也违背「分支」哲学）。解法：**A 共享契约前置**（主 agent 在 spawn 时把表结构草案 / API 签名写进每个 subagent 的提示词 → 把运行时通信问题变成拆解时的设计问题）+ **B 共享黑板**（兄弟经黑板交换信息，不走可见性）。**黑板同样事件化**：`board.written` 作为 durable 事件追加，当前态 = 索引器投影（键级 last-write-wins 由事件顺序天然保证，见 G23）；语义可借鉴 moamcp 的 raw board（键级 LWW + 墓碑删除 + 分区） | ✅ |
 | K23 | **通信收敛机制** | ❌ **不做通信预算 / 配额**——靠**协调者居中**（`coordinator` type 承担协调行为）→ 树形沟通天然收敛，不存在"两两互聊"。**冲突防止靠 CI 门禁**（`gates` 里的 `ci.check` 部件）→ 冲突检测从**运行时移到集成时**。✅ **保留基础兜底**（这些是 agent 的基本属性，不是"预算"）：每 agent 的 turn 超时 / 工具超时 + **异常必须向上冒泡**（subagent 失败或卡住 → 直系父 agent 的 summary 必须报告它） | ✅ |
@@ -227,7 +227,7 @@
 | K25 | 单流多 agent 视图 | 主 agent 与 subagent **共用全局事件流**（G3），靠 `agent_id` 区分。上下文装配 = **按 `agent_id` 对全局流做投影**（主 agent 的视图 = 自身事件 + 子 agent 的 summary + 注入内容；subagent 的视图 = 自身事件 + 注入内容）。subagent 的 trace 因此天然持久、可回放。落地：主/subagent 同 session_id 单流，`newAgentEvent` 让父 loop 代子落 agent.spawned/completed/failed（agent_id=child），子 loop 与父同 Bus/SessionID 仅 AgentID 不同（实现：core/loop/events.go + agenttools.go） | ✅ |
 | K27 | **垂直可见性口径定死** | ✅ 见 K11：**父 ↔ 直系子 可见 + Inquiry 沿父链逐级上查**（不是「全祖先/全后代自动可见」）。三处文档（06 §7.1 / K11 / handoff B#5）已统一 | ✅ |
 | K28 | **Durable 与恢复语义（承重墙）** | 见 X 区（单独成节）。承 X 区全部落地：三段写路径（X1）、replay 三分类（X2）、checkpoint 四要素（X3）、resume 五步（X4）、ownership 幂等键（X5）、ledger 写放大（X6）均在 core/durable + core/loop 实现，kill -9 后可续跑且不重复副作用（实现：core/durable + core/loop/replay.go） | ✅ |
-| K29 | **fork/clone 复制语义** | ✅ **拍板（2026-10-28 用户，改写原提案）**：fork **只附带上下文**——不复制 ledger/gate 全套（原提案"只复制 ledger 快照与 gate 成员"作废）；主场景 = `/btw` 类旁支命令。**实现后置**（随 /btw 命令落地，不进 v1） | ✅ |
+| K29 | **fork/clone 复制语义** | ✅ **拍板（2026-10-28 用户，改写原提案）**：fork **只附带上下文**——不复制 ledger/gate 全套（原提案"只复制 ledger 快照与 gate 成员"作废）；主场景 = `/btw` 类旁支命令。**实现后置**（随 /btw 命令落地，不进 v1） **UX 拍板（2026-10-28 用户）**：/btw 结果**只给用户**、不回灌主上下文；**预埋**“从 /btw 生成全新 session”钩子——只埋点不实现（实现需多方面微调） | ✅ |
 | K26 | agent 树的 id | `agent_id` = **ULID**（不是递增序列——递增序列在并发 spawn 下不安全，且跨树无意义）；`depth` = int；`parent_agent_id` = ULID 或 null；树内"第几个 subagent" = int64（仅供 UI 显示，非身份）。落地：`agent_id` = `core.NewUlid()`（并发 spawn 安全）、`depth` = int、`parent_agent_id` = ULID 或 nil（root）；树内 spawn 顺序由 `children` 切片记录供 UI 显示（实现：core/agents/tree.go） | ✅ |
 
 ## L. 可观测性与评测
@@ -258,7 +258,7 @@
 
 | ID | 决策项 | 我的主张 | 状态 |
 |---|---|---|---|
-| N1 | MCP 方向 | 先做 client 还是先做 server？v0 未做——v3（MCP：先 client 后 server 或反之，官方 go-sdk 已实测可用）再定 | ★ |
+| N1 | MCP 方向 | 先做 client 还是先做 server？v0 未做——v3（MCP：先 client 后 server 或反之，官方 go-sdk 已实测可用）再定 **拍板（2026-10-28 用户）**：**client 先**——先消费别人的 MCP server（工具生态立刻变宽），官方 go-sdk 已实测 | ✅ |
 | N2 | MCP 可选能力 | 不实现 sampling / elicitation / roots | · |
 | N3 | ACP | 不在 v0 | ✅ |
 | N4 | hub↔UI 协议 | ✅ **WebSocket + NDJSON**（与 D1/D2 已定契约一致，不引入 protobuf 工具链；浏览器/手机原生可用零额外组件；调试友好 `curl` 即可看流；HTTP/1.1 在移动网络重连比 HTTP/2 简单；量级不需要 gRPC 多路复用）。gRPC 排除原因：protobuf 与 JSON Schema 契约冲突 + gRPC-Web 需额外部署 Envoy proxy | — | ✅ |
@@ -293,16 +293,16 @@
 | R10 | 编排能力 | `spawn` 只是 orchestrator type 的一个工具，worker type 没有 → 多 agent 模型自然涌现，不需要框架内置"主 agent"概念。落地：`spawn`/`complete` 是按类型可达性注入的框架内部工具（can_spawn 非空才可见 spawn、depth>1 才可见 complete），过策略与三闸门；worker type 无 spawn → 多 agent 层级自然涌现，无硬编码"主 agent"概念（实现：core/loop/agenttools.go + visibleTools） | ✅ |
 | R11 | 可见 vs 权限分离 | 可见性管"能不能看见"，权限管"能不能做"（agent_type 的 `permission_request`）；需要"可见但禁止"时走策略层 deny。落地：`visibleTools`（type.Tools + deny）管可见，`permDenial`（effectivePerm = 请求∩ceiling∩父授予，RequiredCapabilities 推导）管能否做；"可见但禁止"经策略层 deny/权限维度收窄实现，两层独立（实现：core/loop/loop.go + toolcall.go permDenial） | ✅ |
 | R7 | 权限绑定 | 权限跟着 **agent_type** 走，不跟着工作流叠加走（"review 只读"通过选只读 agent_type 实现） | ✅ |
-| R8 | 能力池叠加 | 追加 loop 时 system prompt 的哲学**并列追加**，能力池**并集**，权限仍受策略上限约束。v0 未做——v1（能力池叠加：追加 loop 的 prompt 并列 + 能力池并集）再定 | ★ |
+| R8 | 能力池叠加 | 追加 loop 时 system prompt 的哲学**并列追加**，能力池**并集**，权限仍受策略上限约束。v0 未做——v1（能力池叠加：追加 loop 的 prompt 并列 + 能力池并集）再定 → **挪 v3**（2026-10-28 重新标注：随工作流 agent_type 声明一并解） | ★ |
 
 ## W. 工作流（能力包 / 设计哲学 / 主 agent 自编排）
 
 | ID | 决策项 | 我的主张 | 状态 |
 |---|---|---|---|
-| W1 | 工作流本质 | **能力包的提供与批准**：一套工作哲学 + 子代理类型 + 上下文管理方式 + 关键阶段部件 + 预批准。**不是流程**。v0 未做——v3（工作流引擎）再定 | ★（方向已由用户明确） |
-| W2 | 阶段含义 | 阶段 = **设计哲学**（如 plan-coder-critic-review），不是强制序列，不规定"这个阶段必须派哪些 subagent"。v0 未做——v3（工作流引擎）再定 | ★ |
-| W3 | 触发方式 | slash 命令 / 显式触发 → **哲学文本进 system prompt 供主 agent 选择**。v0 未做——v3（工作流引擎）再定 | ★ |
-| W4 | 追加 loop | 有问题时**在后续追加一个 loop**（如 review-critic）继续解决 → 工作流可组合。v0 未做——v3（工作流引擎：追加 loop）再定 | ★ |
+| W1 | 工作流本质 | **能力包的提供与批准**：一套工作哲学 + 子代理类型 + 上下文管理方式 + 关键阶段部件 + 预批准。**不是流程**。v0 未做——v3（工作流引擎）再定 方向已由用户明确，**2026-10-28 再确认**：能力包（哲学+agent_types+context_strategy+gates+grants），**不是流程、非强制** | ✅ |
+| W2 | 阶段含义 | 阶段 = **设计哲学**（如 plan-coder-critic-review），不是强制序列，不规定"这个阶段必须派哪些 subagent"。v0 未做——v3（工作流引擎）再定 **拍板（2026-10-28）**：阶段=哲学非强制序列——“强制反而不适合”（用户） | ✅ |
+| W3 | 触发方式 | slash 命令 / 显式触发 → **哲学文本进 system prompt 供主 agent 选择**。v0 未做——v3（工作流引擎）再定 **拍板（2026-10-28）**：slash/显式触发 → 哲学文本进 system prompt 供主 agent 选择 | ✅ |
+| W4 | 追加 loop | 有问题时**在后续追加一个 loop**（如 review-critic）继续解决 → 工作流可组合。v0 未做——v3（工作流引擎：追加 loop）再定 **拍板（2026-10-28）**：追加 loop 可组合（如 review-critic 续解问题） | ✅ |
 | W5 | 子代理类型 | `agent_types[]`：每项声明 `prompt` / `tools[]` / `permission_request` / `model`——**用户可自定义工具列表、提示词、权限范围**。v0 未做——v3（工作流引擎：子代理类型声明）再定；v0 agent_type 契约（contracts.AgentType）已支持 prompt/tools/permission_request/model，但无工作流层加载 | ★ |
 | W6 | 上下文策略 | `context_strategy` 是工作流的一部分（可区别于默认追加式）；内置枚举 + 参数，复杂的才做成扩展。v0 未做——v3（工作流引擎：上下文策略）再定 | ★ |
 | W7 | 验收目标与部件 | 工作流可自带**验收目标**（自写 CI、写屏障、合并前检查……）；里程碑只是其中一例。分两类：**同步门禁类**（写屏障/权限门）→ **数据驱动的策略规则**，进程内同步生效；**异步任务类**（CI/验收/构建）→ **进程级组件**，可热插拔、可替换。**冲突检测放在这里（CI 门禁），不在通信层解决**。v0 未做——v3（工作流引擎：验收目标与部件）再定 | ★ |
@@ -313,18 +313,18 @@
 | W9c | **CI baseline** | ✅ **优先级高**（tower 回函：这是他们的真空地带；**红仓是长时程自主的常态**，没有 baseline 门禁就永远卡死）。要「**已知失败指纹 + 豁免**」的口子；baseline 作用域建议**仓库级**（分支级会碎片化） | ✅ |
 | W10b | **CI 失败 → 自动 escalate** | ✅ 门禁失败自动 escalate（checkpoint + 挂起）。**不阻塞其它 agent**——只阻塞本分支的 merge，依赖它的 mission 由 deps 检查挡住。failed 是**终态**（无自动重试）；重跑 = 重新发起一次 run | ✅ |
 | W7b | 插件可行性 | **Go plugin 在 Windows 不可用**（仅 linux/darwin/freebsd）→ 组件一律走进程级或解释型。写屏障**不能**做成进程外插件（TOCTOU + 可绕过），必须是进程内策略规则 | ✅（技术结论） |
-| W21 | 编排主体 | 主 agent 自行决定：开几个 subagent、用哪个 agent_type、并行与否；框架不校验。v0 未做——v3（工作流引擎：编排主体）再定 | ★ |
+| W21 | 编排主体 | 主 agent 自行决定：开几个 subagent、用哪个 agent_type、并行与否；框架不校验。v0 未做——v3（工作流引擎：编排主体）再定 **拍板（2026-10-28）**：编排主体=主 agent 自决，框架不校验（非强制） | ✅ |
 | W11 | 动态性 | 偏离（跳过里程碑、自造流程、多开）**记入事件流**；工作流文档变更走事件追加。v0 未做——v3（工作流引擎：动态性）再定 | ★ |
 | W12 | 归属 | 绑定在 session 上的一份配置，不是 core 全局状态。v0 未做——v3（工作流引擎：归属 session 配置）再定 | ★ |
 | W13 | 契约形态 | `Workflow` 是跨边界 JSON Schema 契约（纯数据，可被任何语言写/组合/追加）。v0 未做——v3（工作流引擎：Workflow 跨边界契约）再定 | ★ |
-| W14 | 代码扩展点 | 只有两处是代码：**里程碑部件**（`MilestoneHandler`）与**自定义上下文策略**。v0 未做——v3（工作流引擎：代码扩展点）再定 | ★ |
+| W14 | 代码扩展点 | 只有两处是代码：**里程碑部件**（`MilestoneHandler`）与**自定义上下文策略**。v0 未做——v3（工作流引擎：代码扩展点）再定 **拍板（2026-10-28）**：代码扩展点只有两处——MilestoneHandler + 自定义上下文策略 | ✅ |
 | W15 | **预算策略** | **默认不设上限**（长时程自主是卖点，预算不可控）；改为**风险闸门**：主 agent 判断涉及**大范围架构改动/既有内容**时主动停下告知用户。v0 未做——v3（工作流引擎：预算策略改风险闸门）再定 | ★ |
 | W16 | 闸门实现 | 框架提供**变更影响面**客观依据（diff 规模、触及的核心接口）供 agent 判断，而非纯靠模型感觉 | ✅（做） |
 | W17 | escalate 语义 | **checkpoint + 挂起**（不 deny、不丢进度）；恢复后由用户决定继续 / 改方向 / 放弃。无人值守同样挂起而非失败 | ✅ |
 | W17b | escalate vs ask | 两者都走 Approver 但**触发源不同**：ask=策略链拦截，escalate=agent 主动升级。日志必须可区分触发源。落地：契约层区分触发源——`ApprovalRequest.Trigger` = `policy_ask`（策略链拦截，无人应答→deny+拒绝话术）/ `escalate`（agent 主动升级→checkpoint 挂起）；审批事件与日志据此可区分（实现：contracts/approval.go ApprovalTrigger） | ✅ |
 | W20 | 升级 vs 审批 | `ask`（策略拦截）无人应答 → deny + 拒绝话术；`escalate`（agent 主动）→ checkpoint 挂起 | ✅ |
 | W18 | 哲学分类 | 构建类（plan-coder-critic-review）与探索/资产探查类各有不同哲学 → 工作流是可分发的包。v0 未做——v3（工作流引擎：哲学分类）再定 | ★ |
-| W19 | 现成验证用例 | **tower 就是一个工作流实例**（worktree 生成 + 合并前仿 CI 检查作为里程碑部件）→ 可作首个实现验证。v0 未做——v3（工作流引擎：tower 作首个验证用例）再定 | ★ |
+| W19 | 现成验证用例 | **tower 就是一个工作流实例**（worktree 生成 + 合并前仿 CI 检查作为里程碑部件）→ 可作首个实现验证。v0 未做——v3（工作流引擎：tower 作首个验证用例）再定 **拍板（2026-10-28）**：tower 作首个验证用例（critic→reviewer 循环做成第一个 workflow 包） | ✅ |
 ## V. CI 门禁实现细节（依据 tower 回函 `ho_d0df74d42709`）
 
 | ID | 决策项 | 我的主张 | 状态 |
@@ -332,10 +332,10 @@
 | V1 | **快照隔离** | CI 跑在**一次性快照 worktree**（把分支 tip 检出到独立 detached worktree），**不是 live worktree** → 未提交改动、写了一半的文件**结构性不参与**。比 dirty 检查干净。并行跑 N 个 CI = N 个独立快照。落地：`gateexec.Snapshot` 用 `git worktree add --detach` 把分支 tip 检出到独立 detached worktree，未提交改动结构性不进快照；并行跑 N 个门禁 = N 个独立快照互不干扰（实现：runtime/gate/git.go） | ✅ |
 | V2 | **receipt 校验** | 门禁只认四件事：① `exitCode === 0` ② `receipt.commit === 分支当前 tip` ③ `observedCommit === commit` ④ `command === 当前配置`。**防止"跑的是旧 commit"或"配置已改"被误判为通过**。落地：`core/gate.Verify` 四查，评估序先可信度(②③④)后成败(①)——过期/错配 receipt 硬拒绝，只有"可信但失败"才转 baseline（实现：core/gate/receipt.go） | ✅ |
 | V3 | **外部资源隔离 = 留白 + 约定注入** | 快照只隔离**文件系统**；端口 / 临时目录 / 全局缓存（pnpm store、go mod cache、venv）/ 构建产物**不在问题域内** → 给命令注入约定环境变量（`$CI_WORKTREE`、`$CI_PORT_BASE` 等）让命令自隔离。**tower 明确说这是留白、他们没解**。落地：`gateexec.Run` 注入约定 env `CI_WORKTREE`/`CI_COMMIT`/`CI_PORT_BASE`（端口基址随机派生避免并行撞端口）让命令自隔离，诚认这是留白（实现：runtime/gate/exec.go） | ✅ |
-| V4 | 依赖缓存策略 | tower 选**每快照独立**（干净但每次全量安装，慢）。我们可做**内容寻址的共享只读缓存**（快 + 无锁竞争 + 无污染）——但这是他们重做清单的第 1 条，说明有真实收益。v0 未做——v2（依赖缓存策略：内容寻址共享只读缓存）再定 | ★ |
+| V4 | 依赖缓存策略 | tower 选**每快照独立**（干净但每次全量安装，慢）。我们可做**内容寻址的共享只读缓存**（快 + 无锁竞争 + 无污染）——但这是他们重做清单的第 1 条，说明有真实收益。v0 未做——v2（依赖缓存策略：内容寻址共享只读缓存）再定 **定案（2026-10-28）**：内容寻址共享只读缓存（无锁竞争、无污染）；v2 门禁增强实现 | ✅ |
 | V5 | **日志截断 + 耗时埋点** | CI 日志文件**必须设上限**（tower 现在无限增长，是他们重做清单第 1 条）。run 记录加 `elapsedMs`（tower 没埋，复盘全靠猜）。落地：CI 日志 `LogTail` 只留尾部 ≤64KB（`tailBuffer` 上限，防无限输出吃内存），`Receipt.ElapsedMS` 必记耗时毫秒，`gate.checked` 事件带 elapsed_ms（实现：runtime/gate/exec.go + core/gate/receipt.go） | ✅ |
-| V6 | **review-tip 失效检测** | 「review 后又推了一行」是 tower 最常见的 merge block。我们的事件流天然能检测：分支 tip 变了 → 已有 review 结论失效 → 要求重审。v0 未做——v2（review-tip 失效检测）再定 | ★ |
-| V7 | **合并后冲突预测** | tower 在合并**成功后**做「本次改动 vs 未合并 mission 的三点 diff 求交集」提前预警撞车。**我们能用依赖图做得更准**（G 区 change_impact 的可达性查询）。v0 未做——v2（合并后冲突预测，用依赖图可达性）再定 | ★ |
+| V6 | **review-tip 失效检测** | 「review 后又推了一行」是 tower 最常见的 merge block。我们的事件流天然能检测：分支 tip 变了 → 已有 review 结论失效 → 要求重审。v0 未做——v2（review-tip 失效检测）再定 照主张（2026-10-28）：review 后分支 tip 变 → 结论失效 → 要求重审（事件流天然可检测）；v2 实现 | ✅ |
+| V7 | **合并后冲突预测** | tower 在合并**成功后**做「本次改动 vs 未合并 mission 的三点 diff 求交集」提前预警撞车。**我们能用依赖图做得更准**（G 区 change_impact 的可达性查询）。v0 未做——v2（合并后冲突预测，用依赖图可达性）再定 照主张（2026-10-28）：依赖图可达性做合并冲突预测；v2 实现 | ✅ |
 | V8 | **write guard 的诚实边界** | ✅（已定，方案 a）tower 的 guard 是 **fail-open** 且**只拦 Write/Edit 工具**——Bash 重定向 / `rm` / `git checkout --` 都不拦。他们的教训：要做就 **fail-close + 覆盖 shell 写入**。我们 V0 做不到覆盖 shell 写 → **UI 上明确声明边界**（写保护覆盖文件工具；Bash 写入受策略链但非 OS 强制），**不假装覆盖了**。真正的解法是 V1 的 OS 沙箱（Windows 上原生沙箱极少：AppContainer 形状不对、MIC 不适用、Windows Sandbox 需 Hyper-V 且无法访问真实工作区） | ✅ |
 | V9 | 可搬运资产（**语义参照，产物重写**） | **不搬代码**（与 omkc 的 mission / roster / agentId 强耦合），但**可搬 schema 与机制**：CI run 记录 schema、**receipt 四要素校验**、merge gate **步骤骨架**、gitOps 的 junction-safe rmTree 与 worktree registry、guard 的「声明 accesses + 子路径判定」形态。**但要挑着搬**——tower 的链是 mission→deps→survey→review→tip→scope→CI→base→merge，我们**没有 mission / deps / 独立 reviewer**，对应物是 agent 树 + 协调人 → **只搬 CI 那几段与步骤骨架，其余不要**；「合并后冲突预测」也不能照搬（三点 diff 交集 → 我们用依赖图可达性，更准）。落地：按"只搬 CI 那几段"选择性实现——receipt 记录 schema + 四要素校验（core/gate）、一次性快照 worktree（gateexec.Snapshot）、junction-safe rmTree（removeTreeSafe，Lstat 不跟随链接）；mission/deps/review 链未搬（实现：core/gate + runtime/gate） | ✅ |
 | V10 | Windows 具体坑 | git 走**绝对路径 execFile `git.exe`**（不走 shell，防 cwd 劫持）；`windowsHide:true`；kill 用 `taskkill /T /F /PID`；**WER 弹窗压制**（否则桌面炸弹窗）；**junction 防御**（rmTree 先解 junction 再删）；路径身份比较要 **realpath + 小写**；worktree 被 CI 子进程锁住**无自动解锁**（只能人杀进程）。落地：git 绝对路径 execFile git.exe（不经 shell）、`windowsHide:true`、kill 用 taskkill /T /F /PID、junction 防御（removeTreeSafe Lstat 不跟穿）；WER 崩溃弹窗完整压制属沙箱层（v2）、realpath 路径身份比较属 S13（v1）——诚实标注未做（实现：runtime/gate + runtime/cap/local） | ✅ |
@@ -366,9 +366,9 @@
 
 | ID | 决策项 | 我的主张 | 状态 |
 |---|---|---|---|
-| Q1 | 编排时机 | **最后做**——先确定"所有需要注入的内容"及其**稳定性分级**，再定 prompt 顺序。实现与提案有出入：v0 注入源只落 system/tools/history 三源（`context.assembled` 的 base/tools/history），编排时机与稳定性分级排序未做（在线表注入属 v1），待确认 | ★ |
-| Q2 | 注入源清单 | system/基础提示 · 工具 schema · agent_type 与权限声明 · 项目规则（AGENTS.md）· goal ledger · 历史事件 · **在线表/在线状态** · 当前阶段与 role。实现与提案有出入：v0 只落 system/工具 schema/历史事件三源（context.go 的 base/tools/history），项目规则/ledger/在线表/阶段与 role 未注入，待确认 | ★ |
-| Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾**。实现与提案有出入：v0 无多源注入的稳定性分级排序（只有 base/tools/history 三项粗粒度，顺序即注册序），待确认 | ★ |
+| Q1 | 编排时机 | **最后做**——先确定"所有需要注入的内容"及其**稳定性分级**，再定 prompt 顺序。实现与提案有出入：v0 注入源只落 system/tools/history 三源（`context.assembled` 的 base/tools/history），编排时机与稳定性分级排序未做（在线表注入属 v1），待确认 → 剩余部分**随深度压缩定分级（挪 v2）**（2026-10-28 重新标注） | ★ |
+| Q2 | 注入源清单 | system/基础提示 · 工具 schema · agent_type 与权限声明 · 项目规则（AGENTS.md）· goal ledger · 历史事件 · **在线表/在线状态** · 当前阶段与 role。实现与提案有出入：v0 只落 system/工具 schema/历史事件三源（context.go 的 base/tools/history），项目规则/ledger/在线表/阶段与 role 未注入，待确认 → 同上（挪 v2，随深度压缩补全注入源分级）（2026-10-28 重新标注） | ★ |
+| Q3 | 稳定 → 变动排序 | **极稳定 → 半稳定 → 变动 → 极变动**。system/工具/schema 在前；项目规则/ledger 居中；历史次之；**在线表放最末尾**。实现与提案有出入：v0 无多源注入的稳定性分级排序（只有 base/tools/history 三项粗粒度，顺序即注册序），待确认 → 完整分级随深度压缩落地（挪 v2）（2026-10-28 重新标注） | ★ |
 | Q4 | 缓存友好 | **在线表 / 在线状态必须放 prompt 末尾**——它秒级变动，放前面会让整个前缀的 prompt cache 失效。**落地（2026-10-28 v1-S4）**：在线表恒为 provider 消息序列最后一段（含工具调用轮之后），只进本轮请求、不入持久历史（防 fold 污染与累积） | ✅ |
 | Q5 | 暴露等级收敛 | ✅ 随 K14 拍板（2026-10-28 用户）：默认 `summary`，按需升 `n`，`full` 需显式 | ✅ |
 | Q6 | Inquiry 返回 | **结构化摘要 + 事件窗口**（两者都给）：摘要给模型直接消费，窗口给模型按需翻。**落地（2026-10-28 v1-S3）**：`InquiryResult` = SummaryEntry[] + EventWindow + RefCheck[]；同 session 默认投影到调用方可见集（K11），跨 session 整 session（对端视角，K24 核验依赖）；HTTP 默认 limit=200 + truncated 信号 | ✅ |
@@ -407,44 +407,22 @@
 
 | ID | 决策项 | 状态 |
 |---|---|---|
-| B4 | 解释型扩展运行时 | ★ |
 | E2 | 分配 | ★ |
-| G1 | Store 形态 | ★ |
-| G2 | 存储抽象层 | ★ |
 | G2d | 向量引擎 | ★ |
 | G2e | blob 引擎 | ★ |
-| G2f | 图不是硬依赖 | ★ |
-| G18 | 图查询分层 | ★ |
-| G19 | 图内存预算 | ★ |
-| G20 | 闭包缓存 | ★ |
-| G21 | 图的用途链 | ★ |
 | H14 | env 分层 | ★ |
 | H20 | 注入作用域 | ★ |
 | H22 | 权限语义（工作流侧） | ★ |
 | H23 | 命中即放行（工作流侧） | ★ |
-| J9 | 压缩等级定义 | ★ |
-| J10 | 多阶段权衡 | ★ |
-| J17 | 级联问题（未解） | ★ |
-| J18 | 级联候选解 | ★ |
-| J20 | 压缩触发计入 prompt cache 成本 | ★ |
-| K8 | ExecutionEnv 抽象 | ★ |
 | K19 | 跨机 | ★ |
 | K20 | 层级 3 = 只读型 | ★ |
 | M6 | 通用重试组件 | ★ |
-| N1 | MCP 方向 | ★ |
 | N4b | 公网暴露 / 远程访问 | ★ |
 | N5 | 客户端鉴权与降权 | ★ |
 | Q1 | 编排时机 | ★ |
 | Q2 | 注入源清单 | ★ |
 | Q3 | 稳定 → 变动排序 | ★ |
 | R8 | 能力池叠加 | ★ |
-| V4 | 依赖缓存策略 | ★ |
-| V6 | review-tip 失效检测 | ★ |
-| V7 | 合并后冲突预测 | ★ |
-| W1 | 工作流本质 | ★（方向已由用户明确） |
-| W2 | 阶段含义 | ★ |
-| W3 | 触发方式 | ★ |
-| W4 | 追加 loop | ★ |
 | W5 | 子代理类型 | ★ |
 | W6 | 上下文策略 | ★ |
 | W7 | 验收目标与部件 | ★ |
@@ -452,15 +430,12 @@
 | W11 | 动态性 | ★ |
 | W12 | 归属 | ★ |
 | W13 | 契约形态 | ★ |
-| W14 | 代码扩展点 | ★ |
 | W15 | 预算策略 | ★ |
 | W18 | 哲学分类 | ★ |
-| W19 | 现成验证用例 | ★ |
-| W21 | 编排主体 | ★ |
 
-**合计**：✅ 已定 **143** 条 · ★ 待议 **50** 条 · · 默认通过（我的主张，未逐条确认）**87** 条 · 共 **280** 条
+**合计**：✅ 已定 **170** 条 · ★ 待议 **25** 条 · · 默认通过（我的主张，未逐条确认）**85** 条 · 共 **280** 条
 
-> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）。2026-10-28 v1-S4 落地回填：**Q4 ★→✅**（在线表恒在 prompt 末尾），✅ 139 → **140**、★ 52 → **51**；K14/K15 补落地注记；S15 补短 id 尾段注（前缀同毫秒碰撞）。评审循环 2 轮（p2 短 id 碰撞 + 3 p3 → clean）；修复由主 agent 亲手完成并自证（reviewer 模型账户余额耗尽 402 期间），critic 复查确认 clean。2026-10-28 v1-S5 落地回填：**K9 ★→✅、I5/B2 ·→✅**（hub 监控三档告警、模型目录、bubbletea TUI 选型），✅ 140 → **143**、★ 51 → **50**、· 89 → **87**；H15/J21/O6 补落地注记（TOML env>文件、cost_tokens 成本统计、TUI 三面）。**v1 五段全部收口**。评审循环 2 轮（p2 worktree 文档言过其实 + p3 model 断言缺口 → 修复落盘后主 agent 变异自证，critic 复查轮因 402 未跑完——如实挂账）。**S5 挂账后续项**：worktree 工具级隔离（工具仍跑进程 cwd，改 core/loop 执行上下文与 X1 冲突）、K9 告警入事件流、worktree 登记表持久化、TUI 自动化交互测试
+> 2026-10-28 v0 回填（施工 session，§4.5.2）：★ 108 → **64**（44 条转 ✅；其余 ★ 已补版本归属/出入注记，见各区主张列）。✅ 82 → **126**，· 仍 **90**，总数 **280** 不变（无新增/删除条目，编号不复用）。**汇总脚本不在仓内**（全仓检索无），本表按各区剩余 ★ 手工重排——后人若找到脚本请补回。2026-10-28 议程拍板：★ 64 → 56（S13/S14/K14/K15/K29/Q5/H15/J21 转 ✅）。2026-10-28 v1-S1 落地回填：**F1 ·→✅**（user.prompt/model.turn 入流补缺口），✅ 134 → **135**、· 90 → **89**；S3/S13/S14/J21 补落地注记（S13 的 EvalSymlinks 字面在 Windows 不解析 junction，落地为逐组件 Readlink，语义等同——详见行内）。2026-10-28 v1-S2 落地回填：**K10/K12 ★→✅**（发现表落 core/discovery——原名 Registry 与扩展注册表撞名；gate.joined + 活成员语义），✅ 135 → **137**、★ 56 → **54**；K11 补落地注记；`contracts/INVENTORY.md` §2 kind 表补全至 x-kind-payload 全集（16 项，此前 v0 各期漏账）。2026-10-28 v1-S3 落地回填：**K18/Q6 ★→✅**（agentlink 五件套 + Inquiry 摘要/窗口/refs 核验），✅ 137 → **139**、★ 54 → **52**；subtree 口径收窄为「目标子树 ∩ 一跳可见集」（K27 逐跳，详见 K18 行内）；INVENTORY §2 +agentlink.broadcast/agentlink.handoff（共 18 项）。2026-10-28 v1-S4 落地回填：**Q4 ★→✅**（在线表恒在 prompt 末尾），✅ 139 → **140**、★ 52 → **51**；K14/K15 补落地注记；S15 补短 id 尾段注（前缀同毫秒碰撞）。评审循环 2 轮（p2 短 id 碰撞 + 3 p3 → clean）；修复由主 agent 亲手完成并自证（reviewer 模型账户余额耗尽 402 期间），critic 复查确认 clean。2026-10-28 v1-S5 落地回填：**K9 ★→✅、I5/B2 ·→✅**（hub 监控三档告警、模型目录、bubbletea TUI 选型），✅ 140 → **143**、★ 51 → **50**、· 89 → **87**；H15/J21/O6 补落地注记（TOML env>文件、cost_tokens 成本统计、TUI 三面）。**v1 五段全部收口**。评审循环 2 轮（p2 worktree 文档言过其实 + p3 model 断言缺口 → 修复落盘后主 agent 变异自证，critic 复查轮因 402 未跑完——如实挂账）。**S5 挂账后续项**：worktree 工具级隔离（工具仍跑进程 cwd，改 core/loop 执行上下文与 X1 冲突）、K9 告警入事件流、worktree 登记表持久化、TUI 自动化交互测试 2026-10-28 v2/v3 议程拍板：25 条 ★→✅（J9/J10/J17/J18/J20 压缩两级锚定 L1≤10%/L2≤1% + 级联 C 案；G1/G2/G2f/G18-G21 图投影简版；V4/V6/V7 门禁增强；K8 沙箱务实组合+埋点；B4 保留不选型；N1 MCP client 先；W1/W2/W3/W4/W14/W19/W21 工作流骨架非强制）+ H9/I4 两条 ·→✅（I4 降级随压缩自然可得），✅ 143→**170**、★ 50→**25**、· 87→**85**；串台重标注（H14/H20→v2、K20/R8→v3、Q1-Q3 剩余随压缩）；K29 补 /btw UX（不回灌+生成新 session 预埋）；B3 补第三方 UI 外包验收
 
 ---
 
