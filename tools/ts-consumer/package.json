@@ -3,10 +3,12 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Minimal TypeScript consumer of the alasol NDJSON event stream (cross-language schema check)",
+  "description": "Minimal TypeScript consumer of the alasol NDJSON streams (event stream + transport messages; cross-language schema check)",
   "scripts": {
     "read": "tsx reader.ts",
     "read:broken": "tsx reader.ts broken-events.ndjson",
+    "read:transport": "tsx reader.ts sample-transport.ndjson",
+    "read:transport:broken": "tsx reader.ts broken-transport.ndjson",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

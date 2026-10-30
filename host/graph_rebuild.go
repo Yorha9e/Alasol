@@ -109,10 +109,10 @@ func (h *Hub) RebuildGraph(ctx context.Context) error {
 // 走 hub.* 事件族（durable，进事件流）——不新造 kind（F7 只增：能复用就不扩契约）。
 // 告警落不下**不**影响主流程（重建恢复本身已经尽力做过）：只记一条日志。
 func (h *Hub) recordGraphAlert(ctx context.Context, message string) {
-	if h == nil || h.store == nil {
+	if h == nil || h.bus == nil {
 		return
 	}
-	sink := newHubAlertSink(h.store, h.cfg.DBPath)
+	sink := newHubAlertSink(h.bus, h.cfg.DBPath)
 	err := sink.RecordAlert(ctx, Alert{
 		At:        time.Now(),
 		Metric:    graphRebuildMetric,

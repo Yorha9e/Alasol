@@ -15,6 +15,9 @@ import (
 const (
 	// KindSubscribe 客户端请求订阅事件流（payload = contracts.SubscribeRequest）。
 	KindSubscribe = "subscribe"
+	// KindSubscribed 服务端订阅生效回执（G8；payload = contracts.SubscribeAck，
+	// reply_to 指向原 subscribe）。让客户端不必靠"预期事件到不到"反推订阅是否生效。
+	KindSubscribed = "subscribed"
 	// KindEvent 服务端推送一条事件（payload = contracts.Event）。
 	KindEvent = "event"
 	// KindPing 客户端心跳请求。
@@ -23,6 +26,18 @@ const (
 	KindPong = "pong"
 	// KindError 协议层错误（payload = contracts.TransportError）。
 	KindError = "error"
+	// KindCommandSubmit 客户端提交一轮对话（G1；payload = contracts.CommandSubmit）。
+	// 需宿主经 InboundHandler 处理（异步跑 prompt，结果经事件流回流）。
+	KindCommandSubmit = "command.submit"
+	// KindCommandAccepted 服务端受理 command.submit 的回执（G1；payload =
+	// contracts.CommandAccepted，reply_to 指向原 submit）。
+	KindCommandAccepted = "command.accepted"
+	// KindApprovalRequest 服务端广播一条审批请求（G1；payload = contracts.ApprovalRequest）。
+	// ask 策略触发时推给所有连接（Broadcast，不经订阅过滤——任何窗口都能应答）。
+	KindApprovalRequest = "approval.request"
+	// KindApprovalRespond 客户端应答一条审批（G1；payload = contracts.ApprovalResponse）。
+	// 经 InboundHandler 注入挂起的审批；无人应答 = deny（fail-close）。
+	KindApprovalRespond = "approval.respond"
 )
 
 // TransportError.Code 的取值（开放字符串；v0 固化这几个）。
@@ -52,11 +67,15 @@ const maxLineBytes = 8 << 20
 
 // NewMessage 组装一条 TransportMessage（id 用 core.NewUlid()——框架 id 的唯一生成处）。
 //
+// id 是**客户端关联 id**（G9）：服务端只用它做 reply_to 回指，不校验格式、不做幂等。
+// 服务端自己发的消息用框架 ULID（客户端看得懂、可排序）；客户端发的消息可以是任意
+// 不透明字符串，服务端**原样回指**（见 transport.json 的 id 说明）。
+//
 // payload 为 nil 时消息不带 payload 字段（契约里 payload 可选）。
 func NewMessage(kind string, payload any) (contracts.TransportMessage, error) {
 	m := contracts.TransportMessage{
 		V:    ContractVersion,
-		ID:   core.NewUlid(),
+		ID:   string(core.NewUlid()),
 		Kind: kind,
 	}
 	if payload != nil {
@@ -70,7 +89,9 @@ func NewMessage(kind string, payload any) (contracts.TransportMessage, error) {
 }
 
 // NewErrorMessage 组装一条 kind=error 消息（reply_to 指向出错的那条消息，可为空）。
-func NewErrorMessage(replyTo *contracts.Ulid, code, message string) (contracts.TransportMessage, error) {
+//
+// reply_to 是**客户端关联 id**（与 TransportMessage.id 同一形状：string，不限格式）。
+func NewErrorMessage(replyTo *string, code, message string) (contracts.TransportMessage, error) {
 	m, err := NewMessage(KindError, contracts.TransportError{Code: code, Message: message})
 	if err != nil {
 		return contracts.TransportMessage{}, err

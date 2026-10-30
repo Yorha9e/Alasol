@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 )
 
@@ -137,7 +138,8 @@ func TestHubAlertRetryIsIdempotent(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	sink := newHubAlertSink(st, path)
+	// G4：告警经 bus 发布（bus 内部 store.Append 入库 + 通知 WS 订阅者）。
+	sink := newHubAlertSink(bus.New(st), path)
 
 	ctx := context.Background()
 	alert := Alert{

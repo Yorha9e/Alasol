@@ -94,6 +94,10 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		CWD:            strings.TrimSpace(*f.cwd),
 		RunID:          strings.TrimSpace(*f.runID),
 
+		// 协议面一轮对话的整轮上限（秒；0 = 框架默认 600）。只有 flag 面（无 env/文件面）：
+		// 这是**协议面**的时钟，不影响 CLI/TUI 的交互式对话。
+		PromptRunTimeoutSec: *f.promptTimeout,
+
 		OnlineTableRows:       pickInt(*f.onlineRows, fc.OnlineTable.Rows),
 		OnlineTableLineTokens: pickInt(*f.onlineLineTokens, fc.OnlineTable.LineTokens),
 		OnlineTableLevel:      firstNonEmptyStr(strings.TrimSpace(*f.onlineLevel), strings.TrimSpace(fc.OnlineTable.Level)),

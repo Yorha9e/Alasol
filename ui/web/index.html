@@ -391,8 +391,8 @@
     return ws;
   }
 
-  // 客户端侧生成一个 26 字符 Crockford base32 id（契约 TransportMessage.id 是框架 ULID；
-  // 浏览器里没有 core.NewUlid，这里用同字符集同长度的随机串，服务端不解析它）。
+  // 客户端侧生成一个 26 字符 Crockford base32 id（契约 TransportMessage.id 是**客户端关联 id**：
+  // 任意不透明字符串都行，服务端只回指、不校验；这里沿用 ULID 形状便于排序/调试）。
   var CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
   function newId() {
     var s = "";

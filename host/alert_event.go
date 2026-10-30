@@ -11,6 +11,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/bus"
 )
 
 // 本文件把 K9 告警接进**事件流**（v2-S5 清账②）：host.Monitor 的第三个出口。
@@ -34,7 +35,28 @@ import (
 //   - 不进在线表（/api/sessions，host/projection.go 的 rows 按 **hub.* 事件族整族**过滤
 //     ——不是"登记某个 id"：派生口径变了、老库里残留的伪 id 也照样挡得住）；
 //   - 不进成本统计的 per-session（没有 usage）；
-//   - 只在事件流里按 kind=hub.alert 可查（/ws 订阅者同样看得到）。
+//   - 只在事件流里按 kind=hub.alert 可查（/ws 订阅者同样看得到——见下"过 bus"）。
+//
+// # 告警的**两个消费面**口径不同（G4/A3：如实记账，消费者据此预判）
+//
+// 同一条超阈值事实有两个出口，**记的条数不一样**：
+//
+//   - **告警环**（内存 + GET /api/monitor）：**每次采样超阈值都记一条**（有界 50 条环），
+//     时间字段是 `Alert.at`（RFC3339 **带时区**）。它是**活状态**——"现在这会儿超没超"；
+//   - **事件流**（durable 事件 hub.alert + /ws 订阅）：**同一指标 60s 抑制窗口内最多一条**
+//     （限流，不是状态切换；持续 runaway = 每 60s 一条，见 monitor.go 的 alertEventSuppressSec）。
+//     时间在 `envelope.ts`（RFC3339Nano **UTC**）；payload 只含四要素（metric/value/threshold/message）。
+//
+// 所以"监控环有 50 条、事件流里 3 条"不是 bug，是两个面各有口径（一个要全、一个要可回放不刷屏）。
+// 消费者要做适配：环看 `Alert.at`，事件看 `envelope.ts`（A3）。
+//
+// # 过 bus，不直插 store（G4 修）
+//
+// RecordAlert 经 **bus.Publish**（与其它 durable 事件同一条路）：bus 内部先把事件
+// `store.Append` 入库、**入库成功后**再通知 WS 订阅者。此前的实现直调 `store.Append`
+// 落了库却**绕过了 bus** → /ws 订阅者永远收不到 hub.alert（与上面"/ws 订阅者同样看得到"
+// 的承诺相反，第三方 70s 探针实测坐实：库里 3 条、订阅者 0 条）。改走 bus 后，入库与
+// WS 广播**同源一致**（bus 的口径整批覆盖）。
 
 // hubEventFamily 是 hub 级基础设施事件的 **kind 族前缀**（`hub.alert` 等）。
 //
@@ -54,18 +76,24 @@ func isHubEventKind(kind string) bool {
 	return strings.HasPrefix(kind, hubEventFamily)
 }
 
-// hubAlertSink 实现 host.AlertSink：把一条告警追加成 durable 事件 hub.alert。
+// hubAlertSink 实现 host.AlertSink：把一条告警发布成 durable 事件 hub.alert。
+//
+// 经 **bus**（不是直插 store）：bus.Publish 内部先 store.Append 入库、成功后通知 WS
+// 订阅者——入库与广播同源一致（G4 修；旧实现直调 store.Append 落了库却绕过 bus，
+// /ws 订阅者永远收不到）。
 type hubAlertSink struct {
-	store core.Store
+	bus *bus.Bus
 	// sessionID / agentID 是 hub 级事件的伪归属（按库路径确定性派生，见文件头）。
 	sessionID contracts.Ulid
 	agentID   contracts.Ulid
 }
 
 // newHubAlertSink 建告警事件流出流（dbPath = 事件库路径，用于确定性派生伪 id）。
-func newHubAlertSink(store core.Store, dbPath string) *hubAlertSink {
+//
+// b 是 hub 的事件总线（必填）：告警经它发布，WS 订阅者才看得到（G4）。
+func newHubAlertSink(b *bus.Bus, dbPath string) *hubAlertSink {
 	sessionID, agentID := hubIdentityIDs(dbPath)
-	return &hubAlertSink{store: store, sessionID: sessionID, agentID: agentID}
+	return &hubAlertSink{bus: b, sessionID: sessionID, agentID: agentID}
 }
 
 // hubIdentityIDs 派生 hub 级事件的伪 (session_id, agent_id)。
@@ -120,8 +148,8 @@ func normalizeDBPath(p string) string {
 // payload 只含契约里的四要素（metric/value/threshold/message）——**不含**任何会话内容、
 // 路径或凭据（告警是资源结论，不需要业务上下文；H12/H19 脱敏纪律因此天然满足）。
 func (s *hubAlertSink) RecordAlert(ctx context.Context, a Alert) error {
-	if s == nil || s.store == nil {
-		return fmt.Errorf("host: 告警事件流出口未装配（store 为 nil）")
+	if s == nil || s.bus == nil {
+		return fmt.Errorf("host: 告警事件流出口未装配（bus 为 nil）")
 	}
 	payload, err := json.Marshal(contracts.HubAlertPayload{
 		Metric:    a.Metric,
@@ -149,8 +177,9 @@ func (s *hubAlertSink) RecordAlert(ctx context.Context, a Alert) error {
 		Durable:   true, // 事实事件：入库、占 seq、可回放（F8）
 		Payload:   payload,
 	}
-	if _, err := s.store.Append(ctx, []contracts.Event{ev}); err != nil {
-		return fmt.Errorf("host: 追加 hub.alert 事件: %w", err)
+	// 经 bus 发布（G4）：bus 内部 store.Append 入库 + 成功后通知 WS 订阅者。
+	if err := s.bus.Publish(ctx, ev); err != nil {
+		return fmt.Errorf("host: 发布 hub.alert 事件: %w", err)
 	}
 	return nil
 }

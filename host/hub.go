@@ -53,8 +53,14 @@ type Hub struct {
 	engine   *policy.Engine
 	provider core.Provider
 	approver core.Approver
-	proj     *projection
-	ws       *transport.Server
+	// protocolApprover 是 G1 的协议审批器（ask 流接协议面：approval.request 广播 +
+	// approval.respond 注入；无人应答 = deny，fail-close）。New 恒建（廉价：一张挂起表 +
+	// 广播口），但**只有** Approval=="protocol" 时它才成为 h.approver（否则 hub 用
+	// cfg 指定的 terminal/deny-all/always-allow，不改动既有默认）。HTTP/WS 的审批应答
+	// （/api/approvals/{id}/respond、WS approval.respond）恒经它注入。
+	protocolApprover *protocolApprover
+	proj             *projection
+	ws               *transport.Server
 
 	// 发现表（K10）：core 内存活状态 + 拉式扫描喂它的事件流（host/discovery.go）。
 	disc     *discovery.Table
@@ -96,6 +102,21 @@ type Hub struct {
 	// monCtx 是后台监控器的生命周期（Close 时取消）。
 	monCtx    context.Context
 	monCancel context.CancelFunc
+
+	// lifeCtx 是 **hub 的生命周期**（Close 时取消）：一切"跑在后台、可能活到关库之后"
+	// 的活都从它派生 ctx——协议面的异步 prompt（runPromptAsync）就是其中之一。
+	//
+	// 为什么要有它（v3-S4 质量债）：协议 prompt 的 ctx 原本是 context.Background()
+	// → hub 关掉后它还在跑（最长一轮 600s），往**已关闭**的事件库写事件
+	// （"database is closed" 噪声 + 徒劳的 IO）。派生自 lifeCtx → Close 一取消，
+	// 那一轮立刻收场（fail-close：取消即 deny），关库前也能等到它真正退出。
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
+	// promptWG 统计在跑的协议面异步 prompt（Close 时等它们收场，见 Close 的说明）。
+	// Add 与 Wait 都受 h.mu 保护（见 startPromptAsync）：Close 之后不再接受新 prompt，
+	// 否则 Add 与 Wait 撞车（WaitGroup 误用）。
+	promptWG sync.WaitGroup
 
 	mu sync.Mutex
 	// loops：session → Loop（一个 session 一个 loop）。
@@ -143,6 +164,10 @@ func New(cfg Config) (*Hub, error) {
 		return nil, fmt.Errorf("host: 打开事件库: %w", err)
 	}
 
+	// hub 生命周期 ctx（Close 时取消）：协议面的异步 prompt 从它派生 → 关库前
+	// 那一轮能收场（不往已关的库写事件）。装配失败路径也要取消（无后台活，但别留尾巴）。
+	lifeCtx, lifeCancel := context.WithCancel(context.Background())
+
 	// 装配失败时的**统一收口**（v3-S1）：
 	//
 	// 装配期已经拉起的东西——沙箱 env（WER 排除项是持久的用户级注册表写入，
@@ -165,6 +190,7 @@ func New(cfg Config) (*Hub, error) {
 		if assembled {
 			return // 成功装配：资源归 Hub 所有（Close 时收）
 		}
+		lifeCancel() // 生命周期 ctx 收口（还没起后台活，但别留尾巴）
 		if mcpMgr != nil {
 			_ = mcpMgr.Close() // 收尸 MCP server 进程树（谁拉起谁收尸）
 		}
@@ -311,6 +337,8 @@ func New(cfg Config) (*Hub, error) {
 			ap = core.AlwaysAllow{}
 		case "terminal":
 			ap = terminal.New(os.Stdin, os.Stdout)
+		case "protocol":
+			ap = nil // 协议审批器在下面装配（需要 broadcaster = transport server，见 h 建成后）
 		default: // deny-all（默认，fail-close）
 			ap = core.DenyAll{}
 		}
@@ -337,8 +365,10 @@ func New(cfg Config) (*Hub, error) {
 	}
 	// K9 告警事件流（v2-S5 清账②）：hub 级事件的伪归属按**规范化后**的库路径确定性派生
 	// （跨重启稳定；不是 agent session，不进在线表——在线表按 hub.* 事件族**整族**过滤，
-	// 见 host/projection.go 的 rows：派生口径变了也照样挡得住）。
-	alertSink := newHubAlertSink(st, cfg.DBPath)
+	// 见 host/projection.go 的 rows：派生口径变了也照样挡得住）。经 **bus** 发布（G4 修）：
+	// 入库与 WS 广播同源一致，/ws 订阅者才看得到 hub.alert（旧实现直调 store.Append 落了库
+	// 却绕过 bus → 订阅者永远收不到）。
+	alertSink := newHubAlertSink(b, cfg.DBPath)
 	proj := newProjection(st)
 
 	// 工作流能力包注册表（v3-S3，W1）：内建 tower + Config.WorkflowDir 目录加载。
@@ -375,7 +405,19 @@ func New(cfg Config) (*Hub, error) {
 		sandbox:           sbEnv,
 		mcpManager:        mcpMgr,
 		workflows:         workflows,
+		lifeCtx:           lifeCtx,
+		lifeCancel:        lifeCancel,
 	}
+
+	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持
+	// cfg 指定的 terminal/deny-all/always-allow，不改既有默认）。HTTP/WS 的审批应答
+	// 恒经它注入挂起的审批。同时把 hub 接成 transport 的入站处理器——WS 面上的
+	// command.submit（对话发起）/ approval.respond（审批应答）由此进宿主（协议面遥控）。
+	h.protocolApprover = newProtocolApprover(h.ws)
+	if cfg.Approver == nil && strings.TrimSpace(cfg.Approval) == "protocol" {
+		h.approver = h.protocolApprover
+	}
+	h.ws.SetInboundHandler(h)
 
 	// N2 砖化恢复（v3-S3 修）：崩溃遗留的图投影重建窗口（graph_meta.rebuilding=1）会让
 	// 读侧引擎**永久** fail-close（影响面/冲突预测一直不可用），而 Rebuild 当时没有生产
@@ -420,7 +462,7 @@ func New(cfg Config) (*Hub, error) {
 		MemMB:       cfg.MonitorMemMB,
 		Goroutines:  cfg.MonitorGoroutines,
 		IntervalSec: cfg.MonitorIntervalSec,
-	}, nil, WithAlertSink(alertSink)) // nil src = 真实采样
+	}, cfg.MonitorSampleSource, WithAlertSink(alertSink)) // nil src = 真实采样
 	h.monCtx, h.monCancel = context.WithCancel(context.Background())
 	h.monitor.Start(h.monCtx)
 
@@ -452,7 +494,12 @@ func New(cfg Config) (*Hub, error) {
 	return h, nil
 }
 
-// Close 释放资源（幂等）：停后台索引器 → 关事件库。
+// Close 释放资源（幂等）：取消 hub 生命周期 → 等在跑的协议面 prompt 收场 →
+// 停后台索引器/监控器 → 收沙箱与 MCP → 关事件库。
+//
+// 顺序有讲究：**先**取消生命周期（那一轮 prompt 立刻收场，不再往事件库写东西），
+// **再**等它们退出（有界，promptCloseGrace），**最后**才关事件库——于是不会出现
+// "库已关、goroutine 才醒过来往里写"（database is closed）。
 func (h *Hub) Close() error {
 	if h == nil {
 		return nil
@@ -466,6 +513,14 @@ func (h *Hub) Close() error {
 	h.mu.Unlock()
 
 	var errs []error
+	// ① 先取消 hub 生命周期：在跑的协议面 prompt 立刻收场（fail-close：取消即 deny），
+	//    不再往事件库写东西——否则它们会在**库关掉之后**才醒过来（"database is closed"）。
+	if h.lifeCancel != nil {
+		h.lifeCancel()
+	}
+	// ② 等它们真正退出（**有界**：不让 Close 被一个不认 ctx 的工具/模型拖死）。
+	//    等过了再关库 → 那几轮不会碰到已关闭的库。
+	h.waitPrompts(promptCloseGrace)
 	if h.ixCancel != nil {
 		h.ixCancel()
 	}
@@ -495,6 +550,31 @@ func (h *Hub) Close() error {
 		errs = append(errs, fmt.Errorf("host: 关事件库: %w", err))
 	}
 	return errors.Join(errs...)
+}
+
+// promptCloseGrace 是关库前等待在跑的协议面 prompt 收场的宽限（秒）。
+//
+// 有界而不是无限等：prompt 链上可能有**不认 ctx** 的环节（一个卡住的外部命令、一个
+// 不理 ctx 的 provider）——那属于"它自己坏了"，不该把 Close 拖成永久挂起。
+// 超时只记一条告警：那一轮随后会在已关的库上写失败（可见的噪声），但 hub 一定能关掉。
+const promptCloseGrace = 5 * time.Second
+
+// waitPrompts 等在跑的协议面 prompt 收场，最多等 grace。
+//
+// 为什么要等：Close 的下一步就是**关事件库**——不等的话，那些 goroutine 醒来后
+// 往已关的库写事件（"database is closed"）。等过了就没有这类噪声。
+func (h *Hub) waitPrompts(grace time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		h.promptWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(grace):
+		hubLog.Warn("host: 关库前等待在跑的协议面 prompt 超时（可能仍有 goroutine 在收尾）",
+			"grace", grace.String())
+	}
 }
 
 // RunPrompt 起（或复用）一个 session 的 agent loop 并跑一轮。

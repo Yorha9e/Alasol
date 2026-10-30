@@ -6,6 +6,17 @@
   "$defs": {
     "TransportMessage": {
       "type": "object",
+      "description": "传输消息 envelope（ws+ndjson / stdio / inproc 同一契约）。kind→payload 映射见 x-kind-payload（消费端据此校验载荷）。",
+      "x-kind-payload": {
+        "subscribe": "SubscribeRequest",
+        "subscribed": "SubscribeAck",
+        "command.submit": "CommandSubmit",
+        "command.accepted": "CommandAccepted",
+        "approval.request": "approval.json#/$defs/ApprovalRequest",
+        "approval.respond": "approval.json#/$defs/ApprovalResponse",
+        "error": "TransportError",
+        "event": "event.json#/$defs/Event"
+      },
       "required": ["v", "id", "kind"],
       "properties": {
         "v": {
@@ -13,16 +24,16 @@
           "description": "契约版本（F7）。"
         },
         "id": {
-          "$ref": "common.json#/$defs/Ulid",
-          "description": "消息 id（框架 ULID）。"
+          "type": "string",
+          "description": "消息 id = **客户端关联 id**（G9）：服务端只回指、不校验。它只做 reply_to 回指（pong/error/accepted 的 reply_to 指向它），不做去重/幂等——入站消息的幂等另有着落（approval.respond 按 payload.request_id 幂等，command.submit 不幂等）。**格式不限**：客户端可造框架 ULID，也可造任意不透明字符串（服务端不校验其格式，只原样回指）。"
         },
         "kind": {
           "type": "string",
-          "description": "消息种类（开放字符串，如 subscribe / event / command.submit / approval.request / approval.respond / error / ping）。"
+          "description": "消息种类（开放字符串）。v0 固化：subscribe / subscribed / event / ping / pong / error（基础面）+ command.submit / command.accepted / approval.request / approval.respond（G1 遥控面：对话发起 + 审批应答）。approval.request 载荷 = ApprovalRequest、approval.respond 载荷 = ApprovalResponse（见 approval.json）。"
         },
         "reply_to": {
-          "$ref": "common.json#/$defs/Ulid",
-          "description": "应答关联：指向被应答消息的 id。"
+          "type": "string",
+          "description": "应答关联：指向被应答消息的 id（与 id 同一形状：**客户端关联 id，服务端只回指不校验**）。"
         },
         "session_id": {
           "$ref": "common.json#/$defs/Ulid",
@@ -51,6 +62,60 @@
         "durable_only": {
           "type": "boolean",
           "description": "true = 只收事实事件（不含流事件）。"
+        }
+      }
+    },
+    "SubscribeAck": {
+      "type": "object",
+      "description": "kind=subscribed 的载荷：订阅生效回执（G8）。回显**生效的**过滤条件（与 SubscribeRequest 同口径），让客户端不必靠\"预期事件到不到\"反推订阅是否生效；replaced 说明本次是否替换了同一连接上的前一个订阅（重复 subscribe = 替换）。",
+      "required": ["replaced"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "生效的 session 过滤；缺省 = 全部会话。"
+        },
+        "kind_prefixes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "生效的 kind 前缀过滤；缺省 = 全部 kind。"
+        },
+        "durable_only": {
+          "type": "boolean",
+          "description": "生效的 durable_only；缺省 = false（流事件也收）。"
+        },
+        "replaced": {
+          "type": "boolean",
+          "description": "是否替换了此前的订阅（同一连接第一条订阅 = false，重复 subscribe = true）。"
+        }
+      }
+    },
+    "CommandSubmit": {
+      "type": "object",
+      "description": "kind=command.submit 的载荷：客户端提交一轮对话（G1 遥控面；HTTP 面对应 POST /api/sessions/{id}/prompt）。服务端异步起（或复用）该 session 的 agent loop 跑一轮，结果经事件流（user.prompt/model.turn/tool.call.* 等）回流，不在本消息里返回。",
+      "required": ["prompt"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "目标 session；缺省 = 服务端新建一个（command.accepted 回执里带回新 id）。"
+        },
+        "prompt": {
+          "type": "string",
+          "description": "用户 prompt 原文（空 = 拒绝，400/error）。"
+        }
+      }
+    },
+    "CommandAccepted": {
+      "type": "object",
+      "description": "kind=command.accepted 的载荷：command.submit 的受理回执（reply_to 指向原 command.submit）。带回生效的 session id（客户端未提供时是服务端新建的那个）与运行状态；**受理不等于跑完**——结果经事件流异步回流。",
+      "required": ["session_id", "status"],
+      "properties": {
+        "session_id": {
+          "$ref": "common.json#/$defs/Ulid",
+          "description": "受理的 session（客户端未给时由服务端新建）。"
+        },
+        "status": {
+          "type": "string",
+          "description": "运行状态（当前恒为 running）。"
         }
       }
     },

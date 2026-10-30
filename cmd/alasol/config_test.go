@@ -441,3 +441,30 @@ func TestBuildConfigGoalLedgerPrecedence(t *testing.T) {
 		t.Error("④ 无配置时 goal ledger 应默认关闭")
 	}
 }
+
+// TestBuildConfigPromptTimeoutFlag 钉死 -prompt-timeout：协议面一轮对话的**整轮**上限
+// （秒）。缺省 = 0（= 框架默认 600 秒，见 host.Config.PromptRunTimeoutSec）。
+func TestBuildConfigPromptTimeoutFlag(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(cfgFile, []byte("model = \"m\"\n"), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+
+	// ① 不给 flag → 0（未设 → 框架默认）。
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("① 意外错误: %v", err)
+	}
+	if hc.PromptRunTimeoutSec != 0 {
+		t.Fatalf("① 缺省 PromptRunTimeoutSec = %d，want 0（未设）", hc.PromptRunTimeoutSec)
+	}
+
+	// ② 显式给 flag → 生效。
+	hc2, err := buildConfigFrom(t, "-config", cfgFile, "-prompt-timeout", "42")
+	if err != nil {
+		t.Fatalf("② 意外错误: %v", err)
+	}
+	if hc2.PromptRunTimeoutSec != 42 {
+		t.Fatalf("② -prompt-timeout 42 → PromptRunTimeoutSec = %d，want 42", hc2.PromptRunTimeoutSec)
+	}
+}

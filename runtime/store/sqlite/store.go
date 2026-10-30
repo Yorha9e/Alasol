@@ -258,6 +258,19 @@ func (s *Store) Append(ctx context.Context, events []contracts.Event) ([]contrac
 	return stored, nil
 }
 
+// Tip 返回事件流的当前最大 seq（**事实流 tip**；空库 → 0）。
+//
+// 与索引器水位（indexer.Watermark = 派生表进度）是两回事：这是**事实流**已写到的 seq。
+// 进程外消费者回放时据此判断"追平了没"——追到 Tip 即追上唯一事实源（G3 回放面的水位）。
+// 索引器水位可能因后台轮询短暂落后，但事实流一旦 Append 提交就在（Tip 即时反映）。
+func (s *Store) Tip(ctx context.Context) (int64, error) {
+	var tip int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(seq), 0) FROM events").Scan(&tip); err != nil {
+		return 0, fmt.Errorf("sqlite: tip: %w", err)
+	}
+	return tip, nil
+}
+
 // ReadFrom 从 seq 水位（含）读事实事件，按 seq 升序。
 // sessionID 为 nil 读全部；limit<=0 不限。
 func (s *Store) ReadFrom(ctx context.Context, sessionID *contracts.Ulid, fromSeq int64, limit int) ([]contracts.Event, error) {

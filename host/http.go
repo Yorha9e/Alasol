@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
@@ -62,70 +63,175 @@ var httpLog = slog.Default()
 //	POST /api/agentlink/broadcast         → MessageResult（落一条 durable 事件）
 //	POST /api/agentlink/handoff           → MessageResult（同上 + 结构化 payload）
 //
-// 其它方法/路径 → 405 / 404，一律 JSON 错误体（前端统一按 JSON 解）。
+// 事件回放（v3-S4，G3：断线补读——WS 断线即丢，协议面补一个按 seq 的补读面，
+// 与 Store.ReadFrom 同语义、返回事件数组 + 水位）：
+//
+//	GET /api/events?from=&to=&limit=&session_id= → {"events":[…],"watermark":N,"from":X,"to":Y,"truncated":bool}
+//	  → **全局事实流**按 seq 回放（只含 durable 事件；流事件不入库、不回放）。
+//	    可见性口径 = 全局流（与全局 WS 订阅同口径，**不做 K11 过滤**——这是原始事件日志的补读面，
+//	    不是 agentlink 的可见性读；要 K11 过滤用 /api/inquiry）。from 缺省 = 1，to 缺省 = 不设上界，
+//	    limit 缺省 = defaultEventsLimit、上限 maxEventsLimit。
+//	    watermark = **事实流 tip**（store 的 MAX(seq)；与 /api/health 的**索引器水位**不是一回事：
+//	    那个是派生表进度、后台轮询会短暂落后，这个是事实流本身的即时 tip）。
+//
+// 对话 / 审批（v3-S4，G1：兑现 transport 契约承诺的 command.submit / approval.*）：
+//
+//	POST /api/sessions/{session_id}/prompt   → {"session_id":…,"status":"running"}（202；异步跑，结果经事件流）
+//	POST /api/approvals/{request_id}/respond → {"request_id":…,"decision":…}（注入挂起的审批；无人应答 = deny，fail-close）
+//
+// 其它方法/路径 → **405 / 404，一律 JSON 错误体**（前端统一按 JSON 解）：
+// /api/* 未命中具体路由时，路径认得但方法不符 → 405（带 Allow），路径不认得 → 404
+// ——不再掉进静态通配报"没有这个静态资源"（G7）。
 //
 // 发现表的其余查询面（Agents / Agent / Gates …）**故意不暴露**：K11 的水平可见性只到
 // "对端 session 的主 agent"，跨 session 的 agent 清单是宿主内部视图（见 Hub.Discovery）。
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// 静态资源（嵌入二进制，无外部文件依赖）。
-	mux.HandleFunc("GET /", h.serveIndex)
+	// 静态资源（嵌入二进制，无外部文件依赖）：根与 index 只认**精确路径**
+	// （`{$}` 锚定到根，不当通配——否则 GET /api/xxx 会被它接住，见 G7）。
+	mux.HandleFunc("GET /{$}", h.serveIndex)
 	mux.HandleFunc("GET /index.html", h.serveIndex)
 
 	// 事件流（WS + NDJSON）。
 	mux.HandleFunc("GET /ws", h.ws.ServeWS)
 
-	// API。
-	mux.HandleFunc("GET /api/health", h.serveHealth)
-	mux.HandleFunc("GET /api/monitor", h.serveMonitor)
-	mux.HandleFunc("GET /api/sessions", h.serveSessions)
-	mux.HandleFunc("GET /api/cost", h.serveCostTotal)
-	mux.HandleFunc("GET /api/cost/{session_id}", h.serveCost)
-	mux.HandleFunc("GET /api/context/{session_id}", h.serveContext)
-	mux.HandleFunc("GET /api/peers", h.servePeers)
-	mux.HandleFunc("POST /api/gates/join", h.serveGateJoin)
+	// API：经 reg 登记——同时注册到 mux 并记录"路径 → 允许的方法"（tbl），
+	// 供下面的 /api/ 回退面判 405（路径认得、方法不对）vs 404（路径都不认得）。
+	//
+	// probe 是**只认路径**的探针 mux：同一批路径模板以"不带方法"注册（= 任何方法都匹配），
+	// 用来判"这个路径认不认得"。为什么不能直接拿字面路径查 tbl：tbl 的键是**模板**
+	// （/api/cost/{session_id}、/api/sessions/{id}/prompt …），而请求里的路径是**实例**
+	// （/api/cost/01JN…）——两者永不相等 → 带路径参数的端点方法不符时会误报 404
+	// 而不是 405（客户端于是以为"端点不存在"，而不是"方法用错了"）。
+	tbl := apiTable{}
+	probe := http.NewServeMux()
+	reg := func(method, pattern string, fn http.HandlerFunc) {
+		mux.HandleFunc(method+" "+pattern, fn)
+		if tbl[pattern] == nil {
+			// 探针只注册**一次**每个路径模板（同一路径的 GET/POST 共用一个表项——
+			// 重复注册同一 pattern 会让 ServeMux 直接 panic）。
+			probe.HandleFunc(pattern, fn)
+		}
+		tbl.add(pattern, method)
+	}
+
+	reg("GET", "/api/health", h.serveHealth)
+	reg("GET", "/api/monitor", h.serveMonitor)
+	reg("GET", "/api/sessions", h.serveSessions)
+	reg("GET", "/api/cost", h.serveCostTotal)
+	reg("GET", "/api/cost/{session_id}", h.serveCost)
+	reg("GET", "/api/context/{session_id}", h.serveContext)
+	reg("GET", "/api/peers", h.servePeers)
+	reg("POST", "/api/gates/join", h.serveGateJoin)
 
 	// 图投影（v2-S2，G2f 可选投影）：change_impact 影响面报告（G21/W16）。
 	// 未启用时 503（明说"没开"，不返回空影响面——"没有影响面"对 escalate 是危险答案）。
-	mux.HandleFunc("GET /api/graph/impact", h.serveGraphImpact)
+	reg("GET", "/api/graph/impact", h.serveGraphImpact)
 	// 图投影重建（v3-S3，N2 运维入口）：崩溃遗留的重建窗口（rebuilding=1）会让影响面/
 	// 冲突预测一直不可用；启动期会自动恢复一次，这个端点供人工重试。
-	mux.HandleFunc("POST /api/graph/rebuild", h.serveGraphRebuild)
+	reg("POST", "/api/graph/rebuild", h.serveGraphRebuild)
 
 	// 合并门禁（v3-S3 清 V6/V7 挂账）：review 记录 + 合并前查放行 + 合并后冲突预测。
-	mux.HandleFunc("POST /api/merge/review", h.serveMergeReview)
-	mux.HandleFunc("POST /api/merge/check", h.serveMergeCheck)
-	mux.HandleFunc("POST /api/merge/predict", h.serveMergePredict)
+	reg("POST", "/api/merge/review", h.serveMergeReview)
+	reg("POST", "/api/merge/check", h.serveMergeCheck)
+	reg("POST", "/api/merge/predict", h.serveMergePredict)
 
 	// 多 worktree 隔离（v1-S5 D）：创建 / 列表 / 删除。
-	mux.HandleFunc("GET /api/worktrees", h.serveWorktreesList)
-	mux.HandleFunc("POST /api/worktrees", h.serveWorktreeCreate)
-	mux.HandleFunc("DELETE /api/worktrees/{name}", h.serveWorktreeRemove)
+	reg("GET", "/api/worktrees", h.serveWorktreesList)
+	reg("POST", "/api/worktrees", h.serveWorktreeCreate)
+	reg("DELETE", "/api/worktrees/{name}", h.serveWorktreeRemove)
 
 	// 在线表注入配置（K14/K15：运行期动态管理，不重启）。
-	mux.HandleFunc("GET /api/online-table/config", h.serveOnlineTableConfig)
-	mux.HandleFunc("POST /api/online-table/config", h.serveOnlineTableConfig)
+	reg("GET", "/api/online-table/config", h.serveOnlineTableConfig)
+	reg("POST", "/api/online-table/config", h.serveOnlineTableConfig)
 
 	// agentlink（K18）。
-	mux.HandleFunc("GET /api/presence", h.serveAgentlinkPresence)
-	mux.HandleFunc("GET /api/discover", h.serveAgentlinkDiscover)
-	mux.HandleFunc("GET /api/inquiry", h.serveAgentlinkInquiry)
-	mux.HandleFunc("GET /api/inbox", h.serveAgentlinkInbox)
-	mux.HandleFunc("POST /api/agentlink/broadcast", h.serveAgentlinkSend(agentlink.KindBroadcast))
-	mux.HandleFunc("POST /api/agentlink/handoff", h.serveAgentlinkSend(agentlink.KindHandoff))
+	reg("GET", "/api/presence", h.serveAgentlinkPresence)
+	reg("GET", "/api/discover", h.serveAgentlinkDiscover)
+	reg("GET", "/api/inquiry", h.serveAgentlinkInquiry)
+	reg("GET", "/api/inbox", h.serveAgentlinkInbox)
+	reg("POST", "/api/agentlink/broadcast", h.serveAgentlinkSend(agentlink.KindBroadcast))
+	reg("POST", "/api/agentlink/handoff", h.serveAgentlinkSend(agentlink.KindHandoff))
+
+	// 事件回放（v3-S4，G3）：按 seq 补读全局事实流（断线补读面）。
+	reg("GET", "/api/events", h.serveEvents)
+
+	// 对话 / 审批（v3-S4，G1）：协议面发起一轮对话 + 应答挂起的审批。
+	reg("POST", "/api/sessions/{session_id}/prompt", h.servePrompt)
+	reg("POST", "/api/approvals/{request_id}/respond", h.serveApprovalRespond)
+
+	// /api/* 回退面（G7）：未命中具体路由时，按 probe+tbl 判 405 / 404，一律 JSON 错误体。
+	mux.HandleFunc("/api/", h.serveAPIFallback(tbl, probe))
+	mux.HandleFunc("/api", h.serveAPIFallback(tbl, probe))
+
+	// 其余路径（非 /api 的未知静态路径）→ JSON 404（保持"前端统一按 JSON 解"）。
+	mux.HandleFunc("/", h.serveStaticNotFound)
 
 	return mux
 }
 
-// serveIndex 服务嵌入的 Web UI。
-func (h *Hub) serveIndex(w http.ResponseWriter, r *http.Request) {
-	// 只认 / 与 /index.html：其它静态路径 v0 没有，明确 404 而不是静默回 index.html
-	// （那会让前端 404 变 200，调试时很难发现）。
-	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
-		writeJSONError(w, http.StatusNotFound, "not_found", "没有这个静态资源: "+r.URL.Path)
-		return
+// apiTable 记录每个 API 路径模板允许的 HTTP 方法（G7 回退面判 405 vs 404 用）。
+//
+// 与 mux 注册**同一处**产出（Handler 里的 reg 助手同时写两处），不另抄一份路由表
+// （D21：一处定义，避免"注册了但忘了记方法"的漂移）。
+type apiTable map[string]map[string]bool
+
+// add 记录某路径模板允许的一个方法。
+func (t apiTable) add(pattern, method string) {
+	if t[pattern] == nil {
+		t[pattern] = map[string]bool{}
 	}
+	t[pattern][method] = true
+}
+
+// serveAPIFallback 服务 /api/* 未命中具体路由的请求（G7）。
+//
+//	路径认得、方法不符 → 405（带 Allow 头，明说支持哪些方法）；
+//	路径不认得         → 404（"没有这个 API 端点"——**不**再说"没有这个静态资源"，
+//	                     那对 /api 路径是误导：第三方会去翻静态资源而不是改方法/路径）。
+//
+// 路径认不认得由 probe（只认路径的探针 mux）判：它按**模板**匹配（带路径参数的端点
+// 也能认出），返回的模板再查 tbl 拿允许的方法。tbl 的键是模板，直接拿字面路径查会
+// 永远落空（带参数的端点方法不符 → 误报 404）。
+func (h *Hub) serveAPIFallback(tbl apiTable, probe *http.ServeMux) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		_, pattern := probe.Handler(r)
+		methods, known := tbl[pattern]
+		if known && methods[r.Method] {
+			// 路径认得、方法也对，却没命中具体 handler（不该发生）→ 404 兜底。
+			writeJSONError(w, http.StatusNotFound, "not_found", "没有这个 API 端点: "+r.URL.Path)
+			return
+		}
+		if known {
+			allow := allowedMethods(methods)
+			w.Header().Set("Allow", allow)
+			writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed",
+				fmt.Sprintf("端点 %s 不支持方法 %s（支持: %s）", r.URL.Path, r.Method, allow))
+			return
+		}
+		writeJSONError(w, http.StatusNotFound, "not_found", "没有这个 API 端点: "+r.URL.Path)
+	}
+}
+
+// allowedMethods 把方法集合折成排序后的逗号串（Allow 头要确定性）。
+func allowedMethods(m map[string]bool) string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+// serveStaticNotFound 服务非 /api 的未知静态路径（JSON 404，与旧口径一致）。
+func (h *Hub) serveStaticNotFound(w http.ResponseWriter, r *http.Request) {
+	writeJSONError(w, http.StatusNotFound, "not_found", "没有这个静态资源: "+r.URL.Path)
+}
+
+// serveIndex 服务嵌入的 Web UI（只经 GET / 与 GET /index.html 到达；其它路径由
+// serveStaticNotFound / serveAPIFallback 处理，不落到这里）。
+func (h *Hub) serveIndex(w http.ResponseWriter, r *http.Request) {
 	body, err := web.IndexHTML()
 	if err != nil {
 		httpLog.Error("host: 读嵌入的 index.html 失败", "err", err)
@@ -159,6 +265,10 @@ func (h *Hub) serveMonitor(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveSessions 服务 GET /api/sessions（在线表）。
+//
+// 计数口径（A1）：在线表是 **agent session 面板**——hub 伪 session（hub.* 事件族）与
+// /btw 旁支 fork session **都不进表**。所以"事件流里有 N 条、表里 M 行"对不上是正常的
+// （表只列 agent session；伪 session 无 agent、旁支不是一等会话）。
 func (h *Hub) serveSessions(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.Sessions(r.Context())
 	if err != nil {

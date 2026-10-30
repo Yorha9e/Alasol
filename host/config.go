@@ -54,7 +54,12 @@ type Config struct {
 	// Ask 需要人审的工具名（生成 source=cli 的 ask 规则）。命中 ask 时会去问
 	// Approver（-approval=terminal 即在终端提示）；审批缺席 = deny（fail-close，D14/H8）。
 	Ask []string
-	// Approval 审批策略：deny-all | always-allow | terminal。
+	// Approval 审批策略：deny-all | always-allow | terminal | protocol。
+	//
+	// protocol（v3-S4，G1）= **协议审批器**：ask 策略命中时把 ApprovalRequest 经 WS 广播
+	// （kind=approval.request）推给所有连接，挂起等 approval.respond 注入（HTTP
+	// /api/approvals/{id}/respond 或 WS approval.respond）；**无人应答/超时 = deny**
+	// （fail-close，D14/H8）。供 serve daemon 场景（无本进程 stdin，审批在远端 GUI）。
 	Approval string
 	// BaseURL provider 端点（空 = 官方）。原样传给 provider，不进事件/日志。
 	BaseURL string
@@ -93,6 +98,9 @@ type Config struct {
 	MonitorGoroutines int
 	// MonitorIntervalSec 采样周期（秒；0 = 框架默认）。
 	MonitorIntervalSec int
+	// MonitorSampleSource 覆盖监控采样源（测试注入：用假源精确控制"何时超阈值"，
+	// 不真烧 CPU；nil = defaultSampleSource 真实采样）。与 Config.Provider 同性质的注入点。
+	MonitorSampleSource SampleSource
 	// WorktreeRoot 多 worktree 隔离（v1-S5 D）的受管根目录（所有 worktree 建在其下）。
 	// 空 = 派生自事件库目录（<DBPath 所在目录>/worktrees）。
 	WorktreeRoot string
@@ -197,6 +205,19 @@ type Config struct {
 	// 零行为变化，酸测试）。true 时 agent 可在关键点更新 goal ledger（关键字段立即落盘、
 	// 过程字段 turn 末合并）。仍受策略链（deny-all 默认）与 agent 类型白名单约束。
 	GoalLedger bool
+	// PromptRunTimeoutSec 是协议面发起的**异步 prompt**（POST /api/sessions/{id}/prompt /
+	// WS command.submit）的生命周期上限（秒；0 = 默认 600）。
+	//
+	// 口径（别读成别的）：这是**一轮**（一个 prompt 的全部 turn）的**整轮**上限，
+	// **不是**单次模型调用的超时，也**不是**单次审批等待的超时——一轮里可以有多次审批
+	// 等待，它们共用这份预算（预算耗尽 → 后续审批立即按 deny 收场）。
+	//
+	// 它同时是 fail-close 的兜底时钟：协议 prompt 跑在后台 goroutine，一个卡在审批
+	// （无人应答）的 loop 若无上界会永久挂起；有了它，审批等到超时就按 deny 收场
+	// （契约：无人应答 = deny，D14/H8）。
+	//
+	// 可配：cmd 侧 `-prompt-timeout <秒>`（0 = 用默认 600）。
+	PromptRunTimeoutSec int
 }
 
 // validate 校验并归一化配置。
@@ -216,9 +237,9 @@ func (c *Config) validate() error {
 	}
 	c.Addr = addr
 	switch c.Approval {
-	case "", "deny-all", "always-allow", "terminal":
+	case "", "deny-all", "always-allow", "terminal", "protocol":
 	default:
-		return fmt.Errorf("host: Config.Approval 只支持 deny-all | always-allow | terminal（得到 %q）", c.Approval)
+		return fmt.Errorf("host: Config.Approval 只支持 deny-all | always-allow | terminal | protocol（得到 %q）", c.Approval)
 	}
 	if c.MaxTurns < 0 {
 		return fmt.Errorf("host: Config.MaxTurns 不能为负（得到 %d）", c.MaxTurns)
@@ -358,6 +379,10 @@ func (c *Config) validate() error {
 	// 在 host.New 就炸，而不是拖到装配期或更糟地静默跳过。
 	if err := c.MCP.Validate(); err != nil {
 		return fmt.Errorf("host: Config.MCP: %w", err)
+	}
+	// 协议 prompt 超时（v3-S4，G1）：负值拒绝；0 = 用框架默认。
+	if c.PromptRunTimeoutSec < 0 {
+		return fmt.Errorf("host: Config.PromptRunTimeoutSec 不能为负（得到 %d；0 = 默认）", c.PromptRunTimeoutSec)
 	}
 	return nil
 }

@@ -22,12 +22,38 @@ var log = slog.Default()
 // Server 把一条 core/bus 事件流通过 WS+NDJSON 暴露给客户端（N4）。
 //
 // 并发：每个连接一个 ServeWS goroutine（自己的读循环 + 一个推送 goroutine），
-// 互不共享可变状态；唯一共享的是 *bus.Bus（其本身并发安全）。
+// 互不共享可变状态；唯一共享的是 *bus.Bus（其本身并发安全）。连接注册表
+// （conns）由 connsMu 保护，仅服务于 Broadcast（广播不经订阅过滤的控制消息）。
 type Server struct {
 	bus *bus.Bus
 
 	// maxRead 单条入站消息的字节上限（<=0 用 maxLineBytes）。
 	maxRead int64
+
+	// inbound 处理需要宿主回应的入站 kind（command.submit / approval.respond）。
+	// nil = 纯事件服务端（这些 kind 走 unknown_kind）。经 SetInboundHandler 注入。
+	inbound InboundHandler
+
+	// conns 是活动连接注册表（Broadcast 用：向所有连接推控制消息，如 approval.request）。
+	connsMu sync.Mutex
+	conns   map[*wsConn]struct{}
+}
+
+// InboundHandler 处理需要宿主回应的入站消息（command.submit / approval.respond，G1）。
+//
+// transport 只做协议分发，业务在宿主（library 不绑协议，协议绑定在 host 层——C2/C3）。
+// 返回要回给客户端的应答消息（nil = 只收不回，效果经事件流可见）；返回 error 时
+// transport 回一条 kind=error（reply_to 指向原消息）但**不关连接**（D7 宽容）。
+type InboundHandler interface {
+	HandleInbound(ctx context.Context, m contracts.TransportMessage) (*contracts.TransportMessage, error)
+}
+
+// Broadcaster 向所有活动连接广播一条消息（不经订阅过滤）。实现是 *Server。
+//
+// 用于 approval.request 这类"任何窗口的客户端都该看到、都能应答"的控制消息——
+// 订阅过滤（session/kind/durable）是事件流的口径，不适用于审批广播。
+type Broadcaster interface {
+	Broadcast(kind string, payload any)
 }
 
 // NewServer 构造传输服务端。bus 必填（nil → panic：没有事件流的 WS 服务没有意义，
@@ -36,7 +62,50 @@ func NewServer(b *bus.Bus) *Server {
 	if b == nil {
 		panic("transport: NewServer 需要非 nil 的 *bus.Bus")
 	}
-	return &Server{bus: b, maxRead: maxLineBytes}
+	return &Server{bus: b, maxRead: maxLineBytes, conns: make(map[*wsConn]struct{})}
+}
+
+// SetInboundHandler 注入入站处理器（command.submit / approval.respond）。
+// 传 nil = 回到纯事件服务端（这些 kind 走 unknown_kind）。装配期调用一次。
+func (s *Server) SetInboundHandler(h InboundHandler) {
+	s.inbound = h
+}
+
+// Broadcast 向所有活动连接广播一条消息（不经订阅过滤）。
+//
+// 单条消息序列化失败（理论不可达）→ 静默跳过（不因一条坏广播打断其它连接）。
+// 向某个连接写失败（连接已死）→ 忽略（它的 ServeWS defer 会摘除它）。
+func (s *Server) Broadcast(kind string, payload any) {
+	if s == nil {
+		return
+	}
+	m, err := NewMessage(kind, payload)
+	if err != nil {
+		return
+	}
+	// 快照连接（持锁仅拷指针），锁外发送——避免持 connsMu 时被一个慢/死连接阻塞。
+	s.connsMu.Lock()
+	conns := make([]*wsConn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.connsMu.Unlock()
+	for _, c := range conns {
+		_ = c.send(m)
+	}
+}
+
+// track / untrack 维护活动连接注册表（Broadcast 用）。
+func (s *Server) track(c *wsConn) {
+	s.connsMu.Lock()
+	s.conns[c] = struct{}{}
+	s.connsMu.Unlock()
+}
+
+func (s *Server) untrack(c *wsConn) {
+	s.connsMu.Lock()
+	delete(s.conns, c)
+	s.connsMu.Unlock()
 }
 
 // ServeWS 升级 HTTP 连接并按 NDJSON 行式协议服务（挂到 GET /ws 上）。
@@ -74,9 +143,11 @@ func (s *Server) ServeWS(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	c := &wsConn{conn: conn, bus: s.bus, ctx: ctx}
+	s.track(c)
 	defer func() {
 		// 先摘订阅（关通道 → 推送 goroutine 退出）再关连接，避免向已关闭连接写。
 		c.unsubscribe()
+		s.untrack(c)
 		_ = conn.CloseNow()
 	}()
 
@@ -129,7 +200,35 @@ func (s *Server) handle(ctx context.Context, c *wsConn, m contracts.TransportMes
 			return c.sendError(&m.ID, CodeBadPayload, err.Error())
 		}
 		// 过滤口径与总线一致（K4）；切片已被 FilterFromRequest 复制。
-		c.subscribe(bus.FilterFromRequest(req))
+		replaced := c.subscribe(bus.FilterFromRequest(req))
+		// G8：订阅生效回执（回显生效过滤条件 + 是否替换了前一个订阅），让客户端
+		// 不必靠"预期事件到不到"反推订阅是否生效。
+		ack, err := NewMessage(KindSubscribed, subscribeAckFrom(c.filter(), replaced))
+		if err != nil {
+			return c.sendError(&m.ID, CodeUnknownKind, err.Error())
+		}
+		ack.ReplyTo = &m.ID
+		ack.SessionID = m.SessionID
+		return c.send(ack)
+
+	case KindCommandSubmit, KindApprovalRespond:
+		// 需要宿主回应的入站 kind（G1 遥控面）。未装配 InboundHandler → 不支持。
+		if s.inbound == nil {
+			return c.sendError(&m.ID, CodeUnknownKind,
+				fmt.Sprintf("服务端未装配入站处理器，不支持 kind=%q", m.Kind))
+		}
+		reply, herr := s.inbound.HandleInbound(ctx, m)
+		if herr != nil {
+			// 业务错误回一条 kind=error 但**不关连接**（D7：一条坏消息不打死连接）。
+			return c.sendError(&m.ID, CodeBadPayload, herr.Error())
+		}
+		if reply != nil {
+			reply.ReplyTo = &m.ID
+			if reply.SessionID == nil {
+				reply.SessionID = m.SessionID
+			}
+			return c.send(*reply)
+		}
 		return nil
 
 	case KindEvent:
@@ -140,6 +239,23 @@ func (s *Server) handle(ctx context.Context, c *wsConn, m contracts.TransportMes
 	default:
 		return c.sendError(&m.ID, CodeUnknownKind, fmt.Sprintf("不支持的 kind=%q", m.Kind))
 	}
+}
+
+// subscribeAckFrom 把生效的过滤条件折成订阅回执载荷（G8）。
+func subscribeAckFrom(f bus.Filter, replaced bool) contracts.SubscribeAck {
+	ack := contracts.SubscribeAck{Replaced: replaced}
+	if len(f.SessionIDs) == 1 {
+		sid := f.SessionIDs[0]
+		ack.SessionID = &sid
+	}
+	if len(f.KindPrefixes) > 0 {
+		ack.KindPrefixes = append([]string(nil), f.KindPrefixes...)
+	}
+	if f.DurableOnly {
+		v := true
+		ack.DurableOnly = &v
+	}
+	return ack
 }
 
 // checkOrigin 实现 N5b 的 Origin 判据（见包 doc 的安全边界一节）。
@@ -187,24 +303,36 @@ type wsConn struct {
 	// 进行中的写被中断（否则向一个已死的 TCP 连接写会阻塞到超时）。
 	ctx context.Context
 
-	mu  sync.Mutex
-	sub *bus.Subscription
+	mu     sync.Mutex
+	sub    *bus.Subscription
+	curFil bus.Filter // 当前订阅的过滤条件（subscribed 回执回显用，与 sub 同锁更新）
 }
 
 // subscribe 换上新订阅：旧订阅先摘（关通道 → 旧推送 goroutine 自然退出）。
 //
 // 重复 subscribe = 替换（契约的 SubscribeRequest 只有一组过滤条件，一个连接一条订阅）。
-func (c *wsConn) subscribe(f bus.Filter) {
+// 返回是否替换了此前的订阅（供 subscribed 回执的 replaced 字段，G8）。
+func (c *wsConn) subscribe(f bus.Filter) (replaced bool) {
 	c.mu.Lock()
 	if c.sub != nil {
 		c.sub.Close()
 		c.sub = nil
+		replaced = true
 	}
 	sub := c.bus.Subscribe(f)
 	c.sub = sub
+	c.curFil = f
 	c.mu.Unlock()
 
 	go c.pushLoop(sub)
+	return replaced
+}
+
+// filter 返回当前订阅的过滤条件（subscribed 回执回显用；无订阅 → 零值 Filter）。
+func (c *wsConn) filter() bus.Filter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.curFil
 }
 
 // unsubscribe 摘掉当前订阅（幂等）：关通道 → 推送 goroutine 退出。
@@ -241,9 +369,13 @@ func (c *wsConn) pushLoop(sub *bus.Subscription) {
 			}
 			if n := sub.Lagging(); n > reported {
 				reported = n
+				// 补读指引指向**协议面**的端点（v3-S4 G3）：此前这里写的是 Go API
+				// （Store.ReadFrom）——进程外客户端根本没有那个 API，断线后的事件窗口
+				// 补不回来（"事件流是唯一事实源"对进程外消费者不成立）。
 				msg, _ := NewErrorMessage(nil, CodeSubscriptionLagging,
 					fmt.Sprintf("订阅通道满，已丢弃 %d 条通知；事实事件仍在事件库里，"+
-						"请按自己的 seq 水位用 Store.ReadFrom 补读（流事件丢了就是丢了）", n))
+						"请按自己的 seq 水位用 GET /api/events?from=&limit= 补读"+
+						"（流事件丢了就是丢了）", n))
 				if err := c.send(msg); err != nil {
 					return
 				}
@@ -265,7 +397,10 @@ func (c *wsConn) send(m contracts.TransportMessage) error {
 }
 
 // sendError 回一条 kind=error（reply_to 指向出错消息；nil = 无对应消息）。
-func (c *wsConn) sendError(replyTo *contracts.Ulid, code, message string) error {
+//
+// reply_to 是**客户端关联 id**（与 TransportMessage.id 同一形状：string，不限格式——
+// 客户端可以用任意不透明 id，服务端原样回指，G9）。
+func (c *wsConn) sendError(replyTo *string, code, message string) error {
 	m, err := NewErrorMessage(replyTo, code, message)
 	if err != nil {
 		return err

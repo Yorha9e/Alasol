@@ -3,6 +3,8 @@ package host_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -93,11 +95,28 @@ func TestHostWorktreeHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET worktrees: %v", err)
 	}
+	raw2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	// G6：JSON 形状走 snake_case（对齐全仓视图）。原文里必须出现 snake_case 键、
+	// 不得出现 PascalCase 键——Go 的 json 解包是大小写不敏感的，只解进结构体
+	// 发现不了"其实是 PascalCase"，必须看原始字节（第三方 GUI 按字面键取值）。
+	body2 := string(raw2)
+	for _, want := range []string{`"name"`, `"path"`, `"repo"`, `"created_at"`} {
+		if !strings.Contains(body2, want) {
+			t.Fatalf("GET /api/worktrees 应含 snake_case 键 %s（G6）: %s", want, body2)
+		}
+	}
+	for _, bad := range []string{`"Name"`, `"Path"`, `"Repo"`, `"CreatedAt"`} {
+		if strings.Contains(body2, bad) {
+			t.Fatalf("GET /api/worktrees 不该有 PascalCase 键 %s（G6：worktree JSON 须 snake_case）: %s", bad, body2)
+		}
+	}
 	var list []struct {
 		Name string `json:"name"`
 	}
-	decodeJSON(resp2, &list)
-	resp2.Body.Close()
+	if err := json.Unmarshal(raw2, &list); err != nil {
+		t.Fatalf("解列表: %v", err)
+	}
 	if len(list) != 1 || list[0].Name != "wt-http" {
 		t.Fatalf("列表错: %+v", list)
 	}

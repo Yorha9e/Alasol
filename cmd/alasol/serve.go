@@ -54,6 +54,10 @@ type hubFlags struct {
 	graphCore         *string
 	graphEscalate     *int
 
+	// ---- v3-S4 协议面（G1/G3）----
+	// promptTimeout 是协议面发起的一轮对话的**整轮**上限（秒；0 = 框架默认 600）。
+	promptTimeout *int
+
 	// ---- v3-S3 工作流引擎（W1 能力包，非强制）----
 	workflowDir *string
 	goalLedger  *bool
@@ -77,7 +81,7 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		model:             fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
 		baseURL:           fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
 		apiKeyEnv:         fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
-		approval:          fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal"),
+		approval:          fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal | protocol（protocol=经 WS/HTTP 面应答审批，无人应答=deny）"),
 		allow:             fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
 		ask:               fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
 		maxTurns:          fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
@@ -107,6 +111,12 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		graphMaxResults:   fs.Int("graph-max-results", 0, "多跳遍历结果上限（0=默认 5000，G18）"),
 		graphCore:         fs.String("graph-core", "", "核心接口节点声明（逗号分隔；`*` 结尾=字节前缀，如 core/*,contracts/*；W16）"),
 		graphEscalate:     fs.Int("graph-escalate-reachable", 0, "change_impact 的 escalate 阈值：可达节点数超过它才触发（0=默认 50，W15）"),
+
+		// 协议面的一轮对话上限（v3-S4 G1）：**整轮**（一个 prompt 的全部 turn）共用这份预算，
+		// 不是单次模型调用的超时。它同时是 fail-close 的兜底时钟——审批等不到应答就按 deny 收场。
+		promptTimeout: fs.Int("prompt-timeout", 0,
+			"协议面（POST /api/sessions/{id}/prompt、WS command.submit）一轮对话的**整轮**上限（秒；0=默认 600）。"+
+				"同时是 fail-close 的兜底时钟：审批等不到应答就按 deny 收场（无人应答=deny）"),
 
 		// 工作流引擎（v3-S3，W1 能力包）：目录加载纯数据能力包 + goal ledger 工具开关。
 		workflowDir: fs.String("workflow-dir", "",

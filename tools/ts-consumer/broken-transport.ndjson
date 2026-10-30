@@ -1,0 +1,5 @@
+{"v":1,"id":"client-bad-0001"}
+{"v":1,"id":"01JN8JC080BKFDBKAT2VBAAG9H","kind":"approval.request","payload":{"v":1,"id":"01JN8JC29M57MNPCN48T9KSDHZ","ts":"2025-03-01T10:00:00.000Z","session_id":"not-a-ulid","agent_id":"01JN8JC0800EHT9NTXW9D1FKHH","trigger":"policy_ask","summary":"session_id 不是 ULID"}}
+{"v":1,"id":"01JN8JC29M57MNPCN48T9KSDHZ","kind":"approval.respond","payload":{"v":1,"request_id":"01JN8JC29M57MNPCN48T9KSDHZ","ts":"2025-03-01T10:00:01.000Z","decision":"maybe"}}
+{"v":1,"id":"01JN8JC35RAEFCPRAV2DQXX1Z8","kind":"command.accepted","payload":{"session_id":"01JN8JC080EW3Y1C2AAA8M9XJB"}}
+{"v":"1","id":"01JN8JC3C0YVWS737GTW00J4ZH","kind":"ping"}

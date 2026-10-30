@@ -823,19 +823,58 @@ func TestPeersAndGateJoinHTTPEndpoints(t *testing.T) {
 	if got := len(h.Discovery().JoinHistory()); got != joins {
 		t.Fatalf("重复 join 落了重复事件: %d → %d", joins, got)
 	}
-	// ⑧ 方法路由：join 只认 POST。GET 会落到 catch-all 的 "GET /"（index 路由），
-	// 因路径不是静态资源而 404 —— 关键是**不会**触发 join 处理器（不加 gate）。
+	// ⑧ 方法路由：join 只认 POST。GET 落到 /api/ 回退面 → 405（带 Allow），
+	// 不再掉进静态通配报"没有这个静态资源"（G7）——关键是**不会**触发 join 处理器（不加 gate）。
 	if resp, err := http.Get(srv.URL + "/api/gates/join"); err == nil {
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusNotFound {
-			t.Fatalf("GET /api/gates/join 状态码 = %d，want 404（走 index 路由，不触发 join）", resp.StatusCode)
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET /api/gates/join 状态码 = %d，want 405（路径认得、方法不符，G7）", resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Fatalf("405 应带 Allow: POST，得到 %q", allow)
 		}
 	}
-	// 反向：GET-only 端点用 POST → 405（mux 的方法路由）。
+	// 反向：GET-only 端点用 POST → 405（/api/ 回退面同样处理）。
 	if resp, err := http.Post(srv.URL+"/api/sessions", "application/json", nil); err == nil {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Fatalf("POST /api/sessions 状态码 = %d，want 405", resp.StatusCode)
+		}
+	}
+	// 未知 /api 路径 → 404，且错误体说"没有这个 API 端点"（不是"静态资源"，G7）。
+	if resp, err := http.Get(srv.URL + "/api/nope"); err == nil {
+		var te contracts.TransportError
+		_ = json.NewDecoder(resp.Body).Decode(&te)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound || strings.Contains(te.Message, "静态资源") {
+			t.Fatalf("GET /api/nope 状态码 = %d message=%q，want 404 且不提静态资源", resp.StatusCode, te.Message)
+		}
+	}
+	// ⑧' **带路径参数**的端点：方法不符也要 405（不是 404）——路由表存的是**模板**
+	// （/api/sessions/{session_id}/prompt），拿字面路径查表永远查不到（那会让客户端
+	// 以为"端点不存在"，而不是"方法用错了"）。
+	if resp, err := http.Get(srv.URL + "/api/sessions/" + string(host.NewSession()) + "/prompt"); err == nil {
+		var te contracts.TransportError
+		_ = json.NewDecoder(resp.Body).Decode(&te)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET /api/sessions/{id}/prompt 状态码 = %d，want 405（路径认得、方法不符）", resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Fatalf("405 应带 Allow: POST，得到 %q", allow)
+		}
+		if te.Code != "method_not_allowed" {
+			t.Fatalf("405 错误码 = %q，want method_not_allowed", te.Code)
+		}
+	}
+	// 另一条带参数的端点（DELETE 专用）：GET → 405，Allow: DELETE。
+	if resp, err := http.Get(srv.URL + "/api/worktrees/some-name"); err == nil {
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET /api/worktrees/{name} 状态码 = %d，want 405", resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "DELETE" {
+			t.Fatalf("405 应带 Allow: DELETE，得到 %q", allow)
 		}
 	}
 }

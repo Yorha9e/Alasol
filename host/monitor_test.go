@@ -11,6 +11,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 )
 
@@ -267,7 +268,7 @@ func TestHubAlertEventEndToEnd(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	sink := newHubAlertSink(st, path)
+	sink := newHubAlertSink(bus.New(st), path)
 
 	ctx := context.Background()
 	at := time.Date(2026, 1, 29, 12, 0, 0, 0, time.UTC)
@@ -313,12 +314,12 @@ func TestHubAlertEventEndToEnd(t *testing.T) {
 	}
 
 	// 确定性：同一库路径 → 同一伪 session（跨重启稳定，告警聚成一条流）。
-	sink2 := newHubAlertSink(st, path)
+	sink2 := newHubAlertSink(bus.New(st), path)
 	if sink2.sessionID != sink.sessionID || sink2.agentID != sink.agentID {
 		t.Fatalf("同一库路径应派生同一对伪 id（跨重启稳定）")
 	}
 	// 不同库 → 不同伪 id（多 hub 各自一个库，G25）。
-	other := newHubAlertSink(st, path+"-other")
+	other := newHubAlertSink(bus.New(st), path+"-other")
 	if other.sessionID == sink.sessionID {
 		t.Fatalf("不同库路径应派生不同伪 session")
 	}

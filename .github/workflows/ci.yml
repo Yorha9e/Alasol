@@ -60,8 +60,14 @@ jobs:
           npm ci
           npx tsc --noEmit
           npx tsx reader.ts
-          # The broken sample must be rejected: its exit code has to be 1.
+          # Transport messages (WS+NDJSON envelope) are validated against transport.json.
+          npx tsx reader.ts sample-transport.ndjson
+          # The broken samples must be rejected: their exit code has to be 1.
           if npx tsx reader.ts broken-events.ndjson; then
             echo "::error::broken-events.ndjson was accepted, but it must fail validation"
+            exit 1
+          fi
+          if npx tsx reader.ts broken-transport.ndjson; then
+            echo "::error::broken-transport.ndjson was accepted, but it must fail validation"
             exit 1
           fi

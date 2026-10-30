@@ -97,4 +97,81 @@
 // 没有调用方身份就没有可见性过滤，任意客户端就能枚举任意 gate 的成员与任意 session
 // 的 agent 树。`/api/inquiry` 的 `agent_id` 只是"调用方身份"，窗口投影用
 // `project_agent_id`（缺省 = 调用方的可见集：自己 + 父 + 直系子）。
+//
+// # serve 的定位（v3-S4，G2 口径统一）：**观察 + 协调 daemon**
+//
+// `alasol serve` 与 `alasol chat` 是**两个进程、两个 hub、共享同一个事件库**。由此，
+// 写端点分两类，校验口径**有意不同**（不是遗漏）：
+//
+//   - **托管型写面**（/api/peers、/api/gates/join、/api/agentlink/*、**/api/sessions/{id}/prompt**）：
+//     要求目标 session 由**本进程**托管（hostsSession 查进程内 h.loops，G25 session 亲和写）。
+//     serve 进程 loops 为空 → 这些端点对 chat 进程建的 session 一律 404 unknown_session。这是**设计**：
+//     水平可见性/广播依赖**进程内活状态**（发现表的存活成员是进程本地的，无租约无心跳），
+//     跨进程没有"谁在线"可判；
+//   - **协调型写面**（/api/merge/review|check|predict）：**直查库、不校验托管**——merge 是
+//     协调动作（review 结论/合并检查是事件流里的持久事实 + git 观测），不需要目标 session 在线，
+//     任何拿得到 session id 的一方都能记一条 review。**故意不补托管校验**（补了就成了"只能
+//     给自己进程的 session 记 review"，与它作为协调动作的定位矛盾）。
+//
+// **对话发起端点也在托管型写面里**（v3-S4 G1 + G25）：POST /api/sessions/{id}/prompt 若对
+// **别的进程**托管的 session 起 prompt，本进程会**就地新建一个 loop**（hub.go 的 loopFor）
+// → 两个进程往同一个 session/agent 写事件 → **G25 破**（全局 seq = 提交序 ≠ 因果序）。
+// 所以它要求 hostsSession，否则 404 unknown_session（与 peers/gates/agentlink 同口径）。
+// 协议面**开新会话**走 WS `command.submit`（**不带** session_id → 服务端新建一个 session，
+// 本进程即宿主）；带上 session_id 的 command.submit 同样要求本进程托管，否则回 kind=error。
+//
+// 于是同一 session：读面（/api/sessions、/api/context、/api/cost）与协调写面（merge.*）全通
+// （投影/索引扫的是共享库），托管写面（peers/gates/join/agentlink/prompt）404。**跨进程托管注册不做
+// （记 v4）**——那需要会话亲和/活状态同步一整套（G25 的部署层约束），不是补个端点的事。
+//
+// **重启同理**（活状态是进程本地的）：hub 重启后，**重启前**那些 session 一律**失管**
+// ——本进程没有它们的 loop（h.loops 是内存态，重启即空），发现表的"存活成员"也不会
+// 复活（老 session 不会因重扫事件流而重新变成 live，这是设计）。于是重启后：
+// 读面照常（事件库里的历史还在）、协调写面照常，而托管写面（含 prompt）对**旧 session**
+// 一律 404 unknown_session。**协议面要继续对话就得重新开会话**（WS command.submit 不带
+// session_id → 服务端新建一个 session，本进程即宿主）；想接上旧 session 的上下文，
+// 走 `alasol resume -session <id> -continue "<提示>"`（CLI 的恢复+续跑：**另一个进程**里
+// 自己建 loop 并接管）——协议面**不硬接**旧 session（那正是 G25 要防的双写）。
+//
+// # 审批应答的鉴权口径（v0 的诚实边界，**有意不做鉴权**）
+//
+// 协议审批面（POST /api/approvals/{id}/respond、WS approval.respond）**没有鉴权**：
+// 任何能连上 hub 的客户端都能应答审批（v0 只监听 loopback + 无 cookie + 无 token，
+// 见上面的"安全边界"一节）。fail-close 只保证"**无人应答 = deny**"（不得挂起、不得默认
+// 放行，D14/H8），**不防乱批**：能连上的人可以抢先 approve 一条本不该放行的调用。
+// 收紧方向记 v4（凭证只走 header/query + 按设备签发/可撤销 + 审批与调用方身份绑定 +
+// 全量审计）。这是**有意的口径**，不是待修的 bug——在 loopback 威胁模型里，
+// 能连上 hub 的进程本来就与 hub 同权。
+//
+// 另：**应答被接受（HTTP 200 / WS 无错）= 应答已投递 ≠ 这一轮被放行**。等待者
+// （loop）可能在应答到达的同一瞬间 ctx 已结束（整轮超时/取消）→ 按 fail-close 仍落 deny，
+// note 写"已收到应答但上下文已结束"（与"无人应答"区分，便于事后复盘）。
+//
+// # 前端接入方式（v3-S4，G5 口径）：**必须同源，或自备代理**
+//
+// hub 只监听 loopback（N5b）+ WS 校验 Origin（同源才放行）+ **/api/* 不返回 CORS 头**——
+// 这是**有意的安全口径**（无 cookie、无 token，跨源页面不该能驱动本地 hub）。因此第三方前端：
+//
+//   - **同源托管**：把前端静态文件放到 hub 的 Web UI 位（GET / 由嵌入的 index.html 服务），
+//     或用一个**同源反向代理**把静态资源 + /api + /ws 一起转发到 hub；
+//   - **不要**指望跨源 fetch / 直连 ws（浏览器会因 CORS / Origin 校验被拒——403 origin_rejected）。
+//
+// 非浏览器客户端（CLI / 脚本 / curl，无 Origin 头）不受此限，可直连。
+//
+// # 计数 / 时间 / 分页口径（v3-S4，A1/A3/A5 一次说清）
+//
+//   - **A1 /api/sessions 计数口径**：在线表是 **agent session 面板**——hub 伪 session（hub.*
+//     事件族，如 hub.alert）与 /btw 旁支 fork session **都不进表**（前者无 agent，后者不是一等
+//     会话，见 host/fork.go）。所以"事件流里有 N 条、表里 M 行"对不上是正常的：表只列 agent session。
+//   - **A3 告警时间字段两副面孔**：/api/monitor 的 `Alert.at` 是 RFC3339 **带时区**（活状态、每次
+//     采样一条）；hub.alert 事件的时间在 `envelope.ts`（RFC3339Nano **UTC**，60s 抑制一条）。同一事实
+//     两个消费面，字段名/位置都不同——消费者按面适配（详见 host/alert_event.go）。
+//   - **A5 分页口径**：三个读面各有"还有没有更多"的信号，**形态不统一是故意的**——/api/inbox 给
+//     **next_seq 游标 + has_more**（拉模型收件箱，游标翻页）；/api/inquiry 给 **truncated 信号**
+//     （事件窗口，无游标，要更多得自己抬 from）；**/api/events**（G3 回放面）给 **from/to/limit +
+//     truncated**（按 seq 翻页，追到 watermark 即追平事实流）。消费端按面读各自的信号。
+//
+// # G10：派活 handoff 的端点清单与代码有出入（笔误）——**以 host/http.go 的注册面为准**。
+// （handoff 曾把 GET /api/merge/check 写成 GET，实为 POST；且漏了 /api/graph/impact、
+// /api/graph/rebuild、/api/merge/review|predict。代码是唯一事实源，本文不再复抄清单。）
 package host

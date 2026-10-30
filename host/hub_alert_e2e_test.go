@@ -17,12 +17,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
+	"github.com/Yorha9e/alasol/runtime/transport"
 )
 
 // hubAlertEvents 读事件流里的 hub.alert 事件（最多等 timeout）。
@@ -198,6 +201,112 @@ func TestHubWorktreeRegistryRebuiltAfterRestart(t *testing.T) {
 	}
 	if list[0].Path != wt.Path {
 		t.Fatalf("重建出来的 Path 应与磁盘事实一致: %q vs %q", list[0].Path, wt.Path)
+	}
+}
+
+// controllableSource 是测试用的可注入采样源：armed=false 时正常，armed=true 时
+// mem 恒超阈值——让测试**精确控制告警何时触发**（在 WS 订阅就位之后），不靠时序巧合。
+type controllableSource struct {
+	armed atomic.Bool
+}
+
+func (s *controllableSource) Sample() host.Sample {
+	over := s.armed.Load()
+	mem := uint64(1 << 20) // 1MB（正常，低于 2MB 阈值）
+	if over {
+		mem = 3 << 20 // 3MB（超 2MB 阈值 → 触发）
+	}
+	return host.Sample{MemBytes: mem, Goroutines: 1, At: time.Now()}
+}
+
+// TestHubAlertReachesWSSubscribers（G4 硬验收）：hub.alert 经 **bus** 发布 → /ws 订阅者
+// **实时收到**，且与入库的那一条**同 id 同 seq**（一致）。
+//
+// 这是 G4 的回归锚：旧实现直调 store.Append 落了库却绕过 bus → /ws 订阅者永远收不到
+// （第三方 70s 探针实测：库里 3 条、订阅者 0 条）。本测试把"过 bus"钉死——把 RecordAlert
+// 改回 store.Append，这条必红。
+func TestHubAlertReachesWSSubscribers(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "events.db")
+	src := &controllableSource{}
+	h := newTestHub(t, func(c *host.Config) {
+		c.DBPath = dbPath
+		c.MonitorMemMB = 2          // 2MB 阈值
+		c.MonitorIntervalSec = 1    // 1s 一轮：arm 后下一轮就采到
+		c.MonitorSampleSource = src // 注入可控源（arm 前不超阈值）
+	})
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	// WS 订阅 hub.alert（先订阅、后触发——否则第一轮告警在订阅就位前就发了，错过）。
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	c, err := transport.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if err := c.Subscribe(ctx, contracts.SubscribeRequest{KindPrefixes: []string{"hub.alert"}}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if ack, err := c.RecvContext(ackCtx); err != nil || ack.Kind != transport.KindSubscribed {
+		t.Fatalf("订阅回执: kind=%q err=%v", ack.Kind, err)
+	}
+	ackCancel()
+
+	// 触发：arm → 下一轮采样超阈值 → 告警经 bus 发布 → WS 订阅者实时收到。
+	src.armed.Store(true)
+
+	var got contracts.Event
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		recvCtx, recvCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		m, err := c.RecvContext(recvCtx)
+		recvCancel()
+		if err != nil {
+			continue
+		}
+		if m.Kind != transport.KindEvent {
+			continue
+		}
+		var ev contracts.Event
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue
+		}
+		if ev.Kind == "hub.alert" {
+			got = ev
+			break
+		}
+	}
+	if got.ID == "" {
+		t.Fatal("G4 回归：/ws 订阅者应实时收到 hub.alert（经 bus 发布）")
+	}
+	if !got.Durable || got.Seq == nil {
+		t.Fatalf("WS 收到的 hub.alert 必须是带 seq 的 durable 事件: %+v", got)
+	}
+
+	// 与入库一致：直读取库，找同 id 的那条，seq 必须相同（WS 广播的就是入库的那条）。
+	st, err := sqlite.Open(dbPath, sqlite.Options{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	evs, err := st.ReadFrom(context.Background(), nil, 1, 500)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	var stored *contracts.Event
+	for i := range evs {
+		if evs[i].ID == got.ID {
+			stored = &evs[i]
+			break
+		}
+	}
+	if stored == nil {
+		t.Fatalf("WS 收到的 hub.alert id=%s 不在事件库里（广播与入库不一致）", got.ID)
+	}
+	if stored.Seq == nil || *stored.Seq != *got.Seq {
+		t.Fatalf("WS 事件的 seq 应与入库一致: ws=%v stored=%v", got.Seq, stored.Seq)
 	}
 }
 

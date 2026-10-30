@@ -661,6 +661,13 @@ func TestWSReceivesEventsFromRealRun(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
+	// G8：订阅后服务端先回一条 kind=subscribed 回执，先收掉再读事件。
+	ackCtx, ackCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ack, err := c.RecvContext(ackCtx)
+	ackCancel()
+	if err != nil || ack.Kind != transport.KindSubscribed {
+		t.Fatalf("订阅回执: kind=%q err=%v", ack.Kind, err)
+	}
 
 	sid := runOneRound(t, h, "读一下")
 

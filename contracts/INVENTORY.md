@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | **Event** | `schema/event.json` | 唯一事实流 envelope：`v` / `id` / `kind` / `seq` / `ts` / `session_id` / `agent_id` / `causation_id` / `durable` / `payload` / `binary_ref` | F3/F7/F8；kind 开放字符串 + 点分命名空间（D6）；未知 kind 宽容：忽略但持久化（D7） |
 | 2 | **Command** | `schema/command.json` | 意图；可从进程外提交，经 core 处理产生 Event（D9） | — |
-| 3 | **Transport 消息** | `schema/transport.json` | 客户端/服务端通信 envelope（`ws+ndjson` / `stdio` / `inproc` 同一契约）：订阅、命令提交、审批转发（N4/N6） | NDJSON 行式 |
+| 3 | **Transport 消息** | `schema/transport.json` | 客户端/服务端通信 envelope（`ws+ndjson` / `stdio` / `inproc` 同一契约）：订阅（subscribe→subscribed 回执）、事件推送（event）、心跳（ping/pong）、对话发起（command.submit→command.accepted）、审批应答（approval.request/approval.respond）、错误（error）（N4/N6） | NDJSON 行式；kind 开放字符串（v0 固化上述几个）；`TransportMessage.id` 是**客户端关联 id**（G9：服务端只做 reply_to 回指、不去重幂等，客户端可造 ULID 或任意不透明字符串） |
 | 4 | **Extension 元数据** | `schema/extension.json` | `kind` / `schema` / `capabilities` / `priority` / `reloadable` / `health`（D17） | — |
 | 5 | **Tool.schema** | `schema/tool.json` | 工具描述：`schema` / `side_effect`（none/read/write/destructive）/ `cancelable` / `approvable` / `idempotent` / `replay`（D12/D22） | `schema` 字段**值本身是 JSON Schema**（元嵌套）→ codegen 当原始 JSON 处理 |
 | 6 | **Tool 返回值** | `schema/tool-result.json` | 工具返回值：`graph_edges: [{src,dst,kind}]` / `taint` / 可重放标记（D22/G22/Q7） | 跨边界：MCP 与进程级扩展都要传 |
@@ -58,6 +58,28 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 
 其余 core kind（`policy.decided` 等）随对应阶段补 payload schema，envelope 复用 `event.json`；kind→payload 全量映射以 `schema/event.json` 的 `x-kind-payload` 为准（D21：源头一处）。
 
+### 2b. Transport 消息 kind 子集（v3-S4 补全，G1/G8）
+
+`TransportMessage.kind` 是**开放字符串**（D6/D7 同 Event：未知 kind 宽容）。v0 固化的几个（**不是**事件 kind——不进事件流、不占 seq，是 WS 连接上的控制/对话消息）：
+
+| kind | 方向 | 载荷 | 说明 |
+|---|---|---|---|
+| `subscribe` | client→server | `SubscribeRequest` | 订阅事件流（K4 远程订阅；重复 = 替换） |
+| `subscribed` | server→client | `SubscribeAck` | **订阅生效回执**（G8）：回显生效过滤条件 + `replaced`；reply_to 指向原 subscribe |
+| `event` | server→client | `Event` | 事件推送（按订阅过滤）；客户端发 = `forbidden_kind` |
+| `ping` / `pong` | client→server / server→client | — | 心跳（pong 的 reply_to = ping.id） |
+| `command.submit` | client→server | `CommandSubmit` | **对话发起**（G1）：提交一轮 prompt，服务端异步跑、结果经事件流回流 |
+| `command.accepted` | server→client | `CommandAccepted` | command.submit 受理回执：带回生效 session id + status=running（reply_to 指向原 submit） |
+| `approval.request` | server→client | `ApprovalRequest`（approval.json） | **审批请求**（G1）：ask 策略触发时经 WS 广播推给所有连接；载荷四要素 + trigger/tool_call_id/side_effect/summary/detail |
+| `approval.respond` | client→server | `ApprovalResponse`（approval.json） | **审批应答**（G1）：按 `payload.request_id` 注入挂起的审批；无人应答/超时 = deny（fail-close，D14/H8） |
+| `error` | server→client | `TransportError` | 协议层错误（reply_to 指向出错消息） |
+
+**审批不是事件 kind**：审批是**实时交互**（必须人在线应答，回放一条几天前的 approval.request 没有意义），故走 WS 控制消息而非 durable 事件流。fail-close 铁律：无人应答 = deny，不得挂起（D14/H8/陷阱 9）。
+
+**载荷映射机器可读**：`schema/transport.json` 的 `$defs.TransportMessage["x-kind-payload"]` 给出 kind→载荷 `$defs` 的映射（同事件 schema 的 `x-kind-payload` 约定，跨文件写成显式 ref，如 `approval.json#/$defs/ApprovalRequest`）。跨语言消费端据此校验载荷，**不硬编码** kind→载荷表（消费端见 `tools/ts-consumer/reader.ts`）。
+
+**消息 id 的口径（G9）**：`TransportMessage.id` / `reply_to` 是**客户端关联 id**，schema 形状 = `string`（**不限格式**：框架 ULID 或任意不透明字符串皆可），服务端**只回指、不校验、不去重**。它是**客户端** id，不是框架 id——故不标 `x-id-kind: framework`、不套 ULID pattern（见 §5 变更记账）。
+
 ## 3. 生成与编码约定（schema 与 codegen 共同遵守）
 
 - **演进铁律（F7）**：只增不删、不改义；弃用字段标 `x-deprecated`；envelope 带版本字段 `v`
@@ -90,6 +112,7 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 | 日期 | 契约 | 变更 | 原因 | 阶段 |
 |---|---|---|---|---|
 | 2026-10-27 | `transport.SubscribeRequest` | `kinds` → `kind_prefixes` | 字段名与语义漂移：原名 `kinds` 暗示"精确 kind 列表"，description 却写"前缀匹配由实现定义"——改为 `kind_prefixes` 并把语义钉死为**按 kind 前缀匹配**（如 `tool.call.`）。**发布前破例一次**（发布后须走 `x-deprecated` + 版本递增） | 阶段 2 core 骨架（P2-7 修语义漂移） |
+| 2026-10-30 | `transport.TransportMessage.id` / `.reply_to` | `$ref: common.json#/$defs/Ulid`（26 字符 ULID pattern）→ `{"type":"string"}`（**任意字符串**） | **契约文字与实现矛盾**（G9）：description 早就写"客户端可造框架 ULID，也可造任意不透明字符串（服务端不校验其格式，只原样回指）"，实现也只原样回指（transport 层的 id 不是框架 id，无 `x-id-kind`），schema 却仍是 ULID pattern → 第三方 GUI 用自己的关联 id 会被 schema 判非法。**放宽到与文字/实现一致**（发布前破例一次）。配套：Go 侧 `TransportMessage.ID` 由 `Ulid` 变 `string`、`ReplyTo` 变 `*string`（codegen 全链）；钉子 = transport 侧"不透明 id 原样回指"用例 + TS 消费端的 transport 样本 | v3-S4 协议面补全（P2-3 修契约矛盾） |
 
 ---
 

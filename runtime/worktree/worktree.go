@@ -29,15 +29,21 @@ import (
 const maxNameLen = 64
 
 // Worktree 是一个已登记的 worktree。
+//
+// JSON 形状走 **snake_case**（G6：对齐全仓视图惯例——SessionRow/MonitorView/
+// TokenTotalView/OnlineTableView 都是 snake_case；此前无 tag 落到 PascalCase，
+// 第三方 GUI 要为这一个类型特例）。worktree 是 **HTTP 视图**（GET /api/worktrees），
+// **不是** contracts 的跨边界契约类型（不进 INVENTORY 的 11 个契约）——改 tag 只动
+// 本 HTTP 响应形状，不触契约冻结面。
 type Worktree struct {
 	// Name 是登记名（调用方给的短名，用作 root 下的子目录名）。
-	Name string
+	Name string `json:"name"`
 	// Path 是 worktree 的绝对路径（root/<name>）。
-	Path string
+	Path string `json:"path"`
 	// Repo 是它从哪个仓库检出（主仓库或另一个 worktree 的路径）。
-	Repo string
+	Repo string `json:"repo"`
 	// CreatedAt 创建时刻。
-	CreatedAt time.Time
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // Manager 登记并管理一组 worktree（全部位于 root 下）。

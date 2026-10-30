@@ -4,15 +4,16 @@ package contracts
 
 import "encoding/json"
 
+// 传输消息 envelope（ws+ndjson / stdio / inproc 同一契约）。kind→payload 映射见 x-kind-payload（消费端据此校验载荷）。
 type TransportMessage struct {
 	// 契约版本（F7）。
 	V int64 `json:"v"`
-	// 消息 id（框架 ULID）。
-	ID Ulid `json:"id"`
-	// 消息种类（开放字符串，如 subscribe / event / command.submit / approval.request / approval.respond / error / ping）。
+	// 消息 id = **客户端关联 id**（G9）：服务端只回指、不校验。它只做 reply_to 回指（pong/error/accepted 的 reply_to 指向它），不做去重/幂等——入站消息的幂等另有着落（approval.respond 按 payload.request_id 幂等，command.submit 不幂等）。**格式不限**：客户端可造框架 ULID，也可造任意不透明字符串（服务端不校验其格式，只原样回指）。
+	ID string `json:"id"`
+	// 消息种类（开放字符串）。v0 固化：subscribe / subscribed / event / ping / pong / error（基础面）+ command.submit / command.accepted / approval.request / approval.respond（G1 遥控面：对话发起 + 审批应答）。approval.request 载荷 = ApprovalRequest、approval.respond 载荷 = ApprovalResponse（见 approval.json）。
 	Kind string `json:"kind"`
-	// 应答关联：指向被应答消息的 id。
-	ReplyTo *Ulid `json:"reply_to,omitempty"`
+	// 应答关联：指向被应答消息的 id（与 id 同一形状：**客户端关联 id，服务端只回指不校验**）。
+	ReplyTo *string `json:"reply_to,omitempty"`
 	// 会话过滤上下文（订阅过滤 / 会话定向消息用）。
 	SessionID *Ulid `json:"session_id,omitempty"`
 	// 消息载荷（原始 JSON，按 kind 解释；kind=event 时为 Event 契约对象）。
@@ -27,6 +28,34 @@ type SubscribeRequest struct {
 	KindPrefixes []string `json:"kind_prefixes,omitempty"`
 	// true = 只收事实事件（不含流事件）。
 	DurableOnly *bool `json:"durable_only,omitempty"`
+}
+
+// kind=subscribed 的载荷：订阅生效回执（G8）。回显**生效的**过滤条件（与 SubscribeRequest 同口径），让客户端不必靠"预期事件到不到"反推订阅是否生效；replaced 说明本次是否替换了同一连接上的前一个订阅（重复 subscribe = 替换）。
+type SubscribeAck struct {
+	// 生效的 session 过滤；缺省 = 全部会话。
+	SessionID *Ulid `json:"session_id,omitempty"`
+	// 生效的 kind 前缀过滤；缺省 = 全部 kind。
+	KindPrefixes []string `json:"kind_prefixes,omitempty"`
+	// 生效的 durable_only；缺省 = false（流事件也收）。
+	DurableOnly *bool `json:"durable_only,omitempty"`
+	// 是否替换了此前的订阅（同一连接第一条订阅 = false，重复 subscribe = true）。
+	Replaced bool `json:"replaced"`
+}
+
+// kind=command.submit 的载荷：客户端提交一轮对话（G1 遥控面；HTTP 面对应 POST /api/sessions/{id}/prompt）。服务端异步起（或复用）该 session 的 agent loop 跑一轮，结果经事件流（user.prompt/model.turn/tool.call.* 等）回流，不在本消息里返回。
+type CommandSubmit struct {
+	// 目标 session；缺省 = 服务端新建一个（command.accepted 回执里带回新 id）。
+	SessionID *Ulid `json:"session_id,omitempty"`
+	// 用户 prompt 原文（空 = 拒绝，400/error）。
+	Prompt string `json:"prompt"`
+}
+
+// kind=command.accepted 的载荷：command.submit 的受理回执（reply_to 指向原 command.submit）。带回生效的 session id（客户端未提供时是服务端新建的那个）与运行状态；**受理不等于跑完**——结果经事件流异步回流。
+type CommandAccepted struct {
+	// 受理的 session（客户端未给时由服务端新建）。
+	SessionID Ulid `json:"session_id"`
+	// 运行状态（当前恒为 running）。
+	Status string `json:"status"`
 }
 
 type TransportError struct {

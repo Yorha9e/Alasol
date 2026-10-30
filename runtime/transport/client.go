@@ -97,9 +97,9 @@ func (c *Client) readLoop() {
 
 // Subscribe 发送一条 kind=subscribe 请求（K4 远程订阅）。
 //
-// 注意：契约**没有** subscribe 的 ack 消息——发出去即生效，服务端不会回复确认。
-// 想确认就发一条 ping 等 pong（pong 一定排在订阅生效之后的推送前面，
-// 因为同一连接上服务端按到达顺序处理）。
+// **有回执**（G8）：服务端先回一条 kind=subscribed（payload=SubscribeAck，reply_to 指向
+// 本条 subscribe），回显**生效的**过滤条件与 replaced（是否替换了此前的订阅）——
+// 想确认订阅生效就收这条消息（别再用"预期事件到不到"反推）。
 func (c *Client) Subscribe(ctx context.Context, req contracts.SubscribeRequest) error {
 	m, err := NewMessage(KindSubscribe, req)
 	if err != nil {
