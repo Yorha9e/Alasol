@@ -222,6 +222,12 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 | **v3-S2 fork + /btw** | K29 拍板：fork **只附带上下文**（不复制 ledger/gate 全套）；`/btw` 旁支命令——结果**只给用户、不回灌**主上下文；**预埋**"从 /btw 生成全新 session"钩子（只埋点不实现） | /btw 结果不进主上下文（事件流/快照断言）；fork 附带上下文且不带 ledger/gate（断言）；生成新 session 钩子埋点存在（埋点≠实现） | **✅ 完成（2026-01-29，评审循环 critic 3 轮/reviewer 3 轮至 clean）**：`host/fork.go`（RunBtw：fork 只带折叠上下文、不带 ledger/gate）+ REPL/TUI `/btw` + `btw.forked` 契约 + `SetBtwPromoteHook` 埋点（未实现生成，护栏钉住）；fork 四面过滤、上下文上限 16 条/6000 字符（含工具参数）；v3-S1 挂账 5 项一并清 |
 | **v3-S3 工作流引擎 + tower 验证** | W1 能力包（哲学+agent_types+context_strategy+gates+grants）、**非强制**（W2 阶段=哲学非强制序列、W21 编排主 agent 自决框架不校验）；W3 slash/显式触发 → 哲学文本进 system prompt；W4 追加 loop 可组合；W14 代码扩展点**只有两处**（MilestoneHandler + 自定义上下文策略）；W19 **tower 作首个 workflow 包**（critic→reviewer 循环做成第一个包）；**v2 挂账随做随清**：V6 review-tip / V7 冲突预测的合并门禁接线、N2 重建窗口口径补齐、J19 账本生产者、v2-S1 硬边界事件驱动接线（gate receipt → MarkValidationPassed）、N1 邻居截断信号/N5 Tx 类型化 | workflow 包可挂可不挂（不挂零行为变化，酸测试）；tower 包跑通 critic→reviewer 里程碑（MilestoneHandler 实证）；合并门禁能拦"review 后又推一行"（V6 端到端）+ 冲突预测消费端就位；07 挂账注记同步 | **✅ 完成（2026-01-29，评审循环至 clean——402 断供换通道，详见 07 注记）**：`core/workflow`（能力包+MilestoneHandler+Compose+加载校验）+ `core/workflow/tower`（W19 首包）+ `host/mergegate`（V6/V7 接线）+ J19 账本生产者（LoadLedger 跨 Run 保住关键字段）+ 硬边界 ValidationCursor + N2 重建恢复；**如实注记**：验证游标不跨进程；402 断供期间 reviewer/critic 通道失效，修复与终验经 code-coder 换通道完成并变异自证 |
 
+### v3-S4 · 协议面补全（施工切分，2026-01-30，来源：第三方 GUI 验收 ho_a83f7df3ef9e / REPORT.md G1–G10+A1–A5）
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **v3-S4 协议面补全** | 按 `D:\vscode\alasol-gui\REPORT.md` 分诊修复：**G4** hub.alert 过 bus（注释兑现：入库与 WS 广播一致）+ 告警环/事件流两口径文档化；**G3** 事件回放面（`GET /api/events?from&to&limit` 或 subscribe 支持 from_seq 补发——二选一你定）；**G1** 对话/审批端点（**兑现 transport 契约承诺**的 `command.submit`/`approval.request`/`approval.respond`——HTTP/WS 至少一面对话发起+审批应答端到端）；**G6** Worktree json tag（snake_case 对齐全仓）；**G7** API 前缀显式 405（方法不符不再报"静态资源"）；**G8** subscribe ack 回执（生效过滤条件）；**G9** TransportMessage.id 语义写进契约（或给示例值）；**G5/A1/A3/A5** 口径文档（前端须同源/代理、/api/sessions 计数口径、告警时间字段口径、分页游标口径）；**G2** serve 定位口径统一（文档化"观察+协调 daemon"：托管型写面要求本进程托管、协调型写面（merge.*）直查库；**跨进程托管注册记 v4 不做**）；G10（派活 handoff 笔误）记账不修 | G4：WS 实时收到 hub.alert 且与入库一致；G3：断线后按 seq 补读回放无空洞；G1：协议面发 prompt→跑一轮→审批应答端到端（WS 事件可见）；G6/G7/G8/G9 各有回归钉住；口径文档齐（transport/host doc）；评审循环 clean；07 注记同步 |
+
 ---
 
 
