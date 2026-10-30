@@ -15,6 +15,7 @@ import (
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agentlink"
+	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
@@ -90,6 +91,12 @@ type Hub struct {
 	mcpManager *mcp.Manager
 	// workflows 是 v3-S3 工作流能力包注册表（W1：内建 tower + Config.WorkflowDir 目录加载）。
 	workflows *workflow.Registry
+	// agentTypes 是 v3-S6-B 的 agent 类型注册表（W5：内建五类 + TOML 自定义，同名覆盖内建）。
+	// **只在 MultiAgent=true 时建**（host.New；关 = 不建不校验 = 零行为变化，见 New 的装配处）。
+	// 开了时坏配置启动即拒并点名。agentTypeIDs 是已注册类型 id 的有序列表（root 类型的
+	// CanSpawn 用它 = 全部已注册类型）。MultiAgent=false 时两者都是 nil/空。
+	agentTypes   *agents.TypeRegistry
+	agentTypeIDs []string
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
@@ -121,6 +128,10 @@ type Hub struct {
 	mu sync.Mutex
 	// loops：session → Loop（一个 session 一个 loop）。
 	loops map[contracts.Ulid]*loop.Loop
+	// agentTrees：session → agent 树（v3-S6-B，MultiAgent 开才建；与 loops 同生命周期）。
+	// 树是 session 的**活状态**：workflow 激活失效 loop 时树**保留**（只 delete loops，不 delete
+	// agentTrees——否则续跑/重新装配 loop 会丢掉已派生的子 agent）。仅 h.mu 下读写。
+	agentTrees map[contracts.Ulid]*agents.Tree
 	// specs：session → 归属（CreateSession 登记；自动 gate 的输入）。
 	specs map[contracts.Ulid]SessionSpec
 	// mainAgents：session → 主 agent id（loop 建成时登记；gate.joined 的 envelope 要用）。
@@ -253,6 +264,21 @@ func New(cfg Config) (*Hub, error) {
 			Source: contracts.RuleSourceCli,
 		})
 	}
+	// v3-S6-B：开 MultiAgent 时自动补 spawn/complete 的 allow 规则（source=cli/auto_multi_agent，
+	// 未知来源 = 优先级最低）。为什么必须补：spawn/complete 是**框架内部工具**，用户 Allow 列表
+	// 里通常没有它们 → 策略 deny → 模型不可见（toolVisible）→ 主 agent 根本派不出子 agent。
+	// 开了 multi_agent = **预期主 agent 能 spawn**，故 hub 在此补上。策略链照走（P2-4）：
+	// 未知来源 allow 优先级最低，**任何来源的 deny 仍可拦**（deny 永远赢）——用户/项目/工作流的
+	// 显式 deny 不受自动 allow 影响。默认关（MultiAgent=false）= 不补 = 单 agent 模式零行为变化。
+	if cfg.MultiAgent {
+		for _, name := range []string{loop.ToolSpawn, loop.ToolComplete} {
+			rules = append(rules, contracts.PolicyRule{
+				Effect: contracts.EffectAllow,
+				Tool:   name,
+				Source: contracts.RuleSource(multiAgentRuleSource),
+			})
+		}
+	}
 	eng := policy.New(rules...)
 
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
@@ -379,6 +405,24 @@ func New(cfg Config) (*Hub, error) {
 		return nil, fmt.Errorf("host: 装配工作流注册表: %w", wferr)
 	}
 
+	// agent 类型注册表（v3-S6-B，W5）：内建五类 + TOML 自定义（同名覆盖内建）。
+	//
+	// **只在 MultiAgent=true 时建**（F2 修）：MultiAgent=false = 单 agent 模式**零行为变化**
+	// ——不建注册表、**也不校验**（关 = 不建不校验：坏配置不许拒绝一个根本用不到它的宿主
+	// 启动）。开了才 fail-close：坏配置启动即拒并点名（与工作流注册表同一纪律）。
+	// 返回的 agentTypeIDs 是已注册类型 id 的有序列表（root 类型的 CanSpawn = 全部已注册类型）。
+	var (
+		agentTypes   *agents.TypeRegistry
+		agentTypeIDs []string
+	)
+	if cfg.MultiAgent {
+		reg, ids, aterr := buildAgentTypeRegistry(cfg.Model, cfg.AgentTypes)
+		if aterr != nil {
+			return nil, fmt.Errorf("host: 装配 agent 类型注册表: %w", aterr)
+		}
+		agentTypes, agentTypeIDs = reg, ids
+	}
+
 	h := &Hub{
 		cfg:               cfg,
 		store:             st,
@@ -405,6 +449,9 @@ func New(cfg Config) (*Hub, error) {
 		sandbox:           sbEnv,
 		mcpManager:        mcpMgr,
 		workflows:         workflows,
+		agentTypes:        agentTypes,
+		agentTypeIDs:      agentTypeIDs,
+		agentTrees:        make(map[contracts.Ulid]*agents.Tree),
 		lifeCtx:           lifeCtx,
 		lifeCancel:        lifeCancel,
 	}
@@ -646,22 +693,62 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		h.mu.Unlock()
 		return lp, nil
 	}
-	agentID, ok := h.disc.PrimaryAgent(sessionID)
-	if !ok {
-		// 新 session（事件流里还没有它）→ 新主 agent。续跑的 session 复用原来的 id
-		// （与 durable.PrimaryAgentID 同口径），不造"幽灵 agent"。
-		//
-		// 取之前先把事件流扫到最新：session 原属**另一个 hub 进程**时（共享事件库），
-		// 本地水位可能还没追上它的历史，那就该先扫——否则会退化成新 id。
-		if _, serr := h.discFeed.catchUp(ctx); serr != nil {
-			hubLog.Warn("host: 取主 agent 前扫事件流失败（退化成一个新 agent id）",
-				"session_id", string(sessionID), "err", serr.Error())
+	// 主 agent id 的解析顺序（v3-S6-B F1 修）：**已登记 → 事件流 → 新造**。
+	//
+	//  ① h.mainAgents[sessionID]（本进程已落定的主 agent id）——**最优先**；
+	//  ② disc.PrimaryAgent（事件流口径：续跑复用原 id，与 durable.PrimaryAgentID 同口径）；
+	//  ③ 新造 ULID（全新 session）。
+	//
+	// **同源口径（收窄，F2）**：**树 root ≡ h.mainAgents ≡ loop.AgentID**——**本进程内**恒同源
+	// （树 root 在建树那刻固定；loop 重建时先查 mainAgents → 拿回同一个 id）。
+	// 但**事件流归属**只在"一库一 hub"拓扑下同源：共享事件库的**多写者**拓扑下，
+	// 事件流口径的主 agent（disc.PrimaryAgent）可能 ≠ 本进程钉住的 id → 本进程写的
+	// 事件归属与事件流整体口径**分叉**（下面会打一条 Warn，别静默）。
+	//
+	// 为什么 ① 必须最优先（F1 的病根）：agent 树是 **session 活状态**（建了就一直复用），
+	// 它的 root 在**建树那一刻**就固定成了当时的 agentID；而 loop 每次重建都会重算
+	// agentID。session 还没有事件时（新建 session 尚未跑过 / loop 被失效后还没跑过）
+	// disc.PrimaryAgent 查不到 → 重算出一个**新** id → 与树 root 漂移 →
+	// 主 agent 静默失去 spawn 工具（visibleTools 查不到节点 → 不注入 spawn）、
+	// spawn 必被 ErrParentNotFound 拒、GET agents 的 root.agent_id 也与事件流不一致。
+	// 先取"已登记的稳定 id"，树 root ≡ loop.AgentID（**本进程内**）就恒同源。
+	agentID, ok := h.mainAgents[sessionID]
+	if ok {
+		// ① 命中：**不复核** disc.PrimaryAgent 的取值（顺序不能改——改回事件流优先会把上一轮
+		// F1 的 spawn 失效放回来），但**复核它是否已知且不等**：不等 = 事件流口径与本进程
+		// 钉住的 id 分叉（共享事件库多写者拓扑）→ 打一条 Warn（可观测，别静默）。
+		// 只有"已知且不等"才告警：查不到 = 事件流里还没有该 session 的主 agent（新 session /
+		// 尚未扫到），那不是分叉。
+		if streamID, sok := h.disc.PrimaryAgent(sessionID); sok && streamID != agentID {
+			hubLog.Warn("host: 主 agent id 与事件流口径分叉（本进程钉住的 id ≠ 事件流口径："+
+				"共享事件库的多写者拓扑；本进程的事件归属 = 钉住的 id）",
+				"session_id", string(sessionID), "pinned", string(agentID), "stream", string(streamID))
 		}
+	} else {
 		agentID, ok = h.disc.PrimaryAgent(sessionID)
 		if !ok {
-			agentID = core.NewUlid()
+			// 新 session（事件流里还没有它）→ 新主 agent。续跑的 session 复用原来的 id
+			// （与 durable.PrimaryAgentID 同口径），不造"幽灵 agent"。
+			//
+			// 取之前先把事件流扫到最新：session 原属**另一个 hub 进程**时（共享事件库），
+			// 本地水位可能还没追上它的历史，那就该先扫——否则会退化成新 id。
+			if _, serr := h.discFeed.catchUp(ctx); serr != nil {
+				hubLog.Warn("host: 取主 agent 前扫事件流失败（退化成一个新 agent id）",
+					"session_id", string(sessionID), "err", serr.Error())
+			}
+			agentID, ok = h.disc.PrimaryAgent(sessionID)
+			if !ok {
+				agentID = core.NewUlid()
+			}
 		}
 	}
+	// 登记主 agent id（**建树之前**，F1）：树 root 与 loop.AgentID 都从它来 → 恒同源。
+	// 早于建树登记，是为了让"树已建但 loop 建成失败"的下一次 loopFor 也拿同一个 id
+	// （否则那次失败会留下一个 root 与 loop.AgentID 漂移的树）。
+	if h.mainAgents == nil {
+		h.mainAgents = make(map[contracts.Ulid]contracts.Ulid) // 字面量构造的 Hub（内部测试）兜底
+	}
+	h.mainAgents[sessionID] = agentID
 	// 激活的工作流（W12：归属 session；调用方持 h.mu）：有 → 哲学文本进 system prompt（W3），
 	// 且按其声明的 context_strategy 收敛策略 kind（W6）。未激活 = 用宿主默认（零行为变化）。
 	system := h.workflowSystemForLocked(sessionID)
@@ -670,6 +757,23 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	if err != nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
+	}
+	// v3-S6-B：MultiAgent 开 → 每 session 一棵 agent 树（root=主 agent id，续跑复用）+ 把
+	// loop.Agents 接进 loop.Config（spawn/complete 对模型可见、子 agent 可派生、W6-A 子策略钩子）。
+	// 关（默认）= agentsEnv 留 nil → loop.New 收 nil = 单 agent 模式零行为变化（酸测试）。
+	// 树是 session 活状态：已建则复用（workflow 激活只 delete loops、不 delete agentTrees，
+	// 见 activateWorkflow）——续跑/重新装配 loop 不丢已派生的子 agent。
+	var agentsEnv *loop.Agents
+	if h.cfg.MultiAgent {
+		tree := h.agentTreeForLocked(sessionID, agentID)
+		agentsEnv = &loop.Agents{
+			Tree: tree,
+			// Verifier：summary refs 核验器（K24/Q7）。宿主暂无生产实现 → nil = 不核验
+			//（refs 原样保留；要核验在后续挂 agents.RefVerifier 实现）。
+			Verifier: nil,
+			// W6-A 子策略钩子：按子类型显式声明的 context_strategy 造 per-Run 工厂（绑 child.ID）。
+			ChildStrategy: h.childStrategyFactory(sessionID),
+		}
 	}
 	lp, err := loop.New(loop.Config{
 		Provider:        h.provider,
@@ -694,13 +798,14 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		ContextStrategy: strategy,
 		// goal ledger 更新工具（J19/X6；opt-in，默认关 = 零行为变化）。
 		GoalLedger: h.cfg.GoalLedger,
+		// 多 agent 环境（v3-S6-B；nil = 单 agent 模式默认）。见上面的 agentsEnv 装配。
+		Agents: agentsEnv,
 	})
 	if err != nil {
 		h.mu.Unlock()
 		return nil, fmt.Errorf("host: 为 session %s 建 loop: %w", sessionID, err)
 	}
 	h.loops[sessionID] = lp
-	h.mainAgents[sessionID] = agentID
 	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
 	autoDone := h.autoGates[sessionID]
 	h.mu.Unlock()
@@ -724,6 +829,37 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 // 不登记工作目录 → 自动 gate 用 hub 级默认。要按 session 指定归属（多 worktree）用
 // CreateSession。
 func NewSession() contracts.Ulid { return core.NewUlid() }
+
+// agentTreeForLocked 取（或建）某 session 的 agent 树（v3-S6-B）。**调用方须持 h.mu**。
+//
+// root = 该 session 的主 agent id（WithRootID：续跑复用同一个 id，与 loop 的 AgentID 对齐）。
+// 树是 session 活状态：已建则**复用**（不重建——重建会丢掉已派生的子 agent；workflow 激活
+// 只失效 loop、不失效树，重新装配 loop 时走这里取回同一棵树）。
+//
+// **不变式（F1，收窄口径见 F2）**：**树 root ≡ h.mainAgents 登记值 ≡ loop.AgentID**——
+// **本进程内**恒同源。树 root 在建树那一刻固定，loop 却会重建；
+// 故 loopFor 取 agentID 时**先查 h.mainAgents**（已登记的稳定 id），不让"重建 loop"
+// 重新算出另一个 id（漂移 → 主 agent 静默失去 spawn 工具 + spawn 被 ErrParentNotFound 拒
+// + GET agents 的 root.agent_id 与事件流不一致）。
+//
+// **事件流归属**只在一库一 hub 拓扑下与上面三者同源：共享事件库的**多写者**拓扑下，
+// 事件流口径的主 agent 可能 ≠ 本进程钉住的 id（此时 loopFor 会打一条 Warn，见上）。
+func (h *Hub) agentTreeForLocked(sessionID, agentID contracts.Ulid) *agents.Tree {
+	if h.agentTrees == nil {
+		h.agentTrees = make(map[contracts.Ulid]*agents.Tree)
+	}
+	if t, ok := h.agentTrees[sessionID]; ok {
+		return t
+	}
+	t := agents.NewTree(
+		h.rootAgentType(),
+		agents.WithRootID(agentID),                       // root = 主 agent id（续跑复用）
+		agents.WithTypes(h.agentTypes),                   // 类型注册表（内建五类 + TOML 自定义）
+		agents.WithMaxDepth(agents.DefaultMaxAgentDepth), // 3 = 两级委派（K17）
+	)
+	h.agentTrees[sessionID] = t
+	return t
+}
 
 // contextBudgetFor 是 context.assembled 的 tokens_budget 分母（占比口径，J21）。
 //

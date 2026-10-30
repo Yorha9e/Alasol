@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/Yorha9e/alasol/contracts"
 )
 
 // writeConfig 把一个 TOML 文本写到临时文件并返回路径。
@@ -446,6 +448,118 @@ func mustContainErr(t *testing.T, err error, want string) {
 	}
 	if !strings.Contains(err.Error(), want) {
 		t.Fatalf("错误信息不含 %q：%v", want, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 未知键 fail-close（F3）：TOML 会**静默忽略**没被结构体认领的键
+// ---------------------------------------------------------------------------
+
+// TestLoadFileConfigUnknownKeyFailsClosed（F3 钉子）：写错段位的键**当场点名报错**。
+//
+// 活例子：share_project_assets 是 [[agent_types]] 的**顶层**字段，用户写进
+// [agent_types.context_strategy]（那张表只有 kind）→ TOML 静默忽略 → 配了 true 却毫无
+// 效果，用户以为配了。故装载期 fail-close（与"坏配置当场拒"同一纪律）。
+func TestLoadFileConfigUnknownKeyFailsClosed(t *testing.T) {
+	p := writeConfig(t, `
+model = "m"
+
+[[agent_types]]
+id = "auditor"
+
+[agent_types.context_strategy]
+kind = "tiered"
+share_project_assets = true
+`)
+	fc, err := LoadFileConfig(p)
+	if err == nil {
+		t.Fatalf("未知键应被拒（fail-close），得到 config: %+v", fc)
+	}
+	if fc != nil {
+		t.Fatalf("出错时不应返回 config: %+v", fc)
+	}
+	if !strings.Contains(err.Error(), "share_project_assets") {
+		t.Errorf("错误应点名未知键 share_project_assets: %v", err)
+	}
+}
+
+// TestLoadFileConfigUnknownKeyErrorListsLegalKeys（F3 补的钉子）：未知键的报错**带合法键
+// 清单**——闸门本身保留（"老配置升级即拒"是既定口径），但排查成本要降：只列坏键的话，
+// 用户还得自己翻文档才知道**能写什么**。
+//
+// 断言两处清单：① 顶层合法键（含 base_url / model / multi_agent …）；② 坏键**所在那张表**
+// 的合法键（"写错段位"这类误配最需要的提示：share_project_assets 写进了
+// [agent_types.context_strategy]，那张表只有 kind）。
+func TestLoadFileConfigUnknownKeyErrorListsLegalKeys(t *testing.T) {
+	p := writeConfig(t, `
+model = "m"
+
+[[agent_types]]
+id = "auditor"
+
+[agent_types.context_strategy]
+kind = "tiered"
+share_project_assets = true
+`)
+	_, err := LoadFileConfig(p)
+	if err == nil {
+		t.Fatal("未知键应被拒（fail-close）")
+	}
+	msg := err.Error()
+	// ① 顶层合法键清单（点几个代表键即可，不必把整张清单钉死——清单本身是反射派生的）。
+	for _, want := range []string{"合法键", "base_url", "model", "multi_agent", "agent_types"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误信息应含顶层合法键提示 %q: %v", want, err)
+		}
+	}
+	// ② 坏键所在那张表的合法键（context_strategy 表只有 kind）。
+	if !strings.Contains(msg, "kind") {
+		t.Errorf("错误信息应含坏键所在表的合法键（kind）: %v", err)
+	}
+	// ③ 坏键仍要点名（闸门本体没被削弱）。
+	if !strings.Contains(msg, "share_project_assets") {
+		t.Errorf("错误信息应点名未知键 share_project_assets: %v", err)
+	}
+}
+
+// TestLoadFileConfigAgentTypesTopLevelKeys：段位写对的键**正常解析**（未知键 fail-close
+// 不许误伤合法配置）。
+func TestLoadFileConfigAgentTypesTopLevelKeys(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+multi_agent = true
+
+[[agent_types]]
+id = "auditor"
+prompt = "你是审计员"
+tools = ["read"]
+model = "default"
+can_spawn = ["observer"]
+share_project_assets = true
+
+[agent_types.permission_request]
+read = "workspace"
+write = "none"
+exec = "none"
+
+[agent_types.context_strategy]
+kind = "tiered"
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if !fc.MultiAgent {
+		t.Error("multi_agent 应解析为 true")
+	}
+	if len(fc.AgentTypes) != 1 {
+		t.Fatalf("应有 1 条 agent_types，得到 %d", len(fc.AgentTypes))
+	}
+	at := fc.AgentTypes[0]
+	if at.ID != "auditor" || at.ShareProjectAssets == nil || !*at.ShareProjectAssets {
+		t.Errorf("agent_types 顶层字段解析错: %+v", at)
+	}
+	if at.ContextStrategy == nil || at.ContextStrategy.Kind != string(contracts.ContextStrategyKindTiered) {
+		t.Errorf("agent_types.context_strategy 解析错: %+v", at.ContextStrategy)
 	}
 }
 

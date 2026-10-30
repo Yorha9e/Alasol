@@ -10,7 +10,7 @@
 
 | # | 项 | 内容 | 对应 07 | 状态 |
 |---|---|---|---|---|
-| 1 | **v3-S6 subagent 产品化** | host 装配 agent_type 注册表（内建 **planner/coder/critic/reviewer/observer** 五类 + TOML 自定义）→ `loop.Config.Agents` 接线 → spawn/complete 对模型可见（三闸门+策略链既有）→ 协议面/GUI agent 树真能派活。**W6 方案 A**：agent_type 显式声明 context_strategy，未声明=append 默认（**不继承主 agent**）；项目级资产（rules/常识区）作显式共享开关。K20：observer=只读型（spawn 权限只收窄）。W12：归属 session+父 agent。验收=里程碑部件（W7） | W5/W6/W7/W11/W12/W13/W15(部分)/W18/W9b/K20/R8/H22/H23 | **下一刀（施工索引已备）** |
+| 1 | **v3-S6 subagent 产品化** | host 装配 agent_type 注册表（内建 **planner/coder/critic/reviewer/observer** 五类 + TOML 自定义）→ `loop.Config.Agents` 接线 → spawn/complete 对模型可见（三闸门+策略链既有）→ 协议面/GUI agent 树真能派活。**W6 方案 A**：agent_type 显式声明 context_strategy，未声明=append 默认（**不继承主 agent**）；项目级资产（rules/常识区）作显式共享开关。K20：observer=只读型（spawn 权限只收窄）。W12：归属 session+父 agent。验收=里程碑部件（W7） | W5/W6/W7/W11/W12/W13/W15(部分)/W18/W9b/K20/R8/H22/H23 | **✅ 完成（2026-10-31，v3-S6-A+B，评审循环至 clean）**；挂账：/btw fork 不装配 agent 树（→ 本表第 7 项旁支收口） |
 | 2 | **SSH 远程适配** | 预留接口 + 适配层（远程控制 harness 机器）；鉴权交系统。含 K19 跨机 | N4b/N5/K19 | 排期 |
 | 3 | **blob + 向量（RAG）** | G2e blob 实现（接口已立、`BlobMeta.Ref` 挂接点已备）→ G2d 向量/RAG（Retriever 保留位） | G2e/G2d | 排期 |
 | 4 | **预算与重试补完** | W15 完整预算功能（成本上限等）+ M6（provider 级小重试+通用重试组件） | W15/M6 | 排期 |

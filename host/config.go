@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/discovery"
@@ -224,6 +225,25 @@ type Config struct {
 	//
 	// 可配：cmd 侧 `-prompt-timeout <秒>`（0 = 用默认 600）。
 	PromptRunTimeoutSec int
+
+	// ---- v3-S6-B 多 agent 装配（W5：内建五类 + TOML 自定义；opt-in）----
+	//
+	// MultiAgent 是否给每个 session 装一棵 agent 树 + 把 loop.Agents 接进 loop.Config
+	// （spawn/complete 对模型可见、子 agent 可派生）。**默认 false = 单 agent 模式零行为变化**
+	// （酸测试）：不建树、不传 Agents、不自动补 allow 规则——已有装配（cmd/alasol 未改
+	// multi_agent）与单测完全不受影响。只有显式开（TOML `multi_agent = true`）才走装配。
+	//
+	// 开 multi_agent = **预期主 agent 能 spawn**：hub 装配策略时会自动补两条 allow 规则
+	// （spawn / complete，source=cli/auto_multi_agent，优先级最低）让这两个框架工具对模型
+	// 可见；策略链照走——**deny 规则仍可拦**（P2-4：deny 永远赢，用户/项目/工作流的显式
+	// deny 不受自动 allow 影响）。子 agent 的 spawn 三闸门（深度/类型/权限）在 core 运行时强制。
+	MultiAgent bool
+	// AgentTypes 是**用户自定义**的 agent 类型（TOML `[[agent_types]]` 装载，W5 扩展点）。
+	// 与内建五类（planner/coder/critic/reviewer/observer）合并进同一个类型注册表；
+	// **同名冲突时 TOML 覆盖内建**（用户自定义优先，见 host/agenttypes.go 的装配）。
+	// **只在 MultiAgent=true 时生效**：关 = 不建注册表、**也不校验**（零行为变化——用一个
+	// 根本用不到的扩展点不许拒绝宿主启动；口径见 host/hub.go 的 New 装配处）。
+	AgentTypes []contracts.AgentType
 }
 
 // validate 校验并归一化配置。

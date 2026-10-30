@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/runtime/mcp"
 )
 
@@ -71,6 +73,89 @@ type FileConfig struct {
 	WorkflowDir string `toml:"workflow_dir"`
 	// GoalLedger 是否给 session 注入 goal ledger 更新工具（J19/X6；默认 false = 零行为变化）。
 	GoalLedger bool `toml:"goal_ledger"`
+
+	// MultiAgent 是否给每个 session 装配 agent 树 + loop.Agents（v3-S6-B，W5；默认 false =
+	// 单 agent 模式零行为变化）。开了才建树/传 Agents/spawn 对模型可见（并自动补 spawn/complete
+	// 的 allow 规则）。语义与 host.Config.MultiAgent 一致（这里是它的文件配置面）。
+	MultiAgent bool `toml:"multi_agent"`
+	// AgentTypes 用户自定义 agent 类型（v3-S6-B，W5 扩展点；TOML 数组表 [[agent_types]]）。
+	// 与内建五类（planner/coder/critic/reviewer/observer）合并进同一类型注册表，**同名覆盖内建**
+	// （用户自定义优先）。**只在 MultiAgent=true 时生效**（关 = 不建注册表、**不校验** =
+	// 零行为变化）。装载期 fail-close（仅 MultiAgent 开时）：id 空/重名/**保留名(root)**、
+	// can_spawn 悬空/自环/成环、permission 级别非法、context_strategy.kind 越枚举 → 启动即拒并点名。
+	AgentTypes []AgentTypeFileConfig `toml:"agent_types"`
+}
+
+// AgentTypeFileConfig 是一个**用户自定义** agent 类型的文件级声明（[[agent_types]] 的元素，
+// v3-S6-B / W5）。
+//
+// 形如：
+//
+//	[[agent_types]]
+//	id = "auditor"                         # 必填；类型 id（唯一；同名覆盖内建五类）
+//	prompt = "你是 auditor：……"             # 该类型的 system 提示
+//	tools = ["read", "write", "bash"]      # 工具白名单（R5：不列即不可见）；框架工具 recall/stage/ledger 亦可列
+//	model = "default"                       # 模型绑定（default = 用主模型）
+//	can_spawn = ["observer"]               # 可派生的子类型 id（空 = 叶子；K20）
+//	share_project_assets = false            # W6-A：true = 该类型子 agent 装配 tiered 时注入项目规则（rules）；**顶层字段**
+//
+//	[agent_types.permission_request]        # 权限请求（H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予）
+//	read = "workspace"                      # none | workspace | full
+//	write = "none"
+//	exec = "none"
+//
+//	[agent_types.context_strategy]          # W6-A：本类型子 agent 的上下文策略（显式声明，不继承主 agent）
+//	kind = "tiered"                         # append | stage_scoped | sliding_window | tiered
+//
+// 注意（段位别写错）：**share_project_assets 是 [[agent_types]] 的顶层字段**，不是
+// [agent_types.context_strategy] 下的键（那张表只有 kind）——写错段位时 TOML 解析器会
+// **静默忽略**它（配了 true 却被无声吞掉）。故装载期对**未知键** fail-close 点名
+// （见 LoadFileConfig）。
+//
+// 口径：
+//  1. **只走文件配置面**（结构化数据，不给 flag——与 [[mcp.servers]] 同款纪律）；
+//  2. **deny-all 默认 + R5 白名单**：声明了类型只是"可被派生"，工具能不能调还要策略链放行
+//     + 类型 tools 白名单双重同意；
+//  3. **宿主只实现 tiered**：context_strategy.kind = stage_scoped / sliding_window 可装载，
+//     但 spawn 时宿主的 ChildStrategy 钩子对未实现的 kind 返回 nil 工厂 → core fail-close
+//     收口成 agent.failed（不静默降级成 append）；
+//  4. **context_strategy 不带 params**：tiered 的 window/l1_pct/l2_pct 走宿主配置面
+//     （[context_strategy] / host.Config），类型级 params 契约字段宿主尚未逐字段接线。
+type AgentTypeFileConfig struct {
+	// ID 类型 id（必填；唯一；同名覆盖内建五类）。
+	ID string `toml:"id"`
+	// Prompt 该类型的 system 提示（W5 用户可自定义）。
+	Prompt string `toml:"prompt"`
+	// Tools 工具白名单（R5：不列即不可见）。注册表工具名 read/write/bash + MCP 前缀工具，
+	// 框架工具 recall/stage/ledger 亦可列。
+	Tools []string `toml:"tools"`
+	// Model 模型绑定（default = 用主模型；空 = 继承主模型，见 core/loop buildChildLoop 兜底）。
+	Model string `toml:"model"`
+	// CanSpawn 可派生的子类型 id（空 = 叶子；K20 只读型叶子更深层在类型层面不可达）。
+	CanSpawn []string `toml:"can_spawn"`
+	// PermissionRequest 权限请求（H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予；nil = 未请求 = 全 none）。
+	PermissionRequest *PermissionRequestFileConfig `toml:"permission_request"`
+	// ContextStrategy 本类型子 agent 的上下文策略（W6-A：显式声明，不继承主 agent；nil = append 默认）。
+	ContextStrategy *ContextStrategyDeclFileConfig `toml:"context_strategy"`
+	// ShareProjectAssets 项目级资产（rules）共享开关（W6-A；nil = false = 不共享）。
+	// true = 该类型子 agent 装配 tiered 时注入项目规则（host.Config.ContextRules）。
+	ShareProjectAssets *bool `toml:"share_project_assets"`
+}
+
+// PermissionRequestFileConfig 是权限请求的文件级声明（[agent_types.permission_request]）。
+type PermissionRequestFileConfig struct {
+	// Read 读维度：none | workspace | full。
+	Read string `toml:"read"`
+	// Write 写维度：none | workspace | full。
+	Write string `toml:"write"`
+	// Exec 执行维度：none | allowlist | full。
+	Exec string `toml:"exec"`
+}
+
+// ContextStrategyDeclFileConfig 是上下文策略声明的文件级形状（[agent_types.context_strategy]）。
+type ContextStrategyDeclFileConfig struct {
+	// Kind 策略种类：append | stage_scoped | sliding_window | tiered（装载期枚举校验）。
+	Kind string `toml:"kind"`
 }
 
 // MCPFileConfig 是 MCP client 的文件级配置（v3-S1）。
@@ -213,6 +298,60 @@ func copyEnvMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// AgentTypeConfigs 把文件级 [[agent_types]] 声明折成 []contracts.AgentType（host.Config.AgentTypes
+// 的**唯一来源**，v3-S6-B / W5）。
+//
+// 只做搬运 + 两件归一化（不校验——校验在 host/agenttypes.go 的注册表装配期 fail-close）：
+//  1. **权限空字段 → none**：使用者写了 [agent_types.permission_request] 却只填 read 时，
+//     write/exec 留空 = "没授予" → 归一成 none（least privilege）。若原样留空串，permSubset
+//     会按"未知级别 = 最严（rank 3）"处理，反而让该类型永远派不出来——那不是使用者的本意；
+//  2. **context_strategy / share_project_assets 指针**：nil = 未声明（append 默认 / 不共享），
+//     显式声明才造指针（区分"没写"与"写了 false"）。
+//
+// 深拷贝切片（Tools / CanSpawn）：不共享底层数组，防调用方改到配置内部（与 MCPConfig 同纪律）。
+func (c FileConfig) AgentTypeConfigs() []contracts.AgentType {
+	if len(c.AgentTypes) == 0 {
+		return nil
+	}
+	out := make([]contracts.AgentType, 0, len(c.AgentTypes))
+	for _, at := range c.AgentTypes {
+		ct := contracts.AgentType{
+			ID:       at.ID,
+			Prompt:   at.Prompt,
+			Tools:    append([]string(nil), at.Tools...),
+			Model:    at.Model,
+			CanSpawn: append([]string(nil), at.CanSpawn...),
+		}
+		if at.PermissionRequest != nil {
+			ct.PermissionRequest = &contracts.PermissionRequest{
+				Read:  contracts.ReadWriteLevel(permLevelOrNone(at.PermissionRequest.Read)),
+				Write: contracts.ReadWriteLevel(permLevelOrNone(at.PermissionRequest.Write)),
+				Exec:  contracts.ExecLevel(permLevelOrNone(at.PermissionRequest.Exec)),
+			}
+		}
+		if at.ContextStrategy != nil {
+			ct.ContextStrategy = &contracts.ContextStrategy{
+				Kind: contracts.ContextStrategyKind(strings.TrimSpace(at.ContextStrategy.Kind)),
+			}
+		}
+		if at.ShareProjectAssets != nil {
+			v := *at.ShareProjectAssets
+			ct.ShareProjectAssets = &v
+		}
+		out = append(out, ct)
+	}
+	return out
+}
+
+// permLevelOrNone 把权限级别归一化：空（trim 后）= none（least privilege）；其余原样返回
+// （合法性由 host/agenttypes.go 的装载期校验判——这里不静默改写用户写的值）。
+func permLevelOrNone(v string) string {
+	if s := strings.TrimSpace(v); s != "" {
+		return s
+	}
+	return string(contracts.ReadWriteLevelNone)
 }
 
 // GraphFileConfig 是图投影的文件级配置（v2-S2）。
@@ -373,6 +512,16 @@ func DefaultConfigPath() (string, error) {
 // 文件**不存在** → (nil, nil)（"没有配置文件"是合法状态，不是错误：新用户本就没有）。
 // 文件存在但解析失败 → error（fail-close：损坏的配置可能正是用户指望的默认值/凭据来源，
 // 静默忽略会让行为与预期不符，宁可明确报错）。
+//
+// **未知键 fail-close（F3）**：TOML 解析器对没被结构体认领的键是**静默忽略**——用户把
+// share_project_assets 写进 [agent_types.context_strategy]（那张表只有 kind）就是这样被
+// 无声吞掉的：配了 true 却毫无效果，用户以为配了。故装载期点名报错（与"坏配置当场拒"
+// 同一纪律）：错误信息只含**键名**，不回显键值（凭据安全）。
+//
+// **错误里带合法键清单（F3 补）**：闸门本身保留（"老配置升级即拒"是既定口径），但报错要
+// 给排查留路——只列坏键的话，用户还得自己去翻文档才知道**能写什么**。故错误里附：
+// ① 顶层合法键清单（反射派生，永不与结构体漂移）；② 坏键**所在那张表**的合法键
+// （点出"这张表只能写这些"——正是"写错段位"这类误配最需要的提示）；③ 嵌套表的位置指引。
 func LoadFileConfig(path string) (*FileConfig, error) {
 	p := strings.TrimSpace(path)
 	if p == "" {
@@ -390,11 +539,120 @@ func LoadFileConfig(path string) (*FileConfig, error) {
 		return nil, fmt.Errorf("host: 读配置文件 %s: %w", p, err)
 	}
 	var fc FileConfig
-	if err := toml.Unmarshal(data, &fc); err != nil {
+	md, err := toml.Decode(string(data), &fc)
+	if err != nil {
 		// 错误里**不含**配置内容（toml 的行号/键名足够定位，不回显值——凭据安全）。
 		return nil, fmt.Errorf("host: 解析配置文件 %s: %w", p, err)
 	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		tableHints := make([]string, 0, len(undecoded))
+		for _, k := range undecoded {
+			keys = append(keys, k.String())
+			if sub := legalKeysUnderUnknownKey([]string(k)); len(sub) > 0 {
+				tableHints = append(tableHints, fmt.Sprintf("%s 所在那张表的合法键：%s",
+					k.String(), strings.Join(sub, ", ")))
+			}
+		}
+		msg := fmt.Sprintf("host: 配置文件 %s 有未知键：%s（fail-close：TOML 会**静默忽略**没被认领的键"+
+			"——配了不生效比当场报错难排查得多；键名可能有拼写错误或写错了段位）",
+			p, strings.Join(keys, ", "))
+		msg += fmt.Sprintf("。合法键（顶层）：%s", strings.Join(legalFileConfigKeys(), ", "))
+		for _, hint := range tableHints {
+			msg += "。" + hint
+		}
+		msg += "（嵌套表键见 FileConfig 各表注释，如 [context_strategy]/[graph]/[sandbox]/[mcp]/[[agent_types]]）"
+		// errors.New（不是 fmt.Errorf）：msg 是拼出来的常量文本，里面可能含用户键名里的 %
+		// （TOML 允许带引号的键名含 %）——当格式串用会被 fmt 吃掉。
+		return nil, errors.New(msg)
+	}
 	return &fc, nil
+}
+
+// legalFileConfigKeys 返回 FileConfig 的**顶层合法键**清单（按结构体字段序）。
+//
+// **反射派生，不手抄**：手抄的清单迟早与结构体漂移（加了字段忘了改清单 = 又一个"配了
+// 不生效"的坑——正是这个闸门要治的病）。反射派生 = 永远与结构体一致。
+func legalFileConfigKeys() []string {
+	return tomlKeysOf(reflect.TypeOf(FileConfig{}))
+}
+
+// tomlKeysOf 列一个结构体类型的 toml 键（按字段序；跳过无 tag / "-" 的字段）。
+func tomlKeysOf(t reflect.Type) []string {
+	if t == nil || t.Kind() != reflect.Struct {
+		return nil
+	}
+	out := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("toml")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if name := strings.Split(tag, ",")[0]; name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// tomlFieldByName 按 toml 键名找结构体字段（找不到 → false）。
+func tomlFieldByName(t reflect.Type, name string) (reflect.StructField, bool) {
+	if t == nil || t.Kind() != reflect.Struct {
+		return reflect.StructField{}, false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("toml")
+		if tag == "" || tag == "-" {
+			continue
+		}
+		if strings.Split(tag, ",")[0] == name {
+			return f, true
+		}
+	}
+	return reflect.StructField{}, false
+}
+
+// legalKeysUnderUnknownKey 沿未知键的路径找到**它所在那一层**的合法键清单（找不到 → nil）。
+//
+// 路径 = TOML 的点分键（如 agent_types.context_strategy.share_project_assets）。逐段下钻
+// （数组表 → 元素类型；指针 → 元素类型）到**最后一段的父层**：
+//   - 最后一段**不在**那一层里 → 那层的合法键就是提示（"这张表只能写这些"）；
+//   - 最后一段**在**那一层里（写深了一层）→ 给**子表**的合法键（更贴近现场）。
+//
+// 顶层键（只有一段）→ nil：顶层清单错误信息里已给全，不重复。
+func legalKeysUnderUnknownKey(parts []string) []string {
+	if len(parts) < 2 {
+		return nil
+	}
+	cur := reflect.TypeOf(FileConfig{})
+	for _, part := range parts[:len(parts)-1] {
+		f, ok := tomlFieldByName(cur, part)
+		if !ok {
+			return nil
+		}
+		cur = f.Type
+		for cur.Kind() == reflect.Slice || cur.Kind() == reflect.Ptr {
+			cur = cur.Elem()
+		}
+		if cur.Kind() != reflect.Struct {
+			return nil
+		}
+	}
+	last := parts[len(parts)-1]
+	f, ok := tomlFieldByName(cur, last)
+	if !ok {
+		return tomlKeysOf(cur) // 键不在这一层 → 这一层的合法键
+	}
+	sub := f.Type
+	for sub.Kind() == reflect.Slice || sub.Kind() == reflect.Ptr {
+		sub = sub.Elem()
+	}
+	if sub.Kind() != reflect.Struct {
+		return nil
+	}
+	return tomlKeysOf(sub)
 }
 
 // Precedence 实现 H15 的取值优先级：**显式值（flag）> 环境变量 > 配置文件**。

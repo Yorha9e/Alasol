@@ -286,6 +286,9 @@ func (l *Loop) runSpawn(ctx context.Context, turn int, tc core.ToolCallReq, st *
 	if buildErr != nil {
 		childErr = buildErr
 	} else {
+		// W15：子 loop **同步跑在父的 Run ctx 里**（ctx 同源）——协议面的整轮预算
+		// （Config.PromptRunTimeoutSec → runPromptAsync 的 ctx 上界）因此**覆盖 spawn 子任务**：
+		// 父 ctx 取消/超时 → 子 loop 立刻收场（下面的 ctx 取消分支收口成 agent.failed）。
 		childRes, childErr = childLoop.Run(ctx, sa.Task)
 	}
 	events += childRes.Events
@@ -500,7 +503,12 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		System:     system,       // type.Prompt + task
 		SessionEnv: l.sessionEnv, // 同 session 注入域
 		MaxTurns:   l.maxTurns,   // 每层独立轮数上限（层数由深度闸门限制）
-		Agents:     l.agents,     // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
+		// W15（MaxTurns 先行）：子 loop 的 MaxTurns **透传**父的（l.maxTurns）——每层各自
+		// 受这份轮数上限约束，父跑满不等于子跑满（子的截断另行冒泡成 agent.failed）。这与
+		// 父 Run 的 ctx 同源（见 runSpawn：childLoop.Run(ctx, ...)）共同覆盖子任务：
+		// MaxTurns 管"子自己跑几轮"，ctx（对协议面 = Config.PromptRunTimeoutSec 的整轮预算）
+		// 管"整棵树共用的总时钟"——子 loop 同步跑在父的 Run ctx 里，父的 ctx 取消/超时即子的。
+		Agents: l.agents, // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
 		// W6-A：子策略来自类型声明（未声明 = nil = 追加式），**不抄** l.ctxStrategy
 		// （不继承主 agent——子上下文独立）。
 		ContextStrategy: strategy,

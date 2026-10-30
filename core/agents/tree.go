@@ -115,7 +115,10 @@ type Tree struct {
 	types    *TypeRegistry
 	nodes    map[contracts.Ulid]*node
 	root     contracts.Ulid
-	requests map[requestKey]contracts.Ulid // (父, spawn_request_id) → child id（X5 幂等键）
+	// rootIDOverride 是 WithRootID 指定的 root AgentID（空 = 未指定 → NewTree 自造）。
+	// 与 root 分开存：opts 在 root 落地**之前**应用，需要一个字段承接"调用方指定的 id"。
+	rootIDOverride contracts.Ulid
+	requests       map[requestKey]contracts.Ulid // (父, spawn_request_id) → child id（X5 幂等键）
 }
 
 // TreeOption 配置 Tree（默认值见 NewTree）。
@@ -140,10 +143,25 @@ func WithTypes(reg *TypeRegistry) TreeOption {
 	return func(t *Tree) { t.types = reg }
 }
 
-// NewTree 构造 agent 树并创建 root 节点（depth=1，AgentID = 新 ULID）。
+// WithRootID 指定 root 节点的 AgentID（v3-S6-B host 装配：hub 的主 agent id 来自 discovery，
+// 续跑复用同一个 id，树的 root 必须**等于**它——否则树的 root 与 loop 的 AgentID 对不上，
+// spawn 的 parentID=l.agentID 会落不到 root 上）。
 //
-// root 的有效权限 = rootType.PermissionRequest ∩ ceiling。root 的 AgentID 经 Root() 取得，
-// 调用方（loop）用它作为主 agent 的 AgentID。
+// 默认行为不变：**没传** WithRootID（或传入的 id 不是合法 ULID）时，NewTree 照旧自造一个
+// 新 ULID 作 root（向后兼容：core/loop 的测试、别的宿主仍走"NewTree 造 root"的老路）。
+func WithRootID(id contracts.Ulid) TreeOption {
+	return func(t *Tree) {
+		if core.ValidUlid(id) {
+			t.rootIDOverride = id
+		}
+	}
+}
+
+// NewTree 构造 agent 树并创建 root 节点（depth=1）。
+//
+// root 的 AgentID：传了 WithRootID(合法 ULID) → 用它（host 装配：等于主 agent id，续跑复用）；
+// 否则自造一个新 ULID（默认行为不变）。root 的有效权限 = rootType.PermissionRequest ∩ ceiling。
+// root 的 AgentID 经 Root() 取得，调用方（loop）用它作为主 agent 的 AgentID。
 func NewTree(rootType AgentType, opts ...TreeOption) *Tree {
 	t := &Tree{
 		maxDepth: DefaultMaxAgentDepth,
@@ -153,7 +171,10 @@ func NewTree(rootType AgentType, opts ...TreeOption) *Tree {
 	for _, o := range opts {
 		o(t)
 	}
-	rootID := core.NewUlid()
+	rootID := t.rootIDOverride
+	if !core.ValidUlid(rootID) {
+		rootID = core.NewUlid() // 未指定 / 非法 → 自造（默认行为不变）
+	}
 	t.root = rootID
 	t.nodes[rootID] = &node{
 		id:     rootID,

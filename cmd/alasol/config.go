@@ -153,6 +153,14 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		WorkflowDir: workflowDirValue(f, fc),
 		GoalLedger:  pickBoolFlag(f.explicitlySet("goal-ledger"), *f.goalLedger, fc.GoalLedger),
 
+		// 多 agent 装配（v3-S6-B，W5）：**只走文件配置面**（TOML `multi_agent` + `[[agent_types]]`，
+		// 不给 flag——与 [[mcp.servers]] 同款：结构化数据 + 默认关）。默认 false = 单 agent 模式
+		// 零行为变化（不建树、不传 Agents、**不校验 agent_types**、spawn/complete 不可见）。
+		// AgentTypes 经 FileConfig 折成 []contracts.AgentType（同名覆盖内建五类，
+		// host/agenttypes.go 装配；只在 MultiAgent 开时才建注册表并 fail-close 校验）。
+		MultiAgent: fc.MultiAgent,
+		AgentTypes: fc.AgentTypeConfigs(),
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),

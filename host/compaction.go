@@ -9,6 +9,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/runtime"
@@ -50,21 +51,40 @@ const defaultRecallReadLimit = 2000
 //
 // 参数面（F10）：W / L1% / L2% 全部来自宿主配置（TOML/CLI → host.Config → compaction.Params），
 // 不写死；规则文本（Config.ContextRules）也在这里注入（稳定前缀的一部分）。
+//
+// 主 agent 的策略工厂：**恒共享项目规则**（rules）+ 接**会话级验证游标**（跨 Run 接力）。
+// 委托给 tieredFactory 实现（与子 agent 的 ChildStrategy 钩子复用同一构造路径）。
 func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid, kind string) (compaction.AssemblerFactory, error) {
 	if strings.TrimSpace(kind) != contextStrategyTiered {
 		return nil, nil // append（默认）：非 tiered 一律 nil（=append）——见函数头"静默降级口径"
 	}
+	// 只在 tiered 时取会话级游标（避免给 append session 也建一个用不上的游标条目）。
+	return h.tieredFactory(sessionID, agentID, kind, true, h.validationCursorFor(sessionID))
+}
+
+// tieredFactory 是 tiered 策略工厂的**唯一构造路径**（主 agent 的 contextStrategyFactory 与
+// 子 agent 的 ChildStrategy 钩子共用）：组装 store/provider/bus 依赖成一个 per-Run 工厂。
+//
+// 参数：
+//   - sessionID / agentID：事件归属与 recall 视角隔离（storeTextSource{agentID} /
+//     busEmitter{agentID} 都按它走——主 agent 传自己的 id，子 agent 传 child.ID）；
+//   - shareRules：是否注入项目规则（Config.ContextRules）。主 agent 恒 true；子 agent 按
+//     childType.ShareProjectAssets（W6-A：false/未声明 = 不注入）；
+//   - cursor：会话级验证游标（跨 Run 接力）。主 agent 传会话游标；子 agent 传 nil（子只跑
+//     一次、同步，无跨 Run 接力需求，且避免子引擎推进共享游标让父引擎漏看会话级验证信号）。
+func (h *Hub) tieredFactory(sessionID, agentID contracts.Ulid, kind string, shareRules bool, cursor *compaction.ValidationCursor) (compaction.AssemblerFactory, error) {
+	if strings.TrimSpace(kind) != contextStrategyTiered {
+		return nil, nil // 宿主只实现 tiered；其余（含枚举内未实现的 stage_scoped/sliding_window）→ nil
+	}
 	params := h.cfg.contextStrategyParams()
 	rules := h.cfg.ContextRules
+	if !shareRules {
+		rules = "" // 子 agent 未开 share_project_assets → 不注入项目规则（W6-A）
+	}
 	// 先校验一次窗口（装配期就拒，别等到第一次 Run 才炸）。
 	if _, err := compaction.NewEngine(params, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
 	}
-	// 验证信号游标（v3-S3 修）：**session 级**持久一份，跨 Run 接力。
-	// tiered 引擎是 per-Run 的（每次 Run 造一个 fresh 引擎）——游标若只活在引擎里，
-	// 落在两次 Run 之间的验证信号（workflow.milestone passed=true 等）**永远看不见**
-	//（下一个 Run 会重新取基线，那一段再没人扫）。见 compaction.ValidationCursor。
-	cursor := h.validationCursorFor(sessionID)
 	return func() compaction.Assembler {
 		engine, err := compaction.NewEngine(
 			params,
@@ -79,14 +99,17 @@ func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid, kind str
 			return compaction.AppendAssembler{}
 		}
 		// 项目规则注入（F7：规则是稳定前缀的一部分，宿主装配面可注入）。
+		// **常识区注入留后续采集源**（SetCommonSense 目前无采集源——不硬造空注入）。
 		if rules != "" {
 			engine.SetRules(rules)
 		}
 		// 硬边界接线（v2-S1 挂账，J11）：让引擎自己观测事件流里的"验证通过"信号
 		// （gate.checked passed=true）并打出阶段硬边界——宿主/loop 不必穿透到 per-Run 引擎。
 		engine.SetValidationSignal(validationSignalSource{store: h.store, sessionID: sessionID})
-		// 验证游标接上**会话级**载体（v3-S3 修）：跨 Run 接力，Run 之间到达的验证信号不再丢。
-		engine.SetValidationCursor(cursor)
+		// 会话级验证游标（跨 Run 接力；子 agent 不接，cursor=nil）——见 tieredFactory 的说明。
+		if cursor != nil {
+			engine.SetValidationCursor(cursor)
+		}
 		// 注入区被截断 → **留痕**（退化必须可见：静默砍掉规则等于悄悄丢上下文）。
 		// 工厂是 per-Run 的 → 告警**只报一次**（否则每轮一条，噪声淹没真问题）。
 		if r, cs := engine.InjectionTruncated(); r || cs {
@@ -101,6 +124,51 @@ func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid, kind str
 		}
 		return engine
 	}, nil
+}
+
+// childStrategyFactory 造 W6-A 的 ChildStrategy 装配钩子（loop.Agents.ChildStrategy），绑到某
+// session（sessionID 由 loopFor 闭包捕获——子 agent 与父**同 session**，K25 单流多 agent）。
+//
+// 钩子签名（见 loop.Agents.ChildStrategy 注释）：core 只在子类型**声明了非 append 的合法 kind**
+// 时才调它（未声明/append 在 core 的 childStrategyFor 就返回 nil = 追加式了）。本实现：
+//
+//   - kind=tiered → 复用 tieredFactory 造工厂，但 **agentID 绑 child.ID**（recall 视角隔离 +
+//     context.compacted 事件归属都按子 agent 走）；share_project_assets=true 才注入项目规则；
+//   - kind=stage_scoped/sliding_window（枚举内但宿主未实现）→ tieredFactory 返回 nil → 本钩子
+//     返回 **nil 工厂** → core fail-close 收口成 agent.failed（不静默降级成 append，钩子契约）；
+//   - 窗口不合法 → tieredFactory 返回 error → 同样返回 nil 工厂（fail-close）。
+//
+// **并发契约**（Agents.ChildStrategy 要求实现并发安全）：本钩子无共享可变状态——只读 h.cfg /
+// h.store 等不可变依赖，每次调用造**独立**的 per-Run 工厂与引擎（策略有状态，不跨 Run 共享）。
+// 唯一的共享状态 h.injectWarned 由 tieredFactory 内的 h.mu 短临界区保护。
+func (h *Hub) childStrategyFactory(sessionID contracts.Ulid) func(child agents.Node, childType agents.AgentType) compaction.AssemblerFactory {
+	return func(child agents.Node, childType agents.AgentType) compaction.AssemblerFactory {
+		// 防御：core 已保证非 nil，这里再挡一次（nil = 让 core 的 childStrategyFor fail-close）。
+		if childType.ContextStrategy == nil {
+			return nil
+		}
+		share := childType.ShareProjectAssets != nil && *childType.ShareProjectAssets
+		kind := string(childType.ContextStrategy.Kind)
+		f, err := h.tieredFactory(sessionID, child.ID, kind, share, nil)
+		if err != nil || f == nil {
+			// 宿主未实现的 kind → (nil,nil)；窗口不合法 → (nil,err)。都返回 nil 工厂 →
+			// core fail-close（该 spawn 的子 agent 以 agent.failed 收口，不静默走 append）。
+			//
+			// err 不能丢（F1 终查）：core 只会给通用文案"装配钩子未产出工厂"，配置现场
+			// （窗口不合法等）的线索只在这里有——留一条 Warn 才排得了障。
+			if err != nil {
+				hubLog.Warn("host: 子 agent 上下文策略装配失败（该 spawn 将以 agent.failed 收口）",
+					"session_id", string(sessionID), "child_agent_id", string(child.ID),
+					"agent_type", childType.ID, "kind", kind, "err", err.Error())
+			} else {
+				hubLog.Warn("host: 子 agent 上下文策略 kind 未实现（该 spawn 将以 agent.failed 收口）",
+					"session_id", string(sessionID), "child_agent_id", string(child.ID),
+					"agent_type", childType.ID, "kind", kind)
+			}
+			return nil
+		}
+		return f
+	}
 }
 
 // validationCursorFor 取（或建）某 session 的验证信号游标（v3-S3 修：跨 Run 接力）。

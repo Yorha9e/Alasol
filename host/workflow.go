@@ -36,6 +36,24 @@ import (
 //  2. **自定义上下文策略**——激活的工作流声明的 context_strategy.kind 决定挂不挂 tiered
 //     （经 contextStrategyFactory，loop.Config.ContextStrategy 注入）。
 
+// ---------------------------------------------------------------------------
+// R8 / H22 / H23 口径（实现已在别处，这里只落注释——不造重复机制）
+// ---------------------------------------------------------------------------
+//
+// 这三条是权限/组合的既有不变式（v3-S6-B 装配多 agent 时**沿用**，不另起一套）：
+//
+//   - **R8（多 workflow 包 Compose 取并集、权限只收窄）**：core/workflow.Compose 把多个能力包
+//     的 philosophy / agent_types / gates / grants 并成一段（追加 loop 可组合，W4）。合并后的
+//     权限**只收窄不放宽**：gates 的 deny/ask 规则跨包取并集，任何一包的收紧都保留。宿主装配
+//     multi agent 时不改这条——类型注册表同理（同名覆盖只发生在"内建 vs TOML 自定义"这一处，
+//     且是用户显式优先级，不是能力包合并）。
+//   - **H22（grants 是请求，只收窄不放宽）**：能力包的 grants 是**预批准请求**，不是授予——
+//     实际权限 = 请求 ∩ 策略上限 ∩ 父级授予（agent 树闸门③同款：子 ⊆ 父 ∩ ceiling）。框架
+//     **不因包里声明了 grant 就授予**。子 agent 的 PermissionRequest 是上限，被父级/策略收窄。
+//   - **H23（allow 命中即放行）**：策略链上一条 allow 命中即放行该调用（求值序 deny → ask →
+//     allow；deny 永远赢）。MultiAgent 开时 hub 自动补的 spawn/complete allow 规则同理——它只是
+//     "补上缺失的许可让框架工具可见"，任何显式 deny 仍可拦（P2-4）。
+
 // buildWorkflowRegistry 建工作流注册表：内建 tower + Config.WorkflowDir 目录加载的纯数据包。
 //
 // 内建包**先登记**（占 id/命令），目录包后登记；任一重名 → 装配失败（fail-close：不许静默

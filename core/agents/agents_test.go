@@ -223,6 +223,50 @@ func TestSpawnAllGatesPass(t *testing.T) {
 	}
 }
 
+// TestNewTreeWithRootID：WithRootID 让 root = 指定 id（host 装配：等于主 agent id，续跑复用）；
+// 没传则照旧自造新 ULID（默认行为不变）。
+func TestNewTreeWithRootID(t *testing.T) {
+	reg := gatesRegistry(t)
+	rootType := agents.AgentType{ID: "root", CanSpawn: []string{"mid"}, PermissionRequest: fullPerm()}
+
+	// ① 传了合法 ULID → root 等于它。
+	want := core.NewUlid()
+	tree := agents.NewTree(rootType, agents.WithTypes(reg), agents.WithMaxDepth(3), agents.WithRootID(want))
+	if got := tree.Root(); got != want {
+		t.Fatalf("WithRootID 应让 root = %q，得到 %q", want, got)
+	}
+	// root 节点真的在树里、depth=1、类型=rootType。
+	node, ok := tree.Get(want)
+	if !ok || node.Depth != 1 || node.Type != "root" {
+		t.Fatalf("root 节点应在树里且 depth=1: %+v ok=%v", node, ok)
+	}
+	// 以该 root 起 spawn 仍正常（parentID 命中）。
+	mid, err := tree.Spawn(want, "mid", "x", core.NewUlid())
+	if err != nil {
+		t.Fatalf("从指定 root spawn 应成功: %v", err)
+	}
+	if mid.ParentID == nil || *mid.ParentID != want {
+		t.Fatalf("mid.ParentID 应指向指定 root: %+v", mid.ParentID)
+	}
+
+	// ② 没传 WithRootID → root 自造（非 want，且合法 ULID）。
+	tree2 := agents.NewTree(rootType, agents.WithTypes(reg), agents.WithMaxDepth(3))
+	r2 := tree2.Root()
+	if r2 == want {
+		t.Fatal("没传 WithRootID 时 root 不应等于别处指定的 id")
+	}
+	if !core.ValidUlid(r2) {
+		t.Fatalf("自造 root 应是合法 ULID: %q", r2)
+	}
+
+	// ③ 传了非法 ULID → 忽略、自造（fail-safe：不把非法 id 当 root）。
+	tree3 := agents.NewTree(rootType, agents.WithTypes(reg), agents.WithRootID("not-a-ulid"))
+	r3 := tree3.Root()
+	if !core.ValidUlid(r3) {
+		t.Fatalf("非法 WithRootID 应退化为自造合法 ULID，得到 %q", r3)
+	}
+}
+
 func TestGateDepthRejectsFourthLayer(t *testing.T) {
 	reg := agents.NewTypeRegistry()
 	// 一条可到底的链：a→b→c，每层 can_spawn 指下一层；maxDepth=3。

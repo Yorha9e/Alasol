@@ -85,6 +85,13 @@ var httpLog = slog.Default()
 //	POST /api/approvals/{request_id}/respond → {"request_id":…,"decision":…}（注入挂起的审批；无人应答 = deny，fail-close）
 //	GET  /api/approvals/pending              → [PendingApprovalView, ...]（G11：挂起审批枚举面；空表 → []）
 //
+// agent 树只读快照（v3-S6-B，W5 多 agent 装配）：
+//
+//	GET /api/sessions/{session_id}/agents    → [AgentNodeView, ...]（该 session 的 agent 树快照：
+//	  agent_id/parent_agent_id/depth/agent_type/role/status + summary/失败原因；root=主 agent。
+//	  判据 = **树存在即 200**（树是 session 活状态，loop 失效不影响它）：没开 multi_agent 或
+//	  还没建树 → 空列表 []；既没树也不由本进程托管 → 404 unknown_session）
+//
 // 其它方法/路径 → **405 / 404，一律 JSON 错误体**（前端统一按 JSON 解）：
 // /api/* 未命中具体路由时，路径认得但方法不符 → 405（带 Allow），路径不认得 → 404
 // ——不再掉进静态通配报"没有这个静态资源"（G7）。
@@ -174,6 +181,11 @@ func (h *Hub) Handler() http.Handler {
 	reg("POST", "/api/approvals/{request_id}/respond", h.serveApprovalRespond)
 	// 挂起审批枚举面（v3-S5，G11）：与 respond 不同路径、不同方法（405 口径各自独立）。
 	reg("GET", "/api/approvals/pending", h.serveApprovalPending)
+
+	// agent 树只读快照（v3-S6-B）：GET /api/sessions/{id}/agents 返回该 session 的树快照
+	// （GUI 派活面；判据 = 树存在即 200 —— 树是 session 活状态，loop 失效不影响它；
+	//  无 MultiAgent/还没建树 → 空列表；既没树也不由本进程托管 → 404）。
+	reg("GET", "/api/sessions/{session_id}/agents", h.serveSessionAgents)
 
 	// /api/* 回退面（G7）：未命中具体路由时，按 probe+tbl 判 405 / 404，一律 JSON 错误体。
 	mux.HandleFunc("/api/", h.serveAPIFallback(tbl, probe))
