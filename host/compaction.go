@@ -40,11 +40,19 @@ const defaultRecallReadLimit = 2000
 // Config.ContextStrategyWindow（0 = 默认 1M）；W < 256k 硬约束不满足时 NewEngine 返回 error
 // → 此处**拒绝装配**并说明（fail-close：不满足设计要求就明说，不静默降级成一个会负预算的策略）。
 //
+// **静默降级口径（工作流级，与 agent_type 级不对称——刻意如此）**：**非 tiered 一律返回
+// nil（=append）**——枚举内但宿主保留未实现的 stage_scoped/sliding_window 也走这条路，
+// **未实现不报错**。这是**工作流级**的既定口径（工作流只是"建议宿主用哪种策略"，宿主
+// 没实现就退回默认追加式）；**agent_type 级**走的是另一条路（core/workflow 的装载期
+// 枚举校验 + loop 的 fail-close，见 contracts 的 AgentType.context_strategy 说明）。
+// 两者不对称是刻意的：工作流级是"能力包提议"，agent_type 级是"类型显式声明"（语义更强，
+// 静默降级会让人以为配了策略其实没配）。
+//
 // 参数面（F10）：W / L1% / L2% 全部来自宿主配置（TOML/CLI → host.Config → compaction.Params），
 // 不写死；规则文本（Config.ContextRules）也在这里注入（稳定前缀的一部分）。
 func (h *Hub) contextStrategyFactory(sessionID, agentID contracts.Ulid, kind string) (compaction.AssemblerFactory, error) {
 	if strings.TrimSpace(kind) != contextStrategyTiered {
-		return nil, nil // append（默认）
+		return nil, nil // append（默认）：非 tiered 一律 nil（=append）——见函数头"静默降级口径"
 	}
 	params := h.cfg.contextStrategyParams()
 	rules := h.cfg.ContextRules

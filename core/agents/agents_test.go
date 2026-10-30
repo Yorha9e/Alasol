@@ -6,6 +6,7 @@ package agents_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -100,6 +101,72 @@ func TestRegisterAcceptsDagAndRejectsDuplicate(t *testing.T) {
 	// Resolve 不存在。
 	if _, err := reg.Resolve("ghost"); !errors.Is(err, agents.ErrTypeNotFound) {
 		t.Fatalf("Resolve ghost 应 ErrTypeNotFound，得到 %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// context_strategy 声明校验（W6-A：注册表这条装载路径同口径）
+// ---------------------------------------------------------------------------
+
+// TestRegisterRejectsInvalidContextStrategyKind：W6-A 的 context_strategy 声明校验在
+// **注册表这条装载路径**上同样生效（与 core/workflow 的能力包装载期同口径——注册表也是
+// "装载期"的一种，不许成为绕过能力包那道枚举闸门的旁路）：
+//   - 越枚举的 kind → 拒注册（错误点名类型 id 与 kind）；
+//   - kind 为空 → 拒注册（"声明了却没说什么"比不声明更危险）；
+//   - 枚举内的四种 → 放行；未声明 → 放行（append 默认）；
+//   - 被拒的类型**不进注册表**（不提交）。
+func TestRegisterRejectsInvalidContextStrategyKind(t *testing.T) {
+	reg := agents.NewTypeRegistry()
+
+	// 越枚举 → 拒。
+	err := reg.Register(agents.AgentType{
+		ID:              "bad-kind",
+		ContextStrategy: &contracts.ContextStrategy{Kind: contracts.ContextStrategyKind("custom_xyz")},
+	})
+	if err == nil {
+		t.Fatal("越枚举的 context_strategy kind 应被拒")
+	}
+	if !strings.Contains(err.Error(), "bad-kind") || !strings.Contains(err.Error(), "custom_xyz") {
+		t.Errorf("错误应点名类型 id 与 kind: %v", err)
+	}
+	if _, ok := reg.Get("bad-kind"); ok {
+		t.Error("被拒的类型不应留在注册表")
+	}
+
+	// kind 为空 → 拒。
+	err = reg.Register(agents.AgentType{
+		ID:              "empty-kind",
+		ContextStrategy: &contracts.ContextStrategy{Kind: contracts.ContextStrategyKind("")},
+	})
+	if err == nil {
+		t.Fatal("kind 为空的 context_strategy 声明应被拒")
+	}
+	if !strings.Contains(err.Error(), "empty-kind") {
+		t.Errorf("错误应点名类型 id: %v", err)
+	}
+	if _, ok := reg.Get("empty-kind"); ok {
+		t.Error("被拒的类型不应留在注册表")
+	}
+
+	// 枚举内的四种 → 放行。
+	for _, kind := range []contracts.ContextStrategyKind{
+		contracts.ContextStrategyKindAppend,
+		contracts.ContextStrategyKindStageScoped,
+		contracts.ContextStrategyKindSlidingWindow,
+		contracts.ContextStrategyKindTiered,
+	} {
+		id := "ok-" + string(kind)
+		if err := reg.Register(agents.AgentType{
+			ID:              id,
+			ContextStrategy: &contracts.ContextStrategy{Kind: kind},
+		}); err != nil {
+			t.Fatalf("枚举内的 kind %q 应放行: %v", kind, err)
+		}
+	}
+
+	// 未声明 → 放行（append 默认）。
+	if err := reg.Register(agents.AgentType{ID: "no-decl"}); err != nil {
+		t.Fatalf("未声明 context_strategy 的类型应放行: %v", err)
 	}
 }
 

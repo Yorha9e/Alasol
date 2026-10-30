@@ -18,7 +18,7 @@
 | 6 | **Tool 返回值** | `schema/tool-result.json` | 工具返回值：`graph_edges: [{src,dst,kind}]` / `taint` / 可重放标记（D22/G22/Q7） | 跨边界：MCP 与进程级扩展都要传 |
 | 7 | **Policy 规则** | `schema/policy.json` | 规则表达式（配置文件形态）+ 判定结果 `Decision`：`allow`/`deny`/`ask`，ask 携带 `suggested_rules`（D13/H5） | workflow 侧规则**只可收窄**（H5/H24） |
 | 8 | **Store 持久化格式** | `schema/store.json` | 事件日志持久化/导出格式（NDJSON 事件记录）（G 系） | 大 payload 走 `binary_ref` 外置（D4） |
-| 9 | **Workflow** | `schema/workflow.json` | 工作流定义（纯数据）：`philosophy` / `agent_types[]` / `context_strategy` / `gates[]` / `grants[]`（`06` §4.1） | `permission_request`/`grants` 是请求，实际 = 请求 ∩ 策略上限 ∩ 父级授予（H11/H22） |
+| 9 | **Workflow** | `schema/workflow.json` | 工作流定义（纯数据）：`philosophy` / `agent_types[]` / `context_strategy` / `gates[]` / `grants[]`（`06` §4.1）。AgentType 亦可带 `context_strategy`/`share_project_assets`（W6-A，2026-10-31：子 agent 策略显式声明、不继承主 agent；项目资产显式共享） | `permission_request`/`grants` 是请求，实际 = 请求 ∩ 策略上限 ∩ 父级授予（H11/H22）；追加段合并（Compose）时同 id **base 整条胜出**（extra 同 id 类型**整条**丢弃：prompt/can_spawn/context_strategy/share_project_assets 全丢） |
 | 10 | **ContextSnapshot** | `schema/context-snapshot.json` | 上下文构成清单：`parts[]`（source/kind/entries/tokens/state/origins/summary_ref）、`state ∈ verbatim/compacted/dropped/deferred`（`06` §4.2） | 每轮一条 durable 事件 `context.assembled` |
 | 11 | **Approval 消息** | `schema/approval.json` | 审批请求 / 答复（跨进程：TUI / GUI / 远端）（D21 补入） | **无人应答 = deny，不得挂起**（D14/H8，fail-close） |
 

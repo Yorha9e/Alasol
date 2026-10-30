@@ -18,7 +18,10 @@
 //     见本包的 MilestoneHandler 接口与 tower 包的首个实现。
 //  2. **自定义上下文策略**——挂 core/compaction.AssemblerFactory（loop.Config.ContextStrategy）。
 //     这是 loop 的注入点，不在本包内；本包只在工作流的 context_strategy 字段里**声明**
-//     用哪种策略（数据），实际装配在宿主。
+//     用哪种策略（数据），实际装配在宿主。**子 agent 的策略也走同一个扩展点**：经
+//     loop.Agents.ChildStrategy 装配（同一扩展点 AssemblerFactory，作用域 = 按 agent_type
+//     显式声明；W6-A：未声明 = append 默认，**不继承主 agent**；声明非 append 而宿主没接
+//     钩子 → 该 spawn 的子 agent 以 agent.failed 收口，fail-close 不静默降级）。
 //
 // **别发明第三个扩展点**：agent_types / gates / grants 都是**纯数据**（contracts.Workflow，
 // 可被任何语言写/组合/追加，W13），不需要 Go 代码；只有里程碑部件与上下文策略是代码。
@@ -38,6 +41,7 @@ import (
 	"sync"
 
 	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core/agents"
 )
 
 // 工作流事件的 core kind（F7 只增；载荷形状见 contracts.Workflow*Payload，
@@ -138,7 +142,9 @@ type Package struct {
 // 校验（fail-close，不静默修复）：id 非空；philosophy 非空（W3：没哲学就没东西注入
 // system prompt）；里程碑部件名非空且不重名（重名会让派发语义不唯一）；
 // **agent_types 自洽**（不可信配置，见 validateAgentTypes：id 唯一、can_spawn 不悬空 /
-// 不自环 / 无环）。
+// 不自环 / 无环、context_strategy 声明合法（W6-A：kind 非空且在枚举内））；
+// **工作流级 context_strategy 声明合法**（见 validateWorkflowContextStrategy：kind 非空
+// 且在枚举内——工作流级 context_strategy 是**必填**声明，越枚举 / 空 kind → 拒装载）。
 func NewPackage(spec contracts.Workflow, milestones ...MilestoneHandler) (*Package, error) {
 	id := strings.TrimSpace(spec.ID)
 	if id == "" {
@@ -148,6 +154,9 @@ func NewPackage(spec contracts.Workflow, milestones ...MilestoneHandler) (*Packa
 		return nil, fmt.Errorf("workflow: 能力包 %q 的 philosophy 不能为空（W3：哲学文本进 system prompt 供主 agent 选择）", id)
 	}
 	if err := validateAgentTypes(id, spec.AgentTypes); err != nil {
+		return nil, err
+	}
+	if err := validateWorkflowContextStrategy(id, spec.ContextStrategy); err != nil {
 		return nil, err
 	}
 	mh := make(map[string]MilestoneHandler, len(milestones))
@@ -177,10 +186,19 @@ func NewPackage(spec contracts.Workflow, milestones ...MilestoneHandler) (*Packa
 //  2. **id 唯一**：重名 → "派哪个"不唯一（同名不同提示词 → 行为不可预期）；
 //  3. **can_spawn 指向包内已声明的类型**：悬空引用 = 派不出来（声明了却永远用不上）；
 //  4. **can_spawn 不自环**：自己派自己 = 无限派生；
-//  5. **can_spawn 无环**：a→b→a 的环 = 派生时死循环（深度闸门只挡深度，挡不住环）。
+//  5. **can_spawn 无环**：a→b→a 的环 = 派生时死循环（深度闸门只挡深度，挡不住环）；
+//  6. **context_strategy 声明合法**（W6-A）：声明了（指针非 nil）就必须有 kind，且 kind 在
+//     枚举内（append / stage_scoped / sliding_window / tiered，与工作流级
+//     validateWorkflowContextStrategy **同一张枚举表**：agents.ValidContextStrategyKind）。
 //
 // 为什么在**装载期**拒（而不是等到运行期）：坏包可能正是用户指望生效的那一个——装载期
 // fail-close（整个包拒，LoadDir 逐个点名文件），别让半坏的声明溜进运行期。
+//
+// 第 6 条的两种坏法都对应"策略语义悄悄变味"：
+//   - **kind 为空**：声明了 context_strategy 却没说什么 → 运行期被当成"未声明"静默走
+//     append（用户以为自己配了策略，其实没配）；
+//   - **kind 不在枚举**：宿主无从装配（造不出工厂）→ 子 agent 派出去就炸（fail-close 收口）。
+//     与其等到派出去才发现，不如装载期就拒。
 //
 // 口径：can_spawn 只能指向**本包内**声明的类型（能力包 = 自带能力池的闭包）。包外的
 // 全局类型由宿主的类型注册表负责，不在本包的声明范围内。
@@ -211,8 +229,53 @@ func validateAgentTypes(pkgID string, types []contracts.AgentType) error {
 			}
 		}
 	}
+	// W6-A：context_strategy 声明了就得说清楚 kind（否则运行期静默走 append）。
+	for _, at := range types {
+		if at.ContextStrategy == nil {
+			continue // 未声明 = append 默认（W6-A：不继承主 agent 的策略）
+		}
+		tid := strings.TrimSpace(at.ID)
+		kind := at.ContextStrategy.Kind
+		if strings.TrimSpace(string(kind)) == "" {
+			return fmt.Errorf("workflow: 能力包 %q 的 agent_type %q 的 context_strategy **kind 为空**（声明了却没说什么 = 运行期会被静默当成 append）：fail-close", pkgID, tid)
+		}
+		if !agents.ValidContextStrategyKind(kind) {
+			return fmt.Errorf("workflow: 能力包 %q 的 agent_type %q 的 context_strategy kind %q **不在枚举内**（append/stage_scoped/sliding_window/tiered）：fail-close", pkgID, tid, kind)
+		}
+	}
 	if cyc := findAgentTypeCycle(types); cyc != "" {
 		return fmt.Errorf("workflow: 能力包 %q 的 agent_types 存在**派生环**（%s）：派生会死循环", pkgID, cyc)
+	}
+	return nil
+}
+
+// validateWorkflowContextStrategy 校验**工作流级** context_strategy 声明（W6，fail-close）。
+//
+// 工作流级 context_strategy 是**必填**声明（契约 schema：required ["kind"]）——既然声明了，
+// 就得说清楚 kind：
+//
+//   - **kind 为空** = 非法声明（"声明了却没说什么"）：运行期宿主无从装配 → 静默按 append
+//     处理 = 策略语义悄悄变味（用户以为配了策略，其实跑的是追加式）；
+//   - **kind 不在枚举内**（append / stage_scoped / sliding_window / tiered 之外）= 宿主
+//     无从装配（造不出工厂）→ 与其等到运行期才发现，不如装载期就拒。
+//
+// 与 agent_type 级（validateAgentTypes 第 6 条）**同一张枚举表**（agents.
+// ValidContextStrategyKind）：两处口径不许分叉——分叉就会出现"agent_type 拒 / 工作流级
+// 收下"的两套口径（契约文案承诺的是"两处都受枚举约束"）。
+//
+// **装载期**拒（整个包拒，LoadDir 逐个点名文件），别让半坏的声明溜进运行期。
+//
+// 注意与**运行期**口径的分工（刻意不对称，不是 bug）：
+//   - **装载期**（这里）：越枚举 / 空 kind → 拒装载（fail-close）；
+//   - **运行期**：枚举内但宿主**未实现**的 kind → 工作流级按 append（宿主只实现 tiered，
+//     其余退回默认追加式），agent_type 级则 fail-close（子 agent 以 agent.failed 收口）。
+func validateWorkflowContextStrategy(pkgID string, cs contracts.ContextStrategy) error {
+	kind := cs.Kind
+	if strings.TrimSpace(string(kind)) == "" {
+		return fmt.Errorf("workflow: 能力包 %q 的 context_strategy **kind 为空**（工作流级 context_strategy 是必填声明：声明了却没说什么 = 运行期会被静默当成 append）：fail-close", pkgID)
+	}
+	if !agents.ValidContextStrategyKind(kind) {
+		return fmt.Errorf("workflow: 能力包 %q 的 context_strategy kind %q **不在枚举内**（append/stage_scoped/sliding_window/tiered）：fail-close", pkgID, kind)
 	}
 	return nil
 }
@@ -361,6 +424,10 @@ func (p *Package) HasMilestone(name string) bool {
 // 合并规则：
 //   - philosophy：base + "\n\n" + extra（两段哲学并陈）；
 //   - agent_types / gates / grants：追加（base 在前，按 name/id 去重，extra 补新增的）；
+//   - **agent_types 同 id 时 base 整条胜出**，extra 同 id 类型**整条丢弃**（prompt /
+//     can_spawn / context_strategy / share_project_assets 全丢；要覆盖请改 base 或换 id）——
+//     W6-A 的显式声明不做字段级合并（不做"base 的 prompt + extra 的策略"这种拼装）：谁赢
+//     必须是确定的，不能取决于装载顺序；
 //   - context_strategy：extra 非 append 则用 extra 的（追加段可换策略），否则留 base 的；
 //   - command / id：留 base 的（追加段不改触发入口）。
 //
@@ -369,7 +436,9 @@ func (p *Package) HasMilestone(name string) bool {
 // `out := base` 只拷了切片头（len/cap/底层数组指针）——后续 append 在 cap 有余量时会写进
 // **base 的底层数组**（改到入参！），元素内部的切片（AgentType.Tools / Gate.Rules…）更是
 // 直接共享。组合产物必须是**独立**的一份：调用方继续改 base（或 extra）不应影响已组合的
-// 结果。故三张切片在合并前**逐元素深拷贝**。
+// 结果。故三张切片在合并前**逐元素深拷贝**；其余**指针/字节底字段**（Workflow.Command
+// *string、工作流级 context_strategy.Params、Gate.Params 等 json.RawMessage）也一并拷——
+// 别只盯着切片头：指针别名同样会让"改入参"改到产物。
 func Compose(base, extra contracts.Workflow) contracts.Workflow {
 	out := base
 	out.Philosophy = joinPhilosophy(base.Philosophy, extra.Philosophy)
@@ -378,6 +447,12 @@ func Compose(base, extra contracts.Workflow) contracts.Workflow {
 	out.AgentTypes = cloneAgentTypes(base.AgentTypes)
 	out.Gates = cloneGates(base.Gates)
 	out.Grants = cloneGrants(base.Grants)
+	// 工作流级 context_strategy：结构头浅拷不够——Params 是 json.RawMessage（[]byte 底），
+	// 浅拷共享**底层数组** → 产物与 base 串味。整份拷一份（Params 也拷底）。
+	out.ContextStrategy = cloneContextStrategy(base.ContextStrategy)
+	// command 是 *string：`out := base` 只拷了指针 → 产物与 base 指向**同一个字符串**，
+	// 调用方改 base.Command 的指向/内容会改到产物。拷一份指针（nil 保 nil）。
+	out.Command = cloneStringPtr(base.Command)
 
 	// agent_types 按 id 去重追加。
 	seenType := map[string]bool{}
@@ -418,7 +493,7 @@ func Compose(base, extra contracts.Workflow) contracts.Workflow {
 	}
 	// context_strategy：追加段显式要了非 append 策略 → 用它（W4：追加段可换上下文管理方式）。
 	if extra.ContextStrategy.Kind != "" && extra.ContextStrategy.Kind != contracts.ContextStrategyKindAppend {
-		out.ContextStrategy = extra.ContextStrategy
+		out.ContextStrategy = cloneContextStrategy(extra.ContextStrategy)
 	}
 	return out
 }
@@ -435,7 +510,9 @@ func cloneAgentTypes(in []contracts.AgentType) []contracts.AgentType {
 	return out
 }
 
-// cloneAgentType 深拷贝一个 agent_type（Tools / CanSpawn 切片 + permission_request 指针）。
+// cloneAgentType 深拷贝一个 agent_type（Tools / CanSpawn 切片 + permission_request /
+// context_strategy / share_project_assets 指针；W6-A 新字段的 Params 是 []byte 底，
+// 浅拷同样共享，一并拷）。
 func cloneAgentType(at contracts.AgentType) contracts.AgentType {
 	cp := at
 	cp.Tools = cloneStrings(at.Tools)
@@ -444,7 +521,50 @@ func cloneAgentType(at contracts.AgentType) contracts.AgentType {
 		pr := *at.PermissionRequest
 		cp.PermissionRequest = &pr
 	}
+	if at.ContextStrategy != nil {
+		cs := *at.ContextStrategy
+		cs.Params = cloneRawMessage(at.ContextStrategy.Params)
+		cp.ContextStrategy = &cs
+	}
+	if at.ShareProjectAssets != nil {
+		v := *at.ShareProjectAssets
+		cp.ShareProjectAssets = &v
+	}
 	return cp
+}
+
+// cloneContextStrategy 深拷贝一份 context_strategy（结构头 + Params 底层数组）。
+//
+// 为什么结构头也要拷：ContextStrategy 里除 Params 外都是值字段，浅拷本身安全；但
+// **Params 是 json.RawMessage（[]byte 底）**——浅拷只拷切片头，底层数组仍与入参共享
+// → 调用方改入参会**改到产物**（组合产物必须与入参完全解耦，见 Compose 函数头）。
+// nil 保 nil（不把"没配参数"变成"配了空参数"）。
+func cloneContextStrategy(cs contracts.ContextStrategy) contracts.ContextStrategy {
+	cp := cs
+	cp.Params = cloneRawMessage(cs.Params)
+	return cp
+}
+
+// cloneRawMessage 复制一段原始 JSON（nil → nil；非 nil → 新底层数组）。
+func cloneRawMessage(in json.RawMessage) json.RawMessage {
+	if in == nil {
+		return nil
+	}
+	out := make(json.RawMessage, len(in))
+	copy(out, in)
+	return out
+}
+
+// cloneStringPtr 复制一个 *string（nil → nil；非 nil → 新指针）。
+//
+// 为什么需要：Workflow.Command 是 *string——`out := base` 只拷指针，产物与入参指向同一
+// 个字符串（调用方改 base.Command 会改到产物，见 Compose 函数头的解耦承诺）。
+func cloneStringPtr(in *string) *string {
+	if in == nil {
+		return nil
+	}
+	v := *in
+	return &v
 }
 
 // cloneGates 深拷贝 gates 列表（nil → nil；Rules 切片与其中的指针字段也拷）。
@@ -459,7 +579,7 @@ func cloneGates(in []contracts.Gate) []contracts.Gate {
 	return out
 }
 
-// cloneGate 深拷贝一个 gate（Rules 切片 + component 指针）。
+// cloneGate 深拷贝一个 gate（Rules 切片 + component 指针 + params 底层数组）。
 func cloneGate(g contracts.Gate) contracts.Gate {
 	cp := g
 	cp.Rules = clonePolicyRules(g.Rules)
@@ -467,6 +587,9 @@ func cloneGate(g contracts.Gate) contracts.Gate {
 		c := *g.Component
 		cp.Component = &c
 	}
+	// params 是 json.RawMessage（[]byte 底）——浅拷只拷切片头，底层数组仍与入参共享
+	// → 调用方改入参会**改到产物**（组合产物必须与入参完全解耦，见 Compose 函数头）。
+	cp.Params = cloneRawMessage(g.Params)
 	return cp
 }
 

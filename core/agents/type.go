@@ -12,11 +12,20 @@ import (
 // AgentType 是子代理的能力模板（K16 类型可达性）。
 //
 // 直接复用跨边界契约类型 contracts.AgentType（ID / Prompt / Tools / Model / CanSpawn /
-// PermissionRequest），使 workflow 加载后的 AgentType 原样可用，无转换边界
-// （D21：一个类型只定义一次，其余引用不重抄）。
+// PermissionRequest / ContextStrategy / ShareProjectAssets），使 workflow 加载后的
+// AgentType 原样可用，无转换边界（D21：一个类型只定义一次，其余引用不重抄）。
 //
 //	CanSpawn 声明"我能派哪些类型"→ 第 N 层在类型层面就不可达（K16）；
 //	数字深度只是兜底（K17）。只读型 type 的 CanSpawn 为空 → 更深层在类型层面不可达（K20）。
+//
+// W6-A（2026-10-31 拍板）两个新字段（**显式声明**，都不继承主 agent）：
+//   - ContextStrategy：*contracts.ContextStrategy，声明该类型**子 agent**的上下文管理
+//     方式；nil = 未声明 = append 默认；声明非 append → 由宿主的 loop.Agents.ChildStrategy
+//     钩子按 kind 造策略工厂（未接钩子 → 该 spawn 的子 agent fail-close 收口）；
+//     **装载期校验**（Register）：声明了就得有 kind 且在四枚举内（append / stage_scoped /
+//     sliding_window / tiered）——空 kind / 越枚举 → 拒注册（与能力包装载期同口径）。
+//   - ShareProjectAssets：*bool，项目级资产（rules / 常识区）共享开关；true = 该类型子
+//     agent 的上下文装配**可**注入项目资产；缺省 false = 不共享。
 type AgentType = contracts.AgentType
 
 // 类型注册表错误（调用方可用 errors.Is 判定）。
@@ -50,6 +59,10 @@ func NewTypeRegistry() *TypeRegistry {
 // 校验（fail-close，S9：不合则拒绝并说明，不修复）：
 //   - ID 不能为空；
 //   - 重名拒绝（ID 唯一）；
+//   - **context_strategy 声明合法**（W6-A）：声明了（指针非 nil）就必须有 kind，且 kind 在
+//     枚举内（append / stage_scoped / sliding_window / tiered）——与能力包装载期
+//     （core/workflow.validateAgentTypes）**同口径**：注册表也是"装载期"的一种，
+//     越枚举的 kind 若从这条路径注册进来，就绕开了能力包那道闸门（直接可达装配钩子）。
 //   - **can_spawn 环检测**：加入后若 can_spawn 图出现环（含自环 A→A）→ 拒绝，不提交。
 func (r *TypeRegistry) Register(t AgentType) error {
 	if r == nil {
@@ -67,6 +80,10 @@ func (r *TypeRegistry) Register(t AgentType) error {
 	if _, dup := r.types[id]; dup {
 		return fmt.Errorf("%w: 类型 %q", ErrTypeExists, id)
 	}
+	// W6-A：context_strategy 声明了就得说清楚 kind（否则运行期静默走 append）。
+	if err := validateContextStrategyDecl(id, t.ContextStrategy); err != nil {
+		return err
+	}
 	// tentatively 加入 → 跑全图环检测 → 有环则回滚（不提交）。
 	r.types[id] = t
 	r.order = append(r.order, id)
@@ -74,6 +91,52 @@ func (r *TypeRegistry) Register(t AgentType) error {
 		delete(r.types, id)
 		r.order = r.order[:len(r.order)-1]
 		return fmt.Errorf("%w: %s", ErrSpawnCycle, cycle)
+	}
+	return nil
+}
+
+// ValidContextStrategyKind 报告 kind 是否在**上下文策略枚举**内
+// （append / stage_scoped / sliding_window / tiered）。
+//
+// **唯一枚举表**：装载期三道闸（core/workflow 的工作流级 + agent_type 级、core/agents 的
+// 类型注册表）与运行期兜底（core/loop 的 childStrategyFor）**共用它**——口径不许分叉：
+// 分叉就会出现"装载期拒一种、运行期放行另一种"的口径漂移（坏声明从旁路溜进运行期）。
+//
+// 宿主配置面（J8：用户可写扩展）**不走这里**——那是 TOML/配置面的扩展性，与工作流 JSON /
+// agent_type 声明的枚举约束是两件事。
+func ValidContextStrategyKind(kind contracts.ContextStrategyKind) bool {
+	switch kind {
+	case contracts.ContextStrategyKindAppend,
+		contracts.ContextStrategyKindStageScoped,
+		contracts.ContextStrategyKindSlidingWindow,
+		contracts.ContextStrategyKindTiered:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateContextStrategyDecl 校验类型的 context_strategy 声明（W6-A，fail-close）。
+//
+// 口径与 core/workflow.validateAgentTypes 的第 6 条**完全一致**（注册表也是"装载期"的一种，
+// 不许成为绕过能力包那道枚举闸门的旁路）：
+//   - 未声明（指针为 nil）= append 默认，**不继承主 agent 的策略** → 合法；
+//   - 声明了但 **kind 为空** → 非法（"声明了却没说什么"比不声明更危险：运行期会被静默
+//     当成 append，用户以为配了策略其实没配）→ 拒；
+//   - kind **不在枚举内**（append / stage_scoped / sliding_window / tiered 之外）→ 非法
+//     （宿主无从装配）→ 拒。
+//
+// 错误文案点名类型 id 与 kind，便于定位是哪条声明坏了。
+func validateContextStrategyDecl(id string, cs *contracts.ContextStrategy) error {
+	if cs == nil {
+		return nil // 未声明 = append 默认（W6-A：不继承主 agent 的策略）
+	}
+	kind := cs.Kind
+	if strings.TrimSpace(string(kind)) == "" {
+		return fmt.Errorf("agents: 类型 %q 的 context_strategy kind %q **为空**（声明了却没说什么 = 运行期会被静默当成 append）：fail-close", id, kind)
+	}
+	if !ValidContextStrategyKind(kind) {
+		return fmt.Errorf("agents: 类型 %q 的 context_strategy kind %q **不在枚举内**（append/stage_scoped/sliding_window/tiered）：fail-close", id, kind)
 	}
 	return nil
 }

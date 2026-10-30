@@ -64,6 +64,39 @@ type Agents struct {
 	Tree *agents.Tree
 	// Verifier summary refs 核验器（K24/Q7）。nil = 不核验（refs 原样保留）。
 	Verifier agents.RefVerifier
+	// ChildStrategy 按子 agent 类型**显式声明**的 context_strategy 装配其上下文策略工厂
+	// （W6-A，2026-10-31 拍板）。
+	//
+	// **签名带 child（树节点快照）**：宿主要把子 agent 绑进 per-Run 策略工厂，缺的是子
+	// agent 的**身份**（ULID）——recall 视角隔离（storeTextSource{agentID}）、事件归属
+	// （busEmitter{agentID}）都按子 agent 的 id 走；只给类型拿不到 child.ID，宿主只能
+	// 造出"不分视角"的策略（子 agent 的 recall 会串到主 agent 的上下文里）。故签名给
+	// 节点（信息更全：id / type / depth / role 一并可见），类型另传一份便于按类型取参数。
+	//
+	// 语义（方案 A：显式声明，不继承）：
+	//   - 子类型未声明 / kind=append → 子 loop 走追加式（ContextStrategy 留 nil），
+	//     **不继承主 agent 的策略**（子 agent 上下文独立）；
+	//   - 子类型声明了非 append 的 kind → 用本钩子造工厂；钩子为 nil 或返回 nil →
+	//     spawn 的子 agent 以 agent.failed 收口并写明原因（fail-close，不静默降级成 append）；
+	//   - **工厂不得返回 nil Assembler**（返回即 fail-close）：工厂指针非 nil 但造不出装配器
+	//     同样是坏装配 → 子 loop 的 Run 装配期就报错收口（loop.error 留痕 + agent.failed），
+	//     不静默走 append（策略语义会悄悄变味）；
+	//   - 声明了 context_strategy 但 **kind 为空** = 非法声明 → 同样 fail-close（不静默
+	//     当成 append："声明了却没说什么"比不声明更危险）；
+	//   - 声明了 **kind 越枚举**（不在 append / stage_scoped / sliding_window / tiered 内）
+	//     = 非法声明 → 同样 fail-close（与装载期同一口径：agents.ValidContextStrategyKind）；
+	//   - **宿主未实现的 kind 必须返回 nil 工厂**（core 即 fail-close：宿主认不得的 kind
+	//     就别造工厂——造出来也是错的策略语义）；返回 nil 工厂 → 该 spawn 的子 agent 以
+	//     agent.failed 收口并写明原因（不静默降级成 append）；
+	//   - childType.ShareProjectAssets=true 时钩子**才**向子策略注入项目资产（rules /
+	//     常识区）；false / 未声明 = 不共享。append 路径无注入区，开关不生效。
+	//
+	// **并发契约**：**实现必须并发安全**——同一 Loop 可被多个 goroutine 并发 Run（loop
+	// 承诺可并发 Run，见 Loop 的注释），本钩子因此会被**并发调用**（不同 spawn 的子 agent
+	// 同时装配策略工厂）。实现方若在钩子里改共享状态，必须自己加锁（同 MilestoneHandler
+	// 的"实现必须是并发安全"要求）。返回值 factory 也应每次造**独立**的 Assembler
+	// （策略有状态、不能跨 Run 共享——见 compaction.AssemblerFactory）。
+	ChildStrategy func(child agents.Node, childType agents.AgentType) compaction.AssemblerFactory
 }
 
 // runState 是一次 Run 的局部可变状态（不进 Loop 字段——Loop 保持无可变状态以支持并发 Run）。
@@ -432,6 +465,13 @@ func (l *Loop) emitAgentFailed(ctx context.Context, causation *contracts.Ulid, c
 }
 
 // buildChildLoop 依据 child 的 AgentType 装配子 loop（同 Bus/Registry/Provider/SessionID/SessionEnv）。
+//
+// W6-A（2026-10-31 拍板）：子 agent 的上下文策略**按其类型显式声明**装配——未声明 / append
+// → 追加式（ContextStrategy 留 nil），**不继承主 agent 的策略**；声明非 append → 经
+// Agents.ChildStrategy 钩子按 kind 造工厂（钩子拿到 child 节点 + 类型声明，能按子 agent
+// 身份造 per-Run 工厂）。钩子缺失/造不出，或**声明了却 kind 为空** → **fail-close**：
+// 返回错误，runSpawn 把它当 childErr 收口成 agent.failed（不静默降级成 append——"声明了
+// 非 append 却跑 append"比失败更糟，策略语义会悄悄变味）。
 func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, task string) (*Loop, error) {
 	model := strings.TrimSpace(childType.Model)
 	if model == "" {
@@ -443,6 +483,10 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 			system += "\n\n"
 		}
 		system += "任务: " + task
+	}
+	strategy, stratErr := l.childStrategyFor(child, childType)
+	if stratErr != nil {
+		return nil, stratErr
 	}
 	cfg := Config{
 		Provider:   l.provider,
@@ -457,6 +501,9 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		SessionEnv: l.sessionEnv, // 同 session 注入域
 		MaxTurns:   l.maxTurns,   // 每层独立轮数上限（层数由深度闸门限制）
 		Agents:     l.agents,     // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
+		// W6-A：子策略来自类型声明（未声明 = nil = 追加式），**不抄** l.ctxStrategy
+		// （不继承主 agent——子上下文独立）。
+		ContextStrategy: strategy,
 		// 思维链档位（G14）**透传给子 agent**：与 model 同源（子 agent 用父的档位，
 		// 除非类型另行绑定——类型目前没有档位字段）。
 		//
@@ -466,6 +513,61 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		ReasoningEffort: l.reasoningEffort,
 	}
 	return New(cfg)
+}
+
+// agentStrategyKind 取类型声明的上下文策略 kind（未声明 → ""）。
+//
+// 注意："未声明"（ContextStrategy == nil）与"声明了但 kind 为空"是**两件事**：前者是
+// append 默认，后者是**非法声明**（fail-close，见 childStrategyFor）。
+func agentStrategyKind(t agents.AgentType) contracts.ContextStrategyKind {
+	if t.ContextStrategy == nil {
+		return ""
+	}
+	return t.ContextStrategy.Kind
+}
+
+// childStrategyFor 按 W6-A 解析子 agent 的上下文策略工厂（未声明/append → nil = 追加式）。
+//
+// fail-close（四条同口径收口，都不静默降级成 append）：
+//  1. 声明了 context_strategy 但 **kind 为空** → 非法声明（"声明了却没说什么"会被
+//     当成 append，策略语义悄悄变味）；
+//  2. 声明了 **kind 越枚举**（不在 append / stage_scoped / sliding_window / tiered 内）→
+//     非法声明（宿主无从装配）：**与装载期同一口径**（agents.ValidContextStrategyKind）——
+//     AgentType.ContextStrategy 是**指针**，注册表/能力包拷的是结构体、共享的是那份声明
+//     本身：装载期之后它被改写（配置热改 / 复用同一份声明对象），运行期就会拿到一个
+//     越枚举的坏声明 → 运行期必须自己 fail-close（不能指望装载期那道闸）。
+//  3. 声明了非 append 而宿主没接装配钩子（Agents.ChildStrategy 为 nil）；
+//  4. 钩子造不出工厂（返回 nil）。
+//
+// 任一条命中 → 返回错误 → buildChildLoop 失败 → runSpawn 收口成 agent.failed。
+//
+// 第五条（**工厂返回 nil Assembler**）在本函数**看不见**（工厂是懒的：造工厂 ≠ 造装配器）→
+// 由子 loop 的 Run 在装配期兜住（loop.go：st.assembler == nil → fail-close 报错收口），
+// 同样收成 agent.failed，不静默走 append。
+func (l *Loop) childStrategyFor(child agents.Node, childType agents.AgentType) (compaction.AssemblerFactory, error) {
+	if childType.ContextStrategy == nil {
+		return nil, nil // 未声明 = append 默认（W6-A：不继承主 agent 的策略）
+	}
+	kind := agentStrategyKind(childType)
+	if strings.TrimSpace(string(kind)) == "" {
+		return nil, fmt.Errorf("子 agent 类型 %q 声明了 context_strategy 但 kind 为空（非法声明）：fail-close，不静默降级成 append", childType.ID)
+	}
+	if !agents.ValidContextStrategyKind(kind) {
+		return nil, fmt.Errorf("子 agent 类型 %q 声明了上下文策略 %q，但该 kind 不在枚举内（append/stage_scoped/sliding_window/tiered）：fail-close，不静默降级成 append", childType.ID, kind)
+	}
+	if kind == contracts.ContextStrategyKindAppend {
+		return nil, nil // 追加式默认
+	}
+	if l.agents == nil || l.agents.ChildStrategy == nil {
+		return nil, fmt.Errorf("子 agent 类型 %q 声明了上下文策略 %q，但宿主未提供装配钩子（Agents.ChildStrategy 为空）：fail-close，不静默降级成 append", childType.ID, kind)
+	}
+	// 钩子拿到**子 agent 身份**（child.ID）+ 类型声明：宿主据此造 per-Run 策略工厂
+	// （recall 视角隔离 / 事件归属都按子 agent 的 id 走）。
+	f := l.agents.ChildStrategy(child, childType)
+	if f == nil {
+		return nil, fmt.Errorf("子 agent 类型 %q 声明了上下文策略 %q，但装配钩子未产出工厂：fail-close，不静默降级成 append", childType.ID, kind)
+	}
+	return f, nil
 }
 
 // summaryToResult 把 summary 转成给父的 ToolResult（K24/Q7）：

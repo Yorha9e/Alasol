@@ -15,7 +15,7 @@ type Workflow struct {
 	Philosophy string `json:"philosophy"`
 	// 能力池：子代理类型声明（W5）。
 	AgentTypes []AgentType `json:"agent_types,omitempty"`
-	// 上下文管理方式是工作流的一部分（W6）。
+	// 上下文管理方式是工作流的一部分（W6）。**装载期（fail-close）**：kind 为空或不在枚举内（append/stage_scoped/sliding_window/tiered 之外）→ **拒装载**（整个包拒，LoadDir 逐个点名文件）——工作流级 context_strategy 是**必填**声明（required ["kind"]），越枚举 / 空 kind 的包不许进运行期（与 agent_type 级同一张枚举表）。**运行期**：枚举内但**宿主未实现**的 kind → 工作流级按 **append** 处理（宿主当前只实现 tiered，其余退回默认追加式，**未实现不报错**）；**agent_type 级**同一情形是 **fail-close**（该 spawn 的子 agent 以 agent.failed 收口）——两处口径**不对称是刻意的**（工作流级=“能力包提议”，agent_type 级=“类型显式声明”，后者语义更强，静默降级会让人以为配了策略其实没配）。
 	ContextStrategy ContextStrategy `json:"context_strategy"`
 	// 验收目标与门禁（W7）：同步门禁=数据驱动策略规则；异步任务=进程级部件。
 	Gates []Gate `json:"gates,omitempty"`
@@ -36,6 +36,10 @@ type AgentType struct {
 	Model string `json:"model"`
 	// 可派生的子类型（K16/K17：类型可达性深度限制，运行时强制；空 = 不可再派）。
 	CanSpawn []string `json:"can_spawn,omitempty"`
+	// W6-A（2026-10-31 拍板）：本类型子 agent 的上下文管理方式，**显式声明**。**装载期（fail-close）**：声明了（指针非 nil）却 kind 为空 / 越枚举（不在 append/stage_scoped/sliding_window/tiered 内）→ **拒装载**（与工作流级同一张枚举表）。**运行期**：未声明或 kind=append = 默认追加式（**不继承主 agent 的策略**——子 agent 上下文独立）。声明非 append 时有**三条分支**：① 宿主**接上装配钩子**（loop.Agents.ChildStrategy）且钩子造得出工厂 → 按 kind 造对应策略工厂（compaction.AssemblerFactory）；② 宿主**未接钩子** → 该 spawn 的子 agent 以 agent.failed 收口并给出原因（fail-close：不静默降级成 append）；③ 钩子在但**造不出工厂**（返回 nil 工厂 / 工厂造出 nil Assembler）→ **同样 fail-close**（agent.failed 收口，不静默走 append）。**枚举内但宿主未实现的 kind 在 agent_type 级同样 fail-close（不是 append）**；**同名 kind 在工作流级按 append 处理**（口径不对称，刻意如此：工作流级是“能力包提议”，agent_type 级是“类型显式声明”）。**注**：仓内宿主尚未接多 agent 装配（host 不建 agent 树），该路径目前仅 core + 测试可达。
+	ContextStrategy *ContextStrategy `json:"context_strategy,omitempty"`
+	// W6-A（2026-10-31 拍板）：项目级资产（rules / 常识区）共享开关，**显式共享**。true = 该类型子 agent 的上下文装配可注入项目规则/常识区；缺省 false = 不共享（子 agent 上下文完全独立）。只在挂了带注入区的 context_strategy 时有实际效果（append 路径无注入区，开关不生效）。
+	ShareProjectAssets *bool `json:"share_project_assets,omitempty"`
 }
 
 type PermissionRequest struct {
@@ -62,15 +66,15 @@ const (
 	ExecLevelFull      ExecLevel = "full"
 )
 
-// 上下文管理方式（kind + params）。**当前未接线**：仓里没有消费方读这个字段——v2-S1 的可配面走宿主配置面（host.Config / 用户级 TOML 的 context_strategy.kind/window/l1_pct/l2_pct → compaction.Params）。本字段保留契约形状（将来接上时不必改契约），但**别当它已经生效**。
+// 上下文管理方式（kind + params）。**两处消费**：① Workflow.context_strategy（W6，工作流级）——宿主按激活能力包的 kind 收敛主 agent 的策略装配（host workflowStrategyKindForLocked → compaction.AssemblerFactory）；② AgentType.context_strategy（W6-A，2026-10-31，子 agent **显式声明**、不继承主 agent）——宿主**接上装配钩子**（loop.Agents.ChildStrategy）时按 kind 给子 loop 造工厂；宿主**未接钩子**而类型声明了非 append → 该 spawn 的子 agent 以 agent.failed 收口（fail-close，不静默降级成 append）。**装载期（fail-close，两处同一张枚举表）**：kind 为空或越枚举（append/stage_scoped/sliding_window/tiered 之外）→ **拒装载**——工作流 JSON 与 agent_type 声明**都**受枚举约束（工作流级 context_strategy 更是必填声明，required ["kind"]）。**运行期**：枚举内但**宿主未实现**的 kind → **工作流级按 append**（宿主当前只实现 kind=tiered，其余取值含枚举内保留未实现的 stage_scoped/sliding_window 退回默认追加式，未实现不报错），**agent_type 级则 fail-close**（不静默降级成 append）——不对称刻意。参数面（kind=tiered 的 window/l1_pct/l2_pct）当前走宿主配置面（host.Config / 用户级 TOML → compaction.Params），params 字段是策略参数的契约形状（按 kind 解释），尚未逐字段接线。
 type ContextStrategy struct {
-	// 内置四种，用户可写扩展（J8）。
+	// 内置四种，**工作流 JSON 与 agent_type 声明都受本枚举约束**（越枚举 / 空 kind → **装载期拒装载**，fail-close，不静默当成 append）。J8 的用户扩展点在**代码侧**（AssemblerFactory 注入，不在 TOML 取值）：宿主配置面当前只接受 ""（默认 append）| "tiered"，其余取值装配期报错（见 host.Config.validate）。
 	Kind ContextStrategyKind `json:"kind"`
 	// 策略参数（原始 JSON，按 kind 解释）。
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
-// 上下文策略枚举（J8）：append 默认；tiered=分级压缩（v0 只预留接口，J12）。
+// 上下文策略枚举（J8）：append 默认；tiered=分级压缩（v0 只预留接口，J12）。**工作流 JSON 与 agent_type 声明都受本枚举约束**（两处同一张枚举表）：kind 为空或不在枚举内 → **装载期拒装载**（fail-close，不静默当成 append）。运行期枚举内但宿主未实现的 kind：工作流级按 append、agent_type 级 fail-close（不对称刻意，见 Workflow.context_strategy）。宿主配置面当前只接受 ""（append）| "tiered"（见 host.Config.validate）；J8 的用户扩展点在代码侧 AssemblerFactory 注入，不在 TOML 取值。
 type ContextStrategyKind string
 
 const (

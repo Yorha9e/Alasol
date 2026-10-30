@@ -228,6 +228,13 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 |---|---|---|
 | **v3-S4 协议面补全** | 按 `D:\vscode\alasol-gui\REPORT.md` 分诊修复：**G4** hub.alert 过 bus（注释兑现：入库与 WS 广播一致）+ 告警环/事件流两口径文档化；**G3** 事件回放面（`GET /api/events?from&to&limit` 或 subscribe 支持 from_seq 补发——二选一你定）；**G1** 对话/审批端点（**兑现 transport 契约承诺**的 `command.submit`/`approval.request`/`approval.respond`——HTTP/WS 至少一面对话发起+审批应答端到端）；**G6** Worktree json tag（snake_case 对齐全仓）；**G7** API 前缀显式 405（方法不符不再报"静态资源"）；**G8** subscribe ack 回执（生效过滤条件）；**G9** TransportMessage.id 语义写进契约（或给示例值）；**G5/A1/A3/A5** 口径文档（前端须同源/代理、/api/sessions 计数口径、告警时间字段口径、分页游标口径）；**G2** serve 定位口径统一（文档化"观察+协调 daemon"：托管型写面要求本进程托管、协调型写面（merge.*）直查库；**跨进程托管注册记 v4 不做**）；G10（派活 handoff 笔误）记账不修 | G4：WS 实时收到 hub.alert 且与入库一致；G3：断线后按 seq 补读回放无空洞；G1：协议面发 prompt→跑一轮→审批应答端到端（WS 事件可见）；G6/G7/G8/G9 各有回归钉住；口径文档齐（transport/host doc）；评审循环 clean；07 注记同步 | **✅ 完成（2026-01-30，评审循环 critic 2 轮/reviewer 2 轮至 clean）**：G1 对话/审批四面（HTTP+WS，无人应答=deny fail-close）、G3 `GET /api/events` 回放、G4 hub.alert 过 bus、G6/G7/G8/G9、口径文档（G2/G5/A1/A3/A5）；**记 v4**：`POST /api/sessions` 开新会话入口、审批应答鉴权收紧、跨进程托管注册 |
 
+### v3-S6 · subagent 产品化（施工切分，2026-10-31，来源：14-v4-plan 排期表第 1 项；版本叙事已合并——"现在做的就等于做 v4"）
+
+| 阶段 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| **v3-S6-A 契约增量 + core W6-A 消费** | ① F7 只增：`AgentType` 加 `context_strategy`（显式声明、不继承主 agent）+ `share_project_assets`（项目资产显式共享开关）② core 消费：`loop.Agents.ChildStrategy` 装配钩子（子 loop 按类型声明装配策略；未声明/append = 追加式默认）；**fail-close 五分支**（kind 空 / 越枚举 / 无钩子 / 钩子返 nil 工厂 / 工厂产 nil Assembler）绝不静默降级 ③ 装载期闸门：`agents.ValidContextStrategyKind` 唯一枚举表 + TypeRegistry.Register / validateAgentTypes / validateWorkflowContextStrategy 三道装载闸 ④ Compose 深拷贝补全（agent_type 新字段指针+Params、工作流级 Params、Gate.Params、Command 指针）+ 同 id 合并口径写明（base 整条胜出） | W6-A 语义钉死（A 不继承 / B 钩子装配 / C·D·E·F·G fail-close 各分支）；装载期三道闸 + 运行期兜底同口径；变异自证全数会红；X1 三段一字不动；F7 只增（schema 无删字段/改旧义）；全量测试+TS 三件套绿 | **✅ 完成（2026-10-31，评审循环 critic 4 轮/reviewer 4 轮至 p3-1 收口）**：契约+core 全落地；**剩 1 p3 文案级已顺手改**（宿主配置面只接受 ""/tiered、J8 扩展点在代码侧）；**host 未接多 agent 装配**（不建树、loop.Config.Agents 不传）→ W6-A 端到端待 v3-S6-B |
+| **v3-S6-B host 装配（五类+TOML+接线）** | host 装配 agent_type 注册表（内建 **planner/coder/critic/reviewer/observer** 五类 + TOML 自定义扩展；observer=只读 K20）→ `loop.Config.Agents` 接线（Tree 归属 session+父 agent，W12）→ spawn/complete 对模型可见（三闸门+策略链既有）→ W6-A 共享开关接注入区；W15 MaxTurns+prompt-timeout 先行 | 五类可 spawn、observer 只读收窄；GUI/协议面 agent 树真能派活；酸测试（不配置多 agent = 零行为变化）；07 回填+合计行同步 | **待做** |
+
 ### v3-S5 · 框架整备与 UI 联调（施工切分，2026-01-30，用户拍板：v4 权限项冻结，先做"大概能用的完整框架"）
 
 | 阶段 | 内容 | 验收 |

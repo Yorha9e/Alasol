@@ -347,6 +347,15 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	// 并收集它注入的框架工具（recall / stage）。nil 工厂 = 不挂 = append（v1 等价）。
 	if l.ctxStrategy != nil {
 		st.assembler = l.ctxStrategy()
+		// **工厂造出 nil Assembler = 装配残缺**（W6-A fail-close）：声明了策略却没装配出
+		// 装配器 → 静默走 append 等于"策略语义悄悄变味"（用户以为配了策略，其实跑的是
+		// 追加式）。故此处**不静默降级**：留一条 loop.error 留痕 + 以错误终止本次 Run
+		// （子 agent 路径上由 runSpawn 收口成 agent.failed）。
+		if st.assembler == nil {
+			err := errors.New("loop: 上下文策略工厂产出了 nil Assembler（装配钩子残缺）：fail-close，不静默降级成 append")
+			l.publishLoopError(ctx, 0, phaseContextStrategy, err)
+			return res, err
+		}
 		tools, err := l.collectStrategyTools(st.assembler)
 		if err != nil {
 			return res, err // 装配期重名 → fail-close（不许静默遮蔽，F12）

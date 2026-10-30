@@ -185,8 +185,10 @@ func (l *Loop) publishLoopError(ctx context.Context, turn int, phase string, cau
 const (
 	phaseUserPrompt = "user.prompt"
 	phaseModelTurn  = "model.turn"
-	// phaseContextStrategy 标记 context_strategy（v2-S1 compaction.Assembler）装配失败
-	// （fail-open 到 append 后的留痕；见 requestWithStrategy）。
+	// phaseContextStrategy 标记 context_strategy（v2-S1 compaction.Assembler）装配失败：
+	//   - 工厂造出 nil Assembler → **fail-close**（装配残缺，Run 直接报错收口；见 loop.go
+	//     RunWithHistory 的装配期检查）；
+	//   - 策略装配本身报错 → fail-open 到 append 后的留痕（见 requestWithStrategy）。
 	phaseContextStrategy = "context.strategy"
 )
 
