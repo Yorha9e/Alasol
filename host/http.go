@@ -31,6 +31,7 @@ var httpLog = slog.Default()
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
 //	GET /api/monitor             → MonitorView（K9：当前采样 + 阈值 + 告警环）
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行）
+//	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
 //	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
 //	GET /api/cost/{session_id}   → TokenCostView（单 session token 成本，按模型分组）
 //	GET /api/context/{session_id}→ 最新 ContextSnapshot；没有 → 404
@@ -76,6 +77,7 @@ var httpLog = slog.Default()
 //
 // 对话 / 审批（v3-S4，G1：兑现 transport 契约承诺的 command.submit / approval.*）：
 //
+//	POST /api/sessions                        → {"session_id":…}（201；开新会话的 REST 入口，v3-S5 ①）
 //	POST /api/sessions/{session_id}/prompt   → {"session_id":…,"status":"running"}（202；异步跑，结果经事件流）
 //	POST /api/approvals/{request_id}/respond → {"request_id":…,"decision":…}（注入挂起的审批；无人应答 = deny，fail-close）
 //
@@ -119,6 +121,9 @@ func (h *Hub) Handler() http.Handler {
 	reg("GET", "/api/health", h.serveHealth)
 	reg("GET", "/api/monitor", h.serveMonitor)
 	reg("GET", "/api/sessions", h.serveSessions)
+	// 开新会话的 REST 入口（v3-S5 ①）：与 GET /api/sessions 同路径、不同方法
+	// （reg 的 probe/tbl 会把两种方法都记进 405 口径）。
+	reg("POST", "/api/sessions", h.serveSessionCreate)
 	reg("GET", "/api/cost", h.serveCostTotal)
 	reg("GET", "/api/cost/{session_id}", h.serveCost)
 	reg("GET", "/api/context/{session_id}", h.serveContext)
@@ -280,6 +285,47 @@ func (h *Hub) serveSessions(w http.ResponseWriter, r *http.Request) {
 		rows = []SessionRow{}
 	}
 	writeJSONBody(w, http.StatusOK, rows)
+}
+
+// maxSessionCreateBody 限制 POST /api/sessions 请求体大小（SessionSpec 三个短字段，4KB 绰绰有余）。
+const maxSessionCreateBody = 4 << 10
+
+// serveSessionCreate 服务 POST /api/sessions（开新会话的 REST 入口，v3-S5 ①）。
+//
+//	请求体（可选，可为空）：{"cwd":"…","run_id":"…","worktree":"…"}（SessionSpec 的 JSON 面；
+//	    全部可省 = 用 hub 级默认）
+//	201 → {"session_id":"<ULID>"}：本进程托管的空 session（**不自动跑 prompt**——纯建会话，
+//	    首轮对话由调用方随后 POST /api/sessions/{id}/prompt 发起）
+//	400 → 体不是合法 JSON / CreateSession 校验失败（坏 cwd / 坏 worktree / 坏 run_id）
+//
+// 托管口径（G2/G25）：与 WS command.submit（不带 session_id）新建路径**同源同口径**——
+// 都是"本进程即宿主"。CreateSession 只登记归属（specs），托管的判据是 h.loops 里有
+// loop（hostsSession），所以这里建完 id 后就地 loopFor 建 loop（不 Run）——之后对该 id
+// 的 POST /api/sessions/{id}/prompt 直接可用（202），不必先跑一轮"预热"。
+func (h *Hub) serveSessionCreate(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CWD      string `json:"cwd"`
+		RunID    string `json:"run_id"`
+		Worktree string `json:"worktree"`
+	}
+	// body 可空：EOF（没发体）= 全用 hub 级默认，不算坏体。
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxSessionCreateBody)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
+		return
+	}
+	sid, err := h.CreateSession(SessionSpec{CWD: body.CWD, RunID: body.RunID, Worktree: body.Worktree})
+	if err != nil {
+		// CreateSession 的校验失败都是入参问题（坏 CWD / 坏 worktree / 坏 run_id）→ 400。
+		writeJSONError(w, http.StatusBadRequest, "session_create_failed", err.Error())
+		return
+	}
+	// 建 loop = 本进程托管（hostsSession 通过；不 Run，零 prompt、零模型调用）。
+	// 与 WS command.submit 新建路径最终汇到的 loopFor 同一处——同源同口径。
+	if _, err := h.loopFor(r.Context(), sid); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "session_host_failed", err.Error())
+		return
+	}
+	writeJSONBody(w, http.StatusCreated, map[string]string{"session_id": string(sid)})
 }
 
 // serveCostTotal 服务 GET /api/cost（跨 session token 成本汇总，J21）。

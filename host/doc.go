@@ -117,8 +117,10 @@
 // **别的进程**托管的 session 起 prompt，本进程会**就地新建一个 loop**（hub.go 的 loopFor）
 // → 两个进程往同一个 session/agent 写事件 → **G25 破**（全局 seq = 提交序 ≠ 因果序）。
 // 所以它要求 hostsSession，否则 404 unknown_session（与 peers/gates/agentlink 同口径）。
-// 协议面**开新会话**走 WS `command.submit`（**不带** session_id → 服务端新建一个 session，
-// 本进程即宿主）；带上 session_id 的 command.submit 同样要求本进程托管，否则回 kind=error。
+// 协议面**开新会话**有两条同源同口径的路：WS `command.submit`（**不带** session_id →
+// 服务端新建一个 session，本进程即宿主）与 **POST /api/sessions**（REST 入口，v3-S5 ①：
+// CreateSession + 本进程建 loop、返回 session_id、不自动跑 prompt——之后对该 id 的
+// /prompt 直接可用）；带上 session_id 的 command.submit 同样要求本进程托管，否则回 kind=error。
 //
 // 于是同一 session：读面（/api/sessions、/api/context、/api/cost）与协调写面（merge.*）全通
 // （投影/索引扫的是共享库），托管写面（peers/gates/join/agentlink/prompt）404。**跨进程托管注册不做
@@ -129,7 +131,8 @@
 // 复活（老 session 不会因重扫事件流而重新变成 live，这是设计）。于是重启后：
 // 读面照常（事件库里的历史还在）、协调写面照常，而托管写面（含 prompt）对**旧 session**
 // 一律 404 unknown_session。**协议面要继续对话就得重新开会话**（WS command.submit 不带
-// session_id → 服务端新建一个 session，本进程即宿主）；想接上旧 session 的上下文，
+// session_id → 服务端新建一个 session，本进程即宿主；或 POST /api/sessions——同源同口径）；
+// 想接上旧 session 的上下文，
 // 走 `alasol resume -session <id> -continue "<提示>"`（CLI 的恢复+续跑：**另一个进程**里
 // 自己建 loop 并接管）——协议面**不硬接**旧 session（那正是 G25 要防的双写）。
 //

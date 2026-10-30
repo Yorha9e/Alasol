@@ -228,6 +228,12 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 |---|---|---|
 | **v3-S4 协议面补全** | 按 `D:\vscode\alasol-gui\REPORT.md` 分诊修复：**G4** hub.alert 过 bus（注释兑现：入库与 WS 广播一致）+ 告警环/事件流两口径文档化；**G3** 事件回放面（`GET /api/events?from&to&limit` 或 subscribe 支持 from_seq 补发——二选一你定）；**G1** 对话/审批端点（**兑现 transport 契约承诺**的 `command.submit`/`approval.request`/`approval.respond`——HTTP/WS 至少一面对话发起+审批应答端到端）；**G6** Worktree json tag（snake_case 对齐全仓）；**G7** API 前缀显式 405（方法不符不再报"静态资源"）；**G8** subscribe ack 回执（生效过滤条件）；**G9** TransportMessage.id 语义写进契约（或给示例值）；**G5/A1/A3/A5** 口径文档（前端须同源/代理、/api/sessions 计数口径、告警时间字段口径、分页游标口径）；**G2** serve 定位口径统一（文档化"观察+协调 daemon"：托管型写面要求本进程托管、协调型写面（merge.*）直查库；**跨进程托管注册记 v4 不做**）；G10（派活 handoff 笔误）记账不修 | G4：WS 实时收到 hub.alert 且与入库一致；G3：断线后按 seq 补读回放无空洞；G1：协议面发 prompt→跑一轮→审批应答端到端（WS 事件可见）；G6/G7/G8/G9 各有回归钉住；口径文档齐（transport/host doc）；评审循环 clean；07 注记同步 | **✅ 完成（2026-01-30，评审循环 critic 2 轮/reviewer 2 轮至 clean）**：G1 对话/审批四面（HTTP+WS，无人应答=deny fail-close）、G3 `GET /api/events` 回放、G4 hub.alert 过 bus、G6/G7/G8/G9、口径文档（G2/G5/A1/A3/A5）；**记 v4**：`POST /api/sessions` 开新会话入口、审批应答鉴权收紧、跨进程托管注册 |
 
+### v3-S5 · 框架整备与 UI 联调（施工切分，2026-01-30，用户拍板：v4 权限项冻结，先做"大概能用的完整框架"）
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **v3-S5 整备+联调** | ① `POST /api/sessions`（从 v4 提前：创建**本进程托管**的 session 返回 id，之后 `POST /api/sessions/{id}/prompt` 即可用——REST 直觉的开新会话入口，G25 自洽）② **与 UI 侧联调**：起真 hub（用户本地网关 `http://127.0.0.1:51142/compat/v1` + gpt-4omini 真模型）+ `D:\vscode\alasol-gui` 的 GUI（同源代理），走通"开 session→发 prompt→模型跑→事件流→上下文/成本面板→ask 审批应答→/btw→merge check"全流程；③ **联调暴露的阻塞项现场修**（走迷你评审循环）；④ 联调报告（可用/不可用清单） | REST 开新会话→prompt 真模型跑通；GUI 三面板实时可见；审批闭环（request→respond→工具执行/拒绝）；联调发现的阻塞项修完或如实挂账；07 注记同步 |
+
 ---
 
 

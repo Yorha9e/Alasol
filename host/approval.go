@@ -38,9 +38,11 @@ import (
 //
 //   - HTTP POST /api/sessions/{id}/prompt：session 必须由本进程托管（hostsSession），
 //     否则 404 unknown_session（与 /api/peers、/api/gates/join、/api/agentlink/* 同口径）；
-//   - WS command.submit：**不带** session_id → 服务端新建一个 session（本进程即宿主，
-//     这是协议面开新会话的唯一入口）；**带** session_id → 同样要求本进程托管，否则回
-//     kind=error（不受理、不假受理）。
+//   - WS command.submit：**不带** session_id → 服务端新建一个 session（本进程即宿主）；
+//     **带** session_id → 同样要求本进程托管，否则回 kind=error（不受理、不假受理）。
+//   - HTTP POST /api/sessions（v3-S5 ①）：开新会话的 REST 入口——CreateSession 登记
+//     归属 + 本进程建 loop（托管），返回 session_id、**不自动跑 prompt**；与 command.submit
+//     不带 session_id 的新建路径**同源同口径**（同落 loopFor，本进程即宿主）。
 //
 // # fail-close 铁律（D14/H8/陷阱 9）
 //
@@ -320,7 +322,8 @@ func (h *Hub) startPromptAsync(sid contracts.Ulid, prompt string) bool {
 //
 // 托管口径（P2-2）：本端点是**托管型写面**，与 /api/peers、/api/gates/join、
 // /api/agentlink/* 同口径——只对**本进程托管**的 session 生效。协议面**开新会话**走
-// WS command.submit（不带 session_id → 服务端新建，本进程即宿主）。
+// WS command.submit（不带 session_id → 服务端新建，本进程即宿主）或 POST /api/sessions
+// （v3-S5 ① REST 入口，同源同口径）。
 func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("session_id"))
 	if err != nil {

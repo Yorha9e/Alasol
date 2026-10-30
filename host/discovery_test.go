@@ -835,10 +835,11 @@ func TestPeersAndGateJoinHTTPEndpoints(t *testing.T) {
 		}
 	}
 	// 反向：GET-only 端点用 POST → 405（/api/ 回退面同样处理）。
-	if resp, err := http.Post(srv.URL+"/api/sessions", "application/json", nil); err == nil {
+	// （v3-S5 起 POST /api/sessions 已是合法的开新会话入口，换用 GET-only 的 /api/monitor。）
+	if resp, err := http.Post(srv.URL+"/api/monitor", "application/json", nil); err == nil {
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
-			t.Fatalf("POST /api/sessions 状态码 = %d，want 405", resp.StatusCode)
+			t.Fatalf("POST /api/monitor 状态码 = %d，want 405", resp.StatusCode)
 		}
 	}
 	// 未知 /api 路径 → 404，且错误体说"没有这个 API 端点"（不是"静态资源"，G7）。

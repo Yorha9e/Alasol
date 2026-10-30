@@ -531,3 +531,105 @@ func TestPromptAndApprovalValidation(t *testing.T) {
 		t.Fatalf("错误码 = %q，want no_pending_approval", te.Code)
 	}
 }
+
+// TestSessionCreateRESTEndpoint（v3-S5 ①）：POST /api/sessions = 开新会话的 REST 入口。
+//
+// 语义：创建**本进程托管**的 session（CreateSession 登记归属 + loopFor 建 loop），
+// 返回 201 + {"session_id"}；**不自动跑 prompt**（纯建会话——与 WS command.submit
+// 新建路径同源：那条建完顺带跑，这条只建不跑，之后 /prompt 可用）。
+func TestSessionCreateRESTEndpoint(t *testing.T) {
+	h := newTestHub(t, func(c *host.Config) { c.Provider = &textOnlyProvider{text: "在"} })
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	// ① 真·空 body（一个字节都不发 → Decode 得 EOF，按"全默认"受理）→ 201 + 合法 ULID；
+	//    随后对该 id 发 prompt → 202（托管已登记）。这条钉子就是变异自证的红灯：
+	//    去掉 serveSessionCreate 里的 loopFor → hostsSession 不通过 → prompt 404。
+	var created struct {
+		SessionID string `json:"session_id"`
+	}
+	emptyResp, err := http.Post(srv.URL+"/api/sessions", "application/json", strings.NewReader(""))
+	if err != nil {
+		t.Fatalf("POST（空 body）: %v", err)
+	}
+	defer emptyResp.Body.Close()
+	if emptyResp.StatusCode != http.StatusCreated {
+		t.Fatalf("空 body 的 POST /api/sessions 状态码 = %d，want 201", emptyResp.StatusCode)
+	}
+	if err := json.NewDecoder(emptyResp.Body).Decode(&created); err != nil {
+		t.Fatalf("解空 body 响应: %v", err)
+	}
+	sid := contracts.Ulid(created.SessionID)
+	if !core.ValidUlid(sid) {
+		t.Fatalf("session_id 不是合法 ULID: %q", created.SessionID)
+	}
+	var acc struct {
+		SessionID string `json:"session_id"`
+		Status    string `json:"status"`
+	}
+	if code := postJSON(t, srv.URL+"/api/sessions/"+string(sid)+"/prompt",
+		map[string]string{"prompt": "你好"}, &acc); code != http.StatusAccepted {
+		t.Fatalf("建会话后对该 id 发 prompt 状态码 = %d，want 202（托管应已登记）", code)
+	}
+	if acc.SessionID != string(sid) || acc.Status != "running" {
+		t.Fatalf("prompt 受理回执不符: %+v", acc)
+	}
+
+	// ② 带 SessionSpec 字段的 body → 201（cwd 归属登记；不自动跑、零模型调用）。
+	repo := tempRepoOrDir(t)
+	var withSpec struct {
+		SessionID string `json:"session_id"`
+	}
+	if code := postJSON(t, srv.URL+"/api/sessions",
+		map[string]string{"cwd": repo, "run_id": "run-7"}, &withSpec); code != http.StatusCreated {
+		t.Fatalf("带 spec 的 POST /api/sessions 状态码 = %d，want 201", code)
+	}
+	if !core.ValidUlid(contracts.Ulid(withSpec.SessionID)) {
+		t.Fatalf("带 spec 的 session_id 不是合法 ULID: %q", withSpec.SessionID)
+	}
+
+	// ③ 重复 POST → 各得新 id（不是幂等复用同一个）。
+	var again struct {
+		SessionID string `json:"session_id"`
+	}
+	if code := postJSON(t, srv.URL+"/api/sessions", nil, &again); code != http.StatusCreated {
+		t.Fatalf("第二次 POST /api/sessions 状态码 = %d，want 201", code)
+	}
+	if again.SessionID == created.SessionID || again.SessionID == withSpec.SessionID {
+		t.Fatalf("重复 POST 复用了旧 id: %q / %q / %q",
+			created.SessionID, withSpec.SessionID, again.SessionID)
+	}
+
+	// ④ 坏 body → 400。
+	var te contracts.TransportError
+	resp, err := http.Post(srv.URL+"/api/sessions", "application/json", strings.NewReader("not json"))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("坏 body 状态码 = %d，want 400", resp.StatusCode)
+	}
+	// 坏 spec（不存在的 cwd）→ 400（CreateSession 的入参校验经 HTTP 面可见）。
+	if code := postJSON(t, srv.URL+"/api/sessions",
+		map[string]string{"cwd": filepath.Join(t.TempDir(), "nope")}, &te); code != http.StatusBadRequest {
+		t.Fatalf("坏 cwd 状态码 = %d，want 400", code)
+	}
+
+	// ⑤ 405 口径：/api/sessions 现在认 GET+POST，PUT 落回退面 → 405 且 Allow 含两者。
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/api/sessions", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	putResp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT: %v", err)
+	}
+	putResp.Body.Close()
+	if putResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT /api/sessions 状态码 = %d，want 405", putResp.StatusCode)
+	}
+	if allow := putResp.Header.Get("Allow"); allow != "GET, POST" {
+		t.Fatalf("405 Allow = %q，want \"GET, POST\"", allow)
+	}
+}
