@@ -542,6 +542,202 @@ func TestProtocolApprovalEndToEndFailClose(t *testing.T) {
 	}
 }
 
+// textToolTextProvider：第一轮回文本（预热），第二轮发一次工具调用（→ ask 触发审批），
+// 第三轮起只回文本（一轮收束）。
+//
+// 与 textThenToolProvider 的分工：那个之后每轮都再要审批（适合"从流里等一条"的用法）；
+// 本 provider 一次性收束——"respond 后不再 X"类断言必须用它，否则后续轮次的**新**挂起
+// 会把断言搅浑（分不清旧请求的重发/缺席，还是新请求的广播）。
+type textToolTextProvider struct {
+	calls int
+	args  string
+}
+
+func (p *textToolTextProvider) Run(_ context.Context, _ core.ModelRequest, emit func(core.ProviderEvent)) (core.ModelResult, error) {
+	p.calls++
+	if p.calls == 2 { // 第 1 次是预热轮；第 2 次才发工具调用
+		tc := core.ToolCallReq{
+			ID:   contracts.ProviderId("toolu_SCRIPTED_01"),
+			Name: "read",
+			Args: json.RawMessage(p.args),
+		}
+		emit(core.ProviderEvent{Kind: "toolcall.start", ToolCall: &tc})
+		emit(core.ProviderEvent{Kind: "done"})
+		return core.ModelResult{ToolCalls: []core.ToolCallReq{tc}, Usage: core.Usage{InputTokens: 10, OutputTokens: 5}}, nil
+	}
+	emit(core.ProviderEvent{Kind: "text.delta", Text: "好了"})
+	emit(core.ProviderEvent{Kind: "done"})
+	return core.ModelResult{Text: "好了", Usage: core.Usage{InputTokens: 5, OutputTokens: 2}}, nil
+}
+
+// TestPendingApprovalsEndpoint（G11）：挂起审批的枚举面 GET /api/approvals/pending。
+//
+// 钉三件事：空表 → []（不是 null）；挂起中 → request 完整形状（id/session_id/trigger/
+// summary/**detail**）+ waiting_since + deadline；respond 后 → 又是 []（已决的不再出现）。
+// 变异自证：serveApprovalPending 恒回 []（枚举面不接 pending 表）→ ② 必红。
+func TestPendingApprovalsEndpoint(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "ask-target.txt")
+	if err := os.WriteFile(target, []byte("approved"), 0o600); err != nil {
+		t.Fatalf("写目标文件: %v", err)
+	}
+	h := newTestHub(t, func(c *host.Config) {
+		c.Allow = nil
+		c.Ask = []string{"read"}
+		c.Approval = "protocol"
+		c.Provider = &textToolTextProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`}
+	})
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	type pendingRow struct {
+		ID           string          `json:"id"`
+		SessionID    string          `json:"session_id"`
+		Trigger      string          `json:"trigger"`
+		Summary      string          `json:"summary"`
+		Detail       json.RawMessage `json:"detail"`
+		WaitingSince string          `json:"waiting_since"`
+		Deadline     string          `json:"deadline"`
+	}
+
+	// ① 空表 → []（字面 `[]`，不是 null——前端 forEach 不用判 null，与 /api/sessions 同口径）。
+	var raw json.RawMessage
+	if code := getJSON(t, srv.URL+"/api/approvals/pending", &raw); code != http.StatusOK {
+		t.Fatalf("空表的 pending 状态码 = %d，want 200", code)
+	}
+	if got := strings.TrimSpace(string(raw)); got != "[]" {
+		t.Fatalf("空表应返回 []，得到 %s", got)
+	}
+
+	// ② 挂起：预热 + prompt → 轮询枚举面直到出现一条（枚举面就是给"没收到广播"的
+	//    客户端兜底的——这里干脆全程不用 WS，证明它自足）。
+	sid := warmupSession(t, h)
+	if code := postJSON(t, srv.URL+"/api/sessions/"+string(sid)+"/prompt",
+		map[string]string{"prompt": "读一下目标文件"}, nil); code != http.StatusAccepted {
+		t.Fatalf("prompt 状态码 = %d，want 202", code)
+	}
+	var row pendingRow
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var rows []pendingRow
+		if code := getJSON(t, srv.URL+"/api/approvals/pending", &rows); code != http.StatusOK {
+			t.Fatalf("pending 状态码 = %d", code)
+		}
+		if len(rows) > 0 {
+			row = rows[0]
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("10s 内枚举面一直为空（ask 挂起应出现在 pending 里）")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !core.ValidUlid(contracts.Ulid(row.ID)) {
+		t.Fatalf("挂起审批 id 不是合法 ULID: %q", row.ID)
+	}
+	if row.SessionID != string(sid) || row.Trigger != string(contracts.ApprovalTriggerPolicyAsk) {
+		t.Fatalf("挂起审批要素不符: %+v", row)
+	}
+	if row.Summary == "" || len(row.Detail) == 0 {
+		t.Fatalf("挂起审批应带 summary + detail（完整 request 形状）: %+v", row)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, row.WaitingSince); err != nil {
+		t.Fatalf("waiting_since 不是 RFC3339Nano: %q（%v）", row.WaitingSince, err)
+	}
+	// 整轮预算的截止时刻：协议 prompt 的 ctx 带 promptRunTimeout 上界 → deadline 该有。
+	if _, err := time.Parse(time.RFC3339, row.Deadline); err != nil {
+		t.Fatalf("deadline 不是 RFC3339: %q（%v）", row.Deadline, err)
+	}
+
+	// ③ respond allow → 枚举面立刻回到 []（Respond 摘表在 HTTP 200 之前完成）。
+	if code := postJSON(t, srv.URL+"/api/approvals/"+row.ID+"/respond",
+		map[string]string{"decision": "allow"}, nil); code != http.StatusOK {
+		t.Fatalf("respond 状态码 = %d，want 200", code)
+	}
+	var after []pendingRow
+	if code := getJSON(t, srv.URL+"/api/approvals/pending", &after); code != http.StatusOK {
+		t.Fatalf("respond 后 pending 状态码 = %d", code)
+	}
+	if len(after) != 0 {
+		t.Fatalf("respond 后不该再枚举到已决的审批，得到 %+v", after)
+	}
+}
+
+// TestWSConnectionResendsPendingApprovals（G11）：新 WS 连接收到仍挂起的
+// approval.request 重发；respond 后新连接不再收到（pending 已摘）。
+//
+// 钉：挂起期间新 dial 的连接**立刻**收到重发（request_id 与原广播一致）——页面刷新/
+// 重连不再丢挂起；应答后摘除，后续新连接干净。变异自证：去掉 hub.New 里的
+// SetOnConnect（重发钩子）→ 前半必红。
+func TestWSConnectionResendsPendingApprovals(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "ask-target.txt")
+	if err := os.WriteFile(target, []byte("approved"), 0o600); err != nil {
+		t.Fatalf("写目标文件: %v", err)
+	}
+	h := newTestHub(t, func(c *host.Config) {
+		c.Allow = nil
+		c.Ask = []string{"read"}
+		c.Approval = "protocol"
+		c.Provider = &textToolTextProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`}
+	})
+	srv := httptest.NewServer(h.Handler())
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dial := func() *transport.Client {
+		t.Helper()
+		c, err := transport.Dial(ctx, "ws"+strings.TrimPrefix(srv.URL, "http")+"/ws")
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return c
+	}
+
+	// 连接①：订阅 + 预热 + prompt → 收原始广播（这条连接是"当时在线的"，不测重发）。
+	c1 := dial()
+	defer c1.Close()
+	if err := c1.Subscribe(ctx, contracts.SubscribeRequest{}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	waitWSKind(t, c1, transport.KindSubscribed, 10*time.Second)
+	sid := warmupSession(t, h)
+	if code := postJSON(t, srv.URL+"/api/sessions/"+string(sid)+"/prompt",
+		map[string]string{"prompt": "读一下目标文件"}, nil); code != http.StatusAccepted {
+		t.Fatalf("prompt 状态码 = %d，want 202", code)
+	}
+	req := recvApprovalRequest(t, c1)
+
+	// 连接②：**挂起期间**新 dial（不订阅也该收到——补发不经订阅过滤，与 Broadcast 同口径）
+	// → 立刻收到同一条 approval.request（request_id 一致）。
+	c2 := dial()
+	defer c2.Close()
+	resent := recvApprovalRequest(t, c2)
+	if resent.ID != req.ID {
+		t.Fatalf("重发的 request_id = %q，want 原广播的 %q", resent.ID, req.ID)
+	}
+
+	// respond allow → pending 摘除。
+	if code := postJSON(t, srv.URL+"/api/approvals/"+string(req.ID)+"/respond",
+		map[string]string{"decision": "allow"}, nil); code != http.StatusOK {
+		t.Fatalf("respond 状态码 = %d，want 200", code)
+	}
+	if !waitEventKind(t, c1, "tool.call.completed", 10*time.Second) {
+		t.Fatal("应答后应看到 tool.call.completed（那一轮继续跑）")
+	}
+
+	// 连接③：应答后再 dial → **收不到**任何 approval.request（已决的不再重发）。
+	c3 := dial()
+	defer c3.Close()
+	recvCtx, recvCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	_, err := c3.RecvContext(recvCtx)
+	recvCancel()
+	if err == nil {
+		// 收到了消息：必须不是 approval.request（本 provider 一轮收束，不会有新挂起）。
+		t.Fatal("respond 后新连接不该收到任何补发消息（挂起表已空；Broadcast 也不该有）")
+	}
+	// 超时 = 干净（没收到任何东西）正是期望。
+}
+
 // TestPromptAndApprovalValidation（G1）：prompt/respond 端点入参校验。
 func TestPromptAndApprovalValidation(t *testing.T) {
 	h := newTestHub(t, nil)

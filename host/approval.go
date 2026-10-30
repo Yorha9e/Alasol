@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,10 +25,18 @@ import (
 //
 //	对话发起：POST /api/sessions/{id}/prompt（HTTP）≡ WS command.submit（transport）
 //	审批应答：POST /api/approvals/{id}/respond（HTTP）≡ WS approval.respond（transport）
-//	审批请求：WS approval.request（服务端广播，无 HTTP 对应——它是实时推送）
+//	审批请求：WS approval.request（服务端广播 + 新连接重发，G11）≡ GET /api/approvals/pending（枚举面，G11）
 //
 // 四个入口最终都汇到本文件的两个原语：Hub.runPromptAsync（对话）+ protocolApprover（审批）。
 // HTTP 与 WS **同源同口径**（都经 protocolApprover.Respond / runPromptAsync），不各写一套。
+//
+// 挂起审批的两个补面（v3-S5，G11）：approval.request 是**一次性广播**——页面刷新 /
+// WS 重连后看不到已挂起的审批（只能等 600s 超时 deny 或盲猜 request_id）。于是：
+// GET /api/approvals/pending **枚举**当前挂起的（完整 request 形状 + 等待起始/截止），
+// transport 的 onConnect 钩子在**新连接建立时**把仍挂起的重发给那条连接（经
+// ResendPending）。投递是 **at-least-once**：锁内快照、锁外投递，投递窗口内被应答
+// 的仍可能送达——客户端按 request_id 去重/幂等呈现；对已决 request_id 再应答，
+// 服务端回 404 no_pending_approval（不假成功）。
 //
 // # 托管口径（G2）：对话发起只对**本进程托管**的 session 有效
 //
@@ -110,6 +119,14 @@ type protocolApprover struct {
 // 按 deny 收场。等待者退出时在**同一把锁**下摘表项并把 alive 置否，投递与摘除因此是
 // 串行的：要么应答先到（等待者看得到），要么等待者先走（应答被拒，不假成功）。
 type pendingApproval struct {
+	// req 是触发这条审批的原始请求（G11：枚举/重发面要把完整形状回给客户端——
+	// 广播那一下 payload 就是它，补发/枚举复用同一份，不另抄字段）。
+	req contracts.ApprovalRequest
+	// startedAt 是挂起起始时刻（UTC；G11 枚举面的"等了多久"）。
+	startedAt time.Time
+	// deadline 是**整轮**预算的截止时刻（Approve 的 ctx deadline = promptRunTimeout；
+	// 零值 = 这个 ctx 没有上界——枚举面省略 deadline 字段）。
+	deadline time.Time
 	// ch 是应答通道（buffered(1)：投递不阻塞，通道只此一次投递）。
 	ch chan contracts.ApprovalResponse
 	// alive 表示等待者是否还在等（false = 等待者已退出，不再接受应答）。
@@ -142,7 +159,17 @@ func (a *protocolApprover) Approve(ctx context.Context, req contracts.ApprovalRe
 		return denyApproval(req, fmt.Sprintf("fail-close: 审批前上下文已结束（%v）", err)), nil
 	}
 
-	p := &pendingApproval{ch: make(chan contracts.ApprovalResponse, 1), alive: true}
+	p := &pendingApproval{
+		req:       req,
+		startedAt: time.Now().UTC(),
+		ch:        make(chan contracts.ApprovalResponse, 1),
+		alive:     true,
+	}
+	// 整轮预算的截止时刻（协议 prompt 的 ctx 带 promptRunTimeout 上界）——枚举面
+	// （GET /api/approvals/pending）按它算剩余预算。ctx.Deadline() 是廉价查询。
+	if dl, ok := ctx.Deadline(); ok {
+		p.deadline = dl
+	}
 	a.mu.Lock()
 	a.pending[req.ID] = p
 	a.mu.Unlock()
@@ -222,6 +249,91 @@ func (a *protocolApprover) retire(id contracts.Ulid, p *pendingApproval) {
 	}
 	if p != nil {
 		p.alive = false
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 挂起审批的枚举面与重发面（v3-S5，G11）
+// ---------------------------------------------------------------------------
+
+// PendingApprovalView 是一条挂起审批的枚举视图（GET /api/approvals/pending 的行）。
+//
+// **host 视图，非 contracts 契约类型**（契约只有 ApprovalRequest/ApprovalResponse 本体）。
+// 内嵌 ApprovalRequest → id/ts/session_id/agent_id/trigger/tool_call_id/side_effect/
+// summary/detail 原样平铺——与 approval.request 广播载荷同形状，GUI 一套解码逻辑复用；
+// 另加两个"挂了多久"的字段（广播载荷里没有：审批是瞬时推送，只有枚举面需要它们）。
+type PendingApprovalView struct {
+	contracts.ApprovalRequest
+	// WaitingSince 是挂起起始时刻（RFC3339Nano UTC）。
+	WaitingSince string `json:"waiting_since"`
+	// Deadline 是**整轮**预算的截止时刻（RFC3339 UTC；promptRunTimeout /
+	// Config.PromptRunTimeoutSec 的时钟；这个 ctx 没有上界时省略）。
+	// 剩余预算 = deadline − now，前端自算（服务端不存倒计时）。
+	Deadline string `json:"deadline,omitempty"`
+}
+
+// Pending 返回当前挂起审批的枚举快照（G11：GET /api/approvals/pending 的数据面）。
+//
+// 只列**还在等**的（alive = 等待者还在）：已应答（Respond 摘除）/ 已超时 fail-close
+// 收场（retire 摘除）的表项不会出现——枚举面与重发面同一口径。空表返回空切片
+// （非 nil：HTTP 面直接回 []，前端不用判 null）。nil 接收者也安全（返回空切片）。
+// 行序确定（对齐 projection.rows 的确定性纪律）：WaitingSince 升序 → ID 升序。
+func (a *protocolApprover) Pending() []PendingApprovalView {
+	if a == nil {
+		return []PendingApprovalView{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]PendingApprovalView, 0, len(a.pending))
+	for _, p := range a.pending {
+		if !p.alive {
+			continue // 等待者已退出（表项理应已摘，双保险）：不算挂起
+		}
+		v := PendingApprovalView{
+			ApprovalRequest: p.req,
+			WaitingSince:    p.startedAt.Format(time.RFC3339Nano),
+		}
+		if !p.deadline.IsZero() {
+			v.Deadline = p.deadline.UTC().Format(time.RFC3339)
+		}
+		out = append(out, v)
+	}
+	// 排序：WaitingSince 升序，同刻按 ID 升序——map 迭代序不确定，不排就是"每次刷新
+	// 行序都变"（UI 抖动 + 客户端 diff 误报）。RFC3339Nano UTC 的字符串序 = 时间序
+	// （定宽字段 + 尾零裁剪不破坏字典序），与投影 rows 的 lessRow 同一纪律。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].WaitingSince != out[j].WaitingSince {
+			return out[i].WaitingSince < out[j].WaitingSince
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// ResendPending 把当前仍挂起的 approval.request 重发给**一条**新连接（G11）。
+//
+// 调用方：transport.Server 的 onConnect 钩子（新 WS 连接建立时，见 hub.New 的装配）。
+// 为什么需要：approval.request 是一次性 Broadcast——页面刷新/WS 重连后新连接错过
+// 那一下就永远看不到这条挂起（只能等整轮超时 deny 或盲猜 request_id）。补发把
+// "当时还挂着的"推给"刚连上的"。at-least-once：锁内快照、锁外投递——投递窗口内
+// 被应答的仍可能送达，客户端按 request_id 去重/幂等呈现；重复应答服务端回 404。
+//
+// 锁外发送（先快照再发）：不持 a.mu 时被一条慢/死连接阻塞。send 失败忽略——
+// 那条连接的 ServeWS defer 会收尸，补发本来就只是尽力而为。
+func (a *protocolApprover) ResendPending(send transport.ConnSender) {
+	if a == nil || send == nil {
+		return
+	}
+	a.mu.Lock()
+	reqs := make([]contracts.ApprovalRequest, 0, len(a.pending))
+	for _, p := range a.pending {
+		if p.alive {
+			reqs = append(reqs, p.req)
+		}
+	}
+	a.mu.Unlock()
+	for _, req := range reqs {
+		_ = send.Send(transport.KindApprovalRequest, req)
 	}
 }
 
@@ -343,9 +455,12 @@ func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	// 托管校验（G2 口径）：别的进程托管的 session 不在这儿跑——那会让两个进程往同一个
 	// session/agent 写事件（G25 破）。404 与 peers/gates/agentlink 同口径（unknown_session）。
+	// 文案带指引（G12）：一库一 hub 是预期拓扑，读面看得见但发不了 prompt 的 session
+	// 要"开新会话"继续，不是"修一修这个 id"。
 	if !h.hostsSession(sid) {
 		writeJSONError(w, http.StatusNotFound, "unknown_session",
-			fmt.Sprintf("session %s 不是本 hub 托管的 session（它由别的进程托管，或还没在本进程起过对话）", sid))
+			fmt.Sprintf("session %s 不是本 hub 托管的 session（一库一 hub 是预期拓扑："+
+				"它由别的进程建/已被本进程重启失管；请 POST /api/sessions 开新会话继续）", sid))
 		return
 	}
 	if !h.startPromptAsync(sid, body.Prompt) {
@@ -411,6 +526,22 @@ func (h *Hub) serveApprovalRespond(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// serveApprovalPending 服务 GET /api/approvals/pending（G11：挂起审批的枚举面）。
+//
+//	200 → [PendingApprovalView, ...]：每条含 approval.request 的完整形状（id/ts/session_id/
+//	      agent_id/trigger/summary/detail …，与 WS 广播载荷同形状）+ waiting_since（挂起
+//	      起始）+ deadline（整轮预算截止；ctx 没有上界时省略）。空表 → []（不是 null）。
+//
+// 为什么要有（G11）：approval.request 是**一次性广播**——页面刷新/WS 重连后看不到
+// 已挂起的审批（只能等整轮超时 deny 或盲猜 request_id）。本端点给"可查询"，WS 新连接
+// 重发（transport onConnect → ResendPending）给"可重收"。两处皆 at-least-once：
+// 投递窗口内被应答的仍可能送达，客户端按 request_id 去重/幂等呈现；重复应答服务端
+// 回 404（不假成功）。
+func (h *Hub) serveApprovalPending(w http.ResponseWriter, r *http.Request) {
+	// nil 接收者也安全（返回空切片）；正常装配下恒非 nil（New 恒建 protocolApprover）。
+	writeJSONBody(w, http.StatusOK, h.protocolApprover.Pending())
+}
+
 // ---------------------------------------------------------------------------
 // WS 入站处理器（transport.InboundHandler）：command.submit / approval.respond
 // ---------------------------------------------------------------------------
@@ -464,10 +595,11 @@ func (h *Hub) HandleInbound(_ context.Context, m contracts.TransportMessage) (*c
 		}
 		if explicit && !h.hostsSession(sid) {
 			// 托管校验（与 HTTP prompt 面同口径）：别的进程托管的 session 不在这儿跑
-			// （那会让两个进程往同一个 session/agent 写事件 → G25 破）。
+			// （那会让两个进程往同一个 session/agent 写事件 → G25 破）。文案带指引
+			// （G12）：一库一 hub 是预期拓扑，要继续就开新会话，不是修这个 id。
 			return nil, fmt.Errorf(
-				"session %s 不是本 hub 托管的 session（它由别的进程托管，或还没在本进程起过对话）；"+
-					"要开新会话就别带 session_id（服务端新建）", sid)
+				"session %s 不是本 hub 托管的 session（一库一 hub 是预期拓扑：它由别的进程建/"+
+					"已被本进程重启失管）；要开新会话就别带 session_id（服务端新建）或 POST /api/sessions", sid)
 		}
 		if !h.startPromptAsync(sid, cs.Prompt) {
 			// hub 已关闭（正在收尾）：不受理（受理了也不会真跑）。

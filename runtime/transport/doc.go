@@ -34,6 +34,22 @@
 // durable_only 三项，AND 语义，全空 = 全收。**Broadcast 不走订阅过滤**（approval.request
 // 要所有连接都看到、都能应答）。
 //
+// 挂起审批的重发（v3-S5，G11）：approval.request 是**一次性 Broadcast**——页面刷新 /
+// WS 重连后的新连接错过那一下就永远看不到已挂起的审批（只能等整轮超时 deny 或盲猜
+// request_id）。宿主经 SetOnConnect（ConnSender 钩子）登记后，**新连接建立时**服务端
+// 把当前仍挂起的 approval.request **只补发给这条连接**（摘除语义在宿主侧；补发是
+// **at-least-once**——投递窗口内被应答的仍可能送达，客户端按 request_id 去重/幂等
+// 呈现，重复应答由 host 回 404）；HTTP 枚举面另有 GET /api/approvals/pending（host 层，非本包）。
+// 补发不经订阅过滤（与 Broadcast 同口径）；重复订阅 = 替换，口径不变。
+//
+// # 多 hub 拓扑（预期**一库一 hub**，G25/G12，契约级限制记 v4）
+//
+// 本传输面的消息**没有 hub 归属**：一条 approval.request / event 不带"来自哪个 hub
+// 进程"。多 hub 共享同一个事件库时读面会串台（另一个 hub 建的 session / 事件照样可见
+// ——读面按库投影，这是正确行为），而托管写面（带 session_id 的 command.submit、挂起
+// 审批的应答续跑）只对**本进程**有效。跨进程托管/路由不做（记 v4）。**多 hub 请各自
+// 一个库**；会话列表的 hostable 字段（GET /api/sessions，host 层）标出"本进程可不可发"。
+//
 // # loopback 安全边界（N5b / O7，v0 的口径）
 //
 // WebSocket **不受同源策略约束**：hub 即使只监听 127.0.0.1，浏览器里的任意恶意网页

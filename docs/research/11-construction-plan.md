@@ -232,7 +232,7 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **v3-S5 整备+联调** | ① `POST /api/sessions`（从 v4 提前：创建**本进程托管**的 session 返回 id，之后 `POST /api/sessions/{id}/prompt` 即可用——REST 直觉的开新会话入口，G25 自洽）② **与 UI 侧联调**：起真 hub（用户本地网关 `http://127.0.0.1:51142/compat/v1` + gpt-4omini 真模型）+ `D:\vscode\alasol-gui` 的 GUI（同源代理），走通"开 session→发 prompt→模型跑→事件流→上下文/成本面板→ask 审批应答→/btw→merge check"全流程；③ **联调暴露的阻塞项现场修**（走迷你评审循环）；④ 联调报告（可用/不可用清单） | REST 开新会话→prompt 真模型跑通；GUI 三面板实时可见；审批闭环（request→respond→工具执行/拒绝）；联调发现的阻塞项修完或如实挂账；07 注记同步 | **✅ 完成（2026-01-30，联调+修复评审至 clean）**：REST 开会话/真模型 prompt/三面板/审批 allow+deny 闭环/merge V6/回放**真机全通**（gpt-4o-mini 经用户网关）；联调暴露并修复：审批超时审计断链（settle ctx：审计留痕/执行守约分离）+ 取消护栏回退（执行与 spawn 前显式 ctx 检查）；**记 v4**：policy 结构化成因码 |
+| **v3-S5 整备+联调** | ① `POST /api/sessions`（从 v4 提前：创建**本进程托管**的 session 返回 id，之后 `POST /api/sessions/{id}/prompt` 即可用——REST 直觉的开新会话入口，G25 自洽）② **与 UI 侧联调**：起真 hub（用户本地网关 `http://127.0.0.1:51142/compat/v1` + gpt-4omini 真模型）+ `D:\vscode\alasol-gui` 的 GUI（同源代理），走通"开 session→发 prompt→模型跑→事件流→上下文/成本面板→ask 审批应答→/btw→merge check"全流程；③ **联调暴露的阻塞项现场修**（走迷你评审循环）；④ 联调报告（可用/不可用清单） | REST 开新会话→prompt 真模型跑通；GUI 三面板实时可见；审批闭环（request→respond→工具执行/拒绝）；联调发现的阻塞项修完或如实挂账；07 注记同步 | **✅ 完成（2026-01-30，联调+修复评审至 clean）**：REST 开会话/真模型 prompt/三面板/审批 allow+deny 闭环/merge V6/回放**真机全通**（gpt-4o-mini 经用户网关）；联调暴露并修复：审批超时审计断链（settle ctx：审计留痕/执行守约分离）+ 取消护栏回退（执行与 spawn 前显式 ctx 检查）；**GUI 反馈轮**：G11 挂起审批枚举+WS 重发（at-least-once）、G12 一库一 hub 口径（hostable 字段+404 指引+文档明示，跨 hub 根治记 v4）；**记 v4**：policy 结构化成因码 |
 
 ---
 

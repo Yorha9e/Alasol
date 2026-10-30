@@ -16,10 +16,15 @@ const scanBatch = 500
 // SessionRow 是在线表的一行（GET /api/sessions 的元素形状）。
 //
 // 口径与索引器的 sessions 投影表一致（first_seq / last_seq / event_count / last_kind），
-// 另加两个 UI 直接要的字段：
+// 另加 UI 直接要的字段：
 //   - updated_at：该 session 最后一条事件的 ts（RFC 3339）——索引器的 sessions 表
 //     不存它（表里没有这一列），而"多久没动静"是在线表的第二常用信息；
-//   - watermark：**全局**索引水位（indexer.Watermark()），附在每行上省得前端再要一次。
+//   - watermark：**全局**索引水位（indexer.Watermark()），附在每行上省得前端再要一次；
+//   - hostable：**本进程**是否托管该 session（= 协议面可对它发 prompt；G12，v3-S5）。
+//     一库一 hub 是预期拓扑（G25）：共享库的读面按库投影（别的 hub 建的 session 也
+//     在表里——可读），但托管写面只对本进程的 loop 生效（不可发）——此前列表不区分，
+//     GUI 只能点下去吃 404。**只增不破坏**（行 JSON 多一个 bool，旧前端可忽略）。
+//     填充在 Hub.Sessions（投影不认识 h.loops；见 hub.go）。
 type SessionRow struct {
 	SessionID  string `json:"session_id"`
 	FirstSeq   int64  `json:"first_seq"`
@@ -28,6 +33,7 @@ type SessionRow struct {
 	LastKind   string `json:"last_kind"`
 	UpdatedAt  string `json:"updated_at"`
 	Watermark  int64  `json:"watermark"`
+	Hostable   bool   `json:"hostable"`
 }
 
 // sessionState 是投影里单个 session 的累积状态。

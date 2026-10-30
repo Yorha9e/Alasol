@@ -30,7 +30,7 @@ var httpLog = slog.Default()
 //	GET /ws                      → transport.Server.ServeWS（NDJSON 行式事件流）
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
 //	GET /api/monitor             → MonitorView（K9：当前采样 + 阈值 + 告警环）
-//	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行）
+//	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12）
 //	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
 //	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
 //	GET /api/cost/{session_id}   → TokenCostView（单 session token 成本，按模型分组）
@@ -80,6 +80,7 @@ var httpLog = slog.Default()
 //	POST /api/sessions                        → {"session_id":…}（201；开新会话的 REST 入口，v3-S5 ①）
 //	POST /api/sessions/{session_id}/prompt   → {"session_id":…,"status":"running"}（202；异步跑，结果经事件流）
 //	POST /api/approvals/{request_id}/respond → {"request_id":…,"decision":…}（注入挂起的审批；无人应答 = deny，fail-close）
+//	GET  /api/approvals/pending              → [PendingApprovalView, ...]（G11：挂起审批枚举面；空表 → []）
 //
 // 其它方法/路径 → **405 / 404，一律 JSON 错误体**（前端统一按 JSON 解）：
 // /api/* 未命中具体路由时，路径认得但方法不符 → 405（带 Allow），路径不认得 → 404
@@ -162,9 +163,11 @@ func (h *Hub) Handler() http.Handler {
 	// 事件回放（v3-S4，G3）：按 seq 补读全局事实流（断线补读面）。
 	reg("GET", "/api/events", h.serveEvents)
 
-	// 对话 / 审批（v3-S4，G1）：协议面发起一轮对话 + 应答挂起的审批。
+	// 对话 / 审批（v3-S4，G1）：协议面发起一轮对话 + 应答/枚举挂起的审批。
 	reg("POST", "/api/sessions/{session_id}/prompt", h.servePrompt)
 	reg("POST", "/api/approvals/{request_id}/respond", h.serveApprovalRespond)
+	// 挂起审批枚举面（v3-S5，G11）：与 respond 不同路径、不同方法（405 口径各自独立）。
+	reg("GET", "/api/approvals/pending", h.serveApprovalPending)
 
 	// /api/* 回退面（G7）：未命中具体路由时，按 probe+tbl 判 405 / 404，一律 JSON 错误体。
 	mux.HandleFunc("/api/", h.serveAPIFallback(tbl, probe))
@@ -508,8 +511,10 @@ func (h *Hub) serveWorktreeRemove(w http.ResponseWriter, r *http.Request) {
 func writeHubError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrSessionNotHosted):
+		// 文案带指引（G12）：一库一 hub 是预期拓扑（G25）——别的进程建/重启失管的
+		// session 在本进程读面可见、写面 404，出路是开新会话继续，不是修这个 id。
 		writeJSONError(w, http.StatusNotFound, "unknown_session",
-			"这个 session 不是本 hub 在托管的 session（先跑一轮 prompt，或它属于别的 hub 进程）")
+			"这个 session 不是本 hub 在托管的 session（一库一 hub 是预期拓扑：它由别的进程建/已被本进程重启失管；请 POST /api/sessions 开新会话继续）")
 		return
 	case errors.Is(err, agentlink.ErrBadIdentity):
 		writeJSONError(w, http.StatusBadRequest, "bad_identity", err.Error())

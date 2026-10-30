@@ -454,3 +454,170 @@ func TestCloseCancelsInFlightProtocolPrompt(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 回归：挂起审批的枚举面与重发面（v3-S5，G11）
+// ---------------------------------------------------------------------------
+
+// fakeConnSender 收集补发给"一条连接"的控制消息（G11 的 ConnSender 测试替身）。
+type fakeConnSender struct {
+	kinds []string
+	reqs  []contracts.ApprovalRequest
+}
+
+func (s *fakeConnSender) Send(kind string, payload any) error {
+	s.kinds = append(s.kinds, kind)
+	if req, ok := payload.(contracts.ApprovalRequest); ok {
+		s.reqs = append(s.reqs, req)
+	}
+	return nil
+}
+
+// TestProtocolApproverPendingSnapshot（G11）：Pending() 枚举**仍在等**的审批——
+// 完整 request 形状（含 detail）+ waiting_since + deadline；收场（应答）后为空。
+// 变异自证：Pending() 恒回空 → 挂起中的断言必红。
+func TestProtocolApproverPendingSnapshot(t *testing.T) {
+	bc := newTestBroadcaster()
+	pa := newProtocolApprover(bc)
+	if got := pa.Pending(); len(got) != 0 {
+		t.Fatalf("初始 pending 应为空，得到 %+v", got)
+	}
+
+	req := testAskReq()
+	req.Detail = json.RawMessage(`{"tool":"read","args":{"path":"/x"}}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan contracts.ApprovalResponse, 1)
+	go func() {
+		resp, _ := pa.Approve(ctx, req)
+		done <- resp
+	}()
+	bc.waitKind(t, transport.KindApprovalRequest)
+
+	got := pa.Pending()
+	if len(got) != 1 {
+		t.Fatalf("挂起中 pending 应恰 1 条，得到 %d 条", len(got))
+	}
+	v := got[0]
+	if v.ID != req.ID || v.SessionID != req.SessionID || v.Summary != req.Summary {
+		t.Fatalf("枚举行的 request 形状不符: %+v", v)
+	}
+	if string(v.Detail) != string(req.Detail) {
+		t.Fatalf("枚举行 detail = %s，want %s", v.Detail, req.Detail)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, v.WaitingSince); err != nil {
+		t.Fatalf("waiting_since 不是 RFC3339Nano: %q（%v）", v.WaitingSince, err)
+	}
+	// 协议 Approve 的 ctx 带 deadline（测试里 5s；生产里 promptRunTimeout）→ deadline 该有。
+	if _, err := time.Parse(time.RFC3339, v.Deadline); err != nil {
+		t.Fatalf("deadline 不是 RFC3339: %q（%v）", v.Deadline, err)
+	}
+
+	// 应答收场 → 枚举面立刻为空（Respond 在投递前就摘了表项）。
+	if !pa.Respond(contracts.ApprovalResponse{
+		V: 1, RequestID: req.ID, TS: req.TS, Decision: contracts.ApprovalDecisionAllow,
+	}) {
+		t.Fatalf("挂起中的审批应被 Respond 接受")
+	}
+	<-done
+	if got := pa.Pending(); len(got) != 0 {
+		t.Fatalf("收场后 pending 应为空，得到 %+v", got)
+	}
+}
+
+// TestProtocolApproverPendingDeterministicOrder（G11/F3）：Pending() 行序确定——
+// WaitingSince 升序，同刻按 ID 升序（对齐 projection rows 的确定性纪律）。
+// 变异自证：去掉 Pending 里的 sort → map 迭代序随机，多次枚举必不一致/顺序错。
+func TestProtocolApproverPendingDeterministicOrder(t *testing.T) {
+	pa := newProtocolApprover(newTestBroadcaster())
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	// 故意乱序登记 4 条：waiting 时刻交错 + 同刻两条靠 ID 决出（钉住两级排序键）。
+	// 直接写 pending 表（不真跑 Approve）：这里只钉枚举面的行序，不需要等待者。
+	specs := []struct {
+		id      contracts.Ulid
+		started time.Time
+	}{
+		{"d", base.Add(30 * time.Second)},
+		{"b", base.Add(10 * time.Second)},
+		{"c", base.Add(10 * time.Second)}, // 与 b 同刻 → 按 ID 升序排在 b 后
+		{"a", base},
+	}
+	pa.mu.Lock()
+	for _, sp := range specs {
+		pa.pending[sp.id] = &pendingApproval{
+			req:       contracts.ApprovalRequest{ID: sp.id, Summary: "row-order"},
+			startedAt: sp.started,
+			ch:        make(chan contracts.ApprovalResponse, 1),
+			alive:     true,
+		}
+	}
+	pa.mu.Unlock()
+
+	want := []contracts.Ulid{"a", "b", "c", "d"}
+	first := pa.Pending()
+	if len(first) != len(want) {
+		t.Fatalf("pending 行数 = %d，want %d", len(first), len(want))
+	}
+	for i, id := range want {
+		if first[i].ID != id {
+			t.Fatalf("第 %d 行 ID = %q，want %q（WaitingSince 升序 → ID 升序）", i, first[i].ID, id)
+		}
+	}
+	// 多次枚举同序：map 迭代序每次随机，不排序时这里几乎必红（4! = 24 种排列）。
+	for i := 0; i < 20; i++ {
+		again := pa.Pending()
+		if len(again) != len(first) {
+			t.Fatalf("第 %d 次枚举行数 = %d，want %d", i, len(again), len(first))
+		}
+		for j := range again {
+			if again[j].ID != first[j].ID {
+				t.Fatalf("第 %d 次枚举第 %d 行 = %q，want %q（行序必须确定）",
+					i, j, again[j].ID, first[j].ID)
+			}
+		}
+	}
+}
+
+// TestProtocolApproverResendPending（G11）：ResendPending 只补发**仍挂着**的
+// approval.request；摘除（应答/超时收场）后一条都不发；nil send 安全。
+// 变异自证：ResendPending 恒 no-op → 挂起中的断言必红。
+func TestProtocolApproverResendPending(t *testing.T) {
+	bc := newTestBroadcaster()
+	pa := newProtocolApprover(bc)
+
+	// 没有挂起 → 补发 0 条（含 nil send 也不炸）。
+	pa.ResendPending(nil)
+	empty := &fakeConnSender{}
+	pa.ResendPending(empty)
+	if len(empty.kinds) != 0 {
+		t.Fatalf("无挂起时不该补发，得到 %v", empty.kinds)
+	}
+
+	req := testAskReq()
+	done := make(chan contracts.ApprovalResponse, 1)
+	go func() {
+		resp, _ := pa.Approve(context.Background(), req)
+		done <- resp
+	}()
+	bc.waitKind(t, transport.KindApprovalRequest)
+
+	// 挂起中 → 补发恰好一条，kind/payload 都对。
+	s1 := &fakeConnSender{}
+	pa.ResendPending(s1)
+	if len(s1.reqs) != 1 || s1.kinds[0] != transport.KindApprovalRequest || s1.reqs[0].ID != req.ID {
+		t.Fatalf("挂起中补发不符: kinds=%v reqs=%+v", s1.kinds, s1.reqs)
+	}
+
+	// 应答收场 → 再补发 0 条（已决/已退休的不重发——这正是"别把退休的发出去"的钉子）。
+	if !pa.Respond(contracts.ApprovalResponse{
+		V: 1, RequestID: req.ID, TS: req.TS, Decision: contracts.ApprovalDecisionAllow,
+	}) {
+		t.Fatalf("挂起中的审批应被 Respond 接受")
+	}
+	<-done
+	s2 := &fakeConnSender{}
+	pa.ResendPending(s2)
+	if len(s2.kinds) != 0 {
+		t.Fatalf("收场后不该补发，得到 %v", s2.kinds)
+	}
+}

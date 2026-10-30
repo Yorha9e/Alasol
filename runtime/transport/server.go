@@ -37,6 +37,11 @@ type Server struct {
 	// conns 是活动连接注册表（Broadcast 用：向所有连接推控制消息，如 approval.request）。
 	connsMu sync.Mutex
 	conns   map[*wsConn]struct{}
+
+	// onConnect 是"新连接建立"钩子（G11）：宿主用它向新连接补发挂起的控制消息
+	// （如仍挂着的 approval.request——Broadcast 只覆盖当时在线的，后来的要补）。
+	// nil = 不补发。装配期经 SetOnConnect 注入一次（与 inbound 同口径）。
+	onConnect func(ConnSender)
 }
 
 // InboundHandler 处理需要宿主回应的入站消息（command.submit / approval.respond，G1）。
@@ -56,6 +61,15 @@ type Broadcaster interface {
 	Broadcast(kind string, payload any)
 }
 
+// ConnSender 是"只向**一条**连接发消息"的口（G11 挂起审批重发）。实现是 *wsConn。
+//
+// 与 Broadcaster 的分工：Broadcast 覆盖"发出那一刻在线的所有连接"；ConnSender 只到
+// 一条连接——宿主经 SetOnConnect 登记的钩子在**新连接建立时**拿到它，把该补发的
+// 控制消息（如仍挂起的 approval.request）只发给这条新连接（刷新/重连不丢挂起）。
+type ConnSender interface {
+	Send(kind string, payload any) error
+}
+
 // NewServer 构造传输服务端。bus 必填（nil → panic：没有事件流的 WS 服务没有意义，
 // 静默降级只会把故障推迟到更难诊断的地方）。
 func NewServer(b *bus.Bus) *Server {
@@ -69,6 +83,16 @@ func NewServer(b *bus.Bus) *Server {
 // 传 nil = 回到纯事件服务端（这些 kind 走 unknown_kind）。装配期调用一次。
 func (s *Server) SetInboundHandler(h InboundHandler) {
 	s.inbound = h
+}
+
+// SetOnConnect 注入"新连接建立"钩子（G11 挂起审批重发）。
+//
+// 调用时机：连接已 track（Broadcast 已把它算作在线）、读循环开始之前——此刻补发
+// 不会与任何入站消息交错。宿主经拿到的 ConnSender 只向这条连接发消息（典型：
+// 把仍挂起的 approval.request 重发给刷新/重连的新客户端）。nil = 回到不补发。
+// 装配期调用一次（与 SetInboundHandler 同口径）。
+func (s *Server) SetOnConnect(fn func(ConnSender)) {
+	s.onConnect = fn
 }
 
 // Broadcast 向所有活动连接广播一条消息（不经订阅过滤）。
@@ -150,6 +174,15 @@ func (s *Server) ServeWS(w http.ResponseWriter, r *http.Request) {
 		s.untrack(c)
 		_ = conn.CloseNow()
 	}()
+	if s.onConnect != nil {
+		// G11：新连接补发宿主侧挂起的控制消息（如仍挂着的 approval.request）。
+		// Broadcast 只覆盖"发出那一刻在线的连接"——刷新/重连后的新连接要靠这里补齐。
+		// at-least-once：track 后补发与并发 Broadcast 可能重叠——同一条可能向这条连接
+		// 投递两次；客户端按 request_id 去重/幂等呈现。不改成"先补发再 track"（那样
+		// 补发快照后、track 前广播的那条两边都收不到——宁重勿漏，与 host 文档同口径）。
+		// 发失败忽略：连接刚死的话下面的读循环立刻会发现。
+		s.onConnect(c)
+	}
 
 	s.serveConn(ctx, c)
 }
@@ -306,6 +339,19 @@ type wsConn struct {
 	mu     sync.Mutex
 	sub    *bus.Subscription
 	curFil bus.Filter // 当前订阅的过滤条件（subscribed 回执回显用，与 sub 同锁更新）
+}
+
+// 编译期断言：*wsConn 满足 ConnSender（onConnect 钩子的补发口）。
+var _ ConnSender = (*wsConn)(nil)
+
+// Send implements ConnSender：向**这条**连接发一条控制消息（G11 补发口；kind 任意，
+// 不经订阅过滤——与 Broadcast 同口径，只是目标只有这一条连接）。
+func (c *wsConn) Send(kind string, payload any) error {
+	m, err := NewMessage(kind, payload)
+	if err != nil {
+		return err
+	}
+	return c.send(m)
 }
 
 // subscribe 换上新订阅：旧订阅先摘（关通道 → 旧推送 goroutine 自然退出）。

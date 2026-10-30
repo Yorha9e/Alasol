@@ -633,6 +633,92 @@ func TestReopenPreservesOnlineTableAndSnapshot(t *testing.T) {
 	}
 }
 
+// TestSessionsHostableField（G12）：GET /api/sessions 行的 hostable = **本进程**托管与否
+// （= 协议面可不可发 prompt）。
+//
+// 一库一 hub 是预期拓扑（G25）：共享库的读面按库投影——别的 hub 建的 session 在本进程
+// 列表里**看得见**（这是正确行为），但托管写面只对本进程的 loop 生效（不可发）。此前
+// 列表不区分，GUI 只能点下去吃 404 unknown_session；hostable 让它直接灰掉不可发行。
+// 变异自证：hostable 恒 true → 外来/重启失管两步必红。
+func TestSessionsHostableField(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "hostable.db")
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("hostable"), 0o600); err != nil {
+		t.Fatalf("写目标文件: %v", err)
+	}
+	// 每次 New 用**新的** provider 实例（脚本 provider 的调用计数是实例态——共用一个
+	// 会让第二个 hub 直接收到收尾文本，runOneRound 的 Events==4 断言随机红）。
+	cfg := func() host.Config {
+		return host.Config{
+			DBPath: db, Model: "scripted", System: "hostable", MaxTurns: 4,
+			Allow:    []string{"read"},
+			Provider: &scriptedProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`},
+			CWD:      tempRepoOrDir(t),
+		}
+	}
+	rowFor := func(t *testing.T, h *host.Hub, sid contracts.Ulid) host.SessionRow {
+		t.Helper()
+		rows, err := h.Sessions(context.Background())
+		if err != nil {
+			t.Fatalf("Sessions: %v", err)
+		}
+		for _, r := range rows {
+			if r.SessionID == string(sid) {
+				return r
+			}
+		}
+		t.Fatalf("在线表里找不到 session %s（rows=%+v）", sid, rows)
+		return host.SessionRow{}
+	}
+
+	// ① 本进程托管（跑过一轮 = h.loops 有 loop）→ hostable=true。
+	h1, err := host.New(cfg())
+	if err != nil {
+		t.Fatalf("host.New #1: %v", err)
+	}
+	sid1 := runOneRound(t, h1, "A 在吗")
+	if got := rowFor(t, h1, sid1); !got.Hostable {
+		t.Fatalf("本进程托管的 session hostable = false，want true: %+v", got)
+	}
+
+	// ② 外来（另一个 hub 进程同时开着**同一个库**）→ 读面可见（正确）但 hostable=false。
+	h2, err := host.New(cfg())
+	if err != nil {
+		t.Fatalf("host.New #2: %v", err)
+	}
+	if got := rowFor(t, h2, sid1); got.Hostable {
+		t.Fatalf("别的 hub 建的 session 对本进程不该 hostable=true: %+v", got)
+	}
+	// h2 自己跑的 → true（同一张表里两种值并存，正是 GUI 要区分的"3 个会话只有 1 个可发"）。
+	sid2 := runOneRound(t, h2, "B 在吗")
+	if got := rowFor(t, h2, sid2); !got.Hostable {
+		t.Fatalf("本进程自己跑的 session hostable = false，want true: %+v", got)
+	}
+
+	// ③ 重启失管：关掉两个宿主，重开 h3 → 旧 session 仍在表里（可读）但全部
+	//    hostable=false（loops 是内存态，重启即空——G2 的重启口径）；h3 自己跑的 true。
+	if err := h1.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+	if err := h2.Close(); err != nil {
+		t.Fatalf("Close #2: %v", err)
+	}
+	h3, err := host.New(cfg())
+	if err != nil {
+		t.Fatalf("host.New #3: %v", err)
+	}
+	defer h3.Close()
+	for _, sid := range []contracts.Ulid{sid1, sid2} {
+		if got := rowFor(t, h3, sid); got.Hostable {
+			t.Fatalf("重启失管的 session %s hostable = true，want false: %+v", sid, got)
+		}
+	}
+	sid3 := runOneRound(t, h3, "C 在吗")
+	if got := rowFor(t, h3, sid3); !got.Hostable {
+		t.Fatalf("重启后本进程新跑的 session hostable = false，want true: %+v", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // WS 事件流（N4）——端到端：真 store 跑一轮，WS 客户端收到事件
 // ---------------------------------------------------------------------------

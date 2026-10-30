@@ -418,6 +418,11 @@ func New(cfg Config) (*Hub, error) {
 		h.approver = h.protocolApprover
 	}
 	h.ws.SetInboundHandler(h)
+	// G11：新 WS 连接补发仍挂起的 approval.request（onConnect 钩子 → ResendPending）。
+	// Broadcast 只覆盖"发出那一刻在线的连接"——刷新/重连的新连接靠这里补齐。补发是
+	// at-least-once：锁内快照、锁外投递，投递窗口内被应答的仍可能送达——客户端按
+	// request_id 去重/幂等呈现；重复应答服务端回 404。重复订阅 = 替换，口径不变。
+	h.ws.SetOnConnect(h.protocolApprover.ResendPending)
 
 	// N2 砖化恢复（v3-S3 修）：崩溃遗留的图投影重建窗口（graph_meta.rebuilding=1）会让
 	// 读侧引擎**永久** fail-close（影响面/冲突预测一直不可用），而 Rebuild 当时没有生产
@@ -761,7 +766,23 @@ func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host: 读索引水位: %w", err)
 	}
-	return h.proj.rows(wm, h.cfg.MaxSessionRows), nil
+	rows := h.proj.rows(wm, h.cfg.MaxSessionRows)
+	// hostable（G12）：本进程托管 = 协议面可对它发 prompt（托管写面的判据 = h.loops
+	// 里有 loop）。投影不认识 h.loops，这一列在出口处补。一库一 hub 是预期拓扑（G25）：
+	// 共享库的读面按库投影（别的 hub 建的 session 也看得见——正确行为），但它们可读
+	// 不可发；GUI 按这列灰掉不可发行，而不是点下去吃 404 unknown_session。
+	// 一次 h.mu 取 loops 快照再逐行标（对齐 fork_internal_test 的快照写法）——不逐行
+	// hostsSession 反复抢锁。
+	h.mu.Lock()
+	hosted := make(map[contracts.Ulid]bool, len(h.loops))
+	for sid := range h.loops {
+		hosted[sid] = true
+	}
+	h.mu.Unlock()
+	for i := range rows {
+		rows[i].Hostable = hosted[contracts.Ulid(rows[i].SessionID)]
+	}
+	return rows, nil
 }
 
 // indexerCatchUpWait 是 Sessions 等索引器追平的有界等待（毫秒级；索引器 50ms 一轮）。

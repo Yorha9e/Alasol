@@ -126,6 +126,14 @@
 // （投影/索引扫的是共享库），托管写面（peers/gates/join/agentlink/prompt）404。**跨进程托管注册不做
 // （记 v4）**——那需要会话亲和/活状态同步一整套（G25 的部署层约束），不是补个端点的事。
 //
+// **预期拓扑是"一库一 hub"（G25/G12，契约级限制）**：多 hub 共享同一个事件库时，读面
+// 按**库**投影——A 进程建的 session 在 B 进程的列表里看得见（这是**正确行为**），但
+// 事件**没有 hub 归属**、托管写面对非本进程的 session 一律 404——"看得见却发不了
+// prompt"对第三方不直观。呈现辅助（v3-S5 G12）：GET /api/sessions 行的 **hostable**
+// 字段（bool：本进程托管 = 可发 prompt；只增不破坏）标出"可发/不可发"，GUI 直接灰掉
+// 不可发行；404 unknown_session 的文案也点明出路（POST /api/sessions 开新会话继续）。
+// **多 hub 请各自一个库**；跨进程托管/路由记 v4，本刀不做。
+//
 // **重启同理**（活状态是进程本地的）：hub 重启后，**重启前**那些 session 一律**失管**
 // ——本进程没有它们的 loop（h.loops 是内存态，重启即空），发现表的"存活成员"也不会
 // 复活（老 session 不会因重扫事件流而重新变成 live，这是设计）。于是重启后：
@@ -137,6 +145,13 @@
 // 自己建 loop 并接管）——协议面**不硬接**旧 session（那正是 G25 要防的双写）。
 //
 // # 审批应答的鉴权口径（v0 的诚实边界，**有意不做鉴权**）
+//
+// 挂起审批的两个补面（v3-S5，G11）：approval.request 是**一次性广播**——页面刷新 /
+// WS 重连后看不到已挂起的审批。于是 **GET /api/approvals/pending** 枚举当前挂起的
+// （完整 request 形状 + waiting_since/deadline；空表 → []），WS **新连接建立时**把仍
+// 挂起的重发给那条连接（transport onConnect → protocolApprover.ResendPending）。
+// 两处皆 at-least-once：投递窗口内被应答的仍可能送达，客户端按 request_id 去重/
+// 幂等呈现；重复应答服务端回 404（不假成功）。
 //
 // 协议审批面（POST /api/approvals/{id}/respond、WS approval.respond）**没有鉴权**：
 // 任何能连上 hub 的客户端都能应答审批（v0 只监听 loopback + 无 cookie + 无 token，
