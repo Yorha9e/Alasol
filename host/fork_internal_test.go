@@ -863,7 +863,7 @@ func TestForkSessionFilteredFromPresenceFaces(t *testing.T) {
 	// 造"误配置"：旁支被激活 + 也 join 了同一个 gate。
 	h.Discovery().Activate(res.ForkSessionID)
 	ev, err := newGateJoinedEvent(res.ForkSessionID, res.ForkAgentID,
-		autoGate{gateID: "repo:fork-test", source: contracts.GateJoinSourceExplicit})
+		autoGate{gateID: "repo:fork-test", source: contracts.GateJoinSourceExplicit}, 0)
 	if err != nil {
 		t.Fatalf("newGateJoinedEvent: %v", err)
 	}

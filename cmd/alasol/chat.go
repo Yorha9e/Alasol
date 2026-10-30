@@ -42,6 +42,10 @@ func chatMain(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// 档位白名单（fail-close）：**配置被拒 = exit 2**（与 run / resume 同一口径；F2）。
+	if rejectInvalidReasoningEffort(cfg) {
+		return 2
+	}
 	h, err := host.New(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

@@ -12,6 +12,7 @@ import (
 // "这个 agent 还活着"的证据）。常量值与契约 event.json 的 x-kind-payload 对齐。
 const (
 	KindGateJoined     = "gate.joined"
+	KindGateLeft       = "gate.left"
 	KindAgentSpawned   = "agent.spawned"
 	KindAgentCompleted = "agent.completed"
 	KindAgentFailed    = "agent.failed"
@@ -50,13 +51,26 @@ type gateJoin struct {
 	eventID contracts.Ulid
 }
 
+// gateLeft 是一次 leave 的折叠结果（LWW：同一 (session, gate) 只留最近一次）。
+//
+// 与 gateJoin 分开存（而不是在 join 记录上打标记）：join 事实要**原样保留**供审计
+// （JoinHistory 折的就是它），leave 是独立的成员关系终止事实——两者各记各的最大 seq，
+// 活跃判据 = join.seq > left.seq（见 gateActiveLocked）。
+type gateLeft struct {
+	seq     int64
+	ts      string
+	eventID contracts.Ulid
+}
+
 // sessionState 是表内单个 session 的折叠态。
 type sessionState struct {
 	id       contracts.Ulid
 	agents   map[contracts.Ulid]*agentState
 	order    []contracts.Ulid        // agent 首次见到的顺序（推主 agent 用）
 	isChild  map[contracts.Ulid]bool // 作为 agent.spawned 的 child 出现过 → 不是主 agent
-	joins    map[string]gateJoin     // gate_id → 最近一次 join（活跃成员关系的折叠）
+	joins    map[string]gateJoin     // gate_id → 最近一次 join（join 事实，LWW；不含 leave 信息）
+	lefts    map[string]gateLeft     // gate_id → 最近一次 leave（LWW；G15 显式离开）
+	joinGen  map[string]int          // gate_id → 已折叠的 join 次数（"届数"；host 算确定性事件 id 用）
 	firstSeq int64
 	lastSeq  int64
 	lastKind string
@@ -64,6 +78,42 @@ type sessionState struct {
 	// live 是**进程本地**活状态（G17b）：本进程此刻持有该 session 的 loop。
 	// 不进 Snapshot——它不是事件能重建的东西。
 	live bool
+}
+
+// gateActiveLocked 判定 (session, gate) 的成员关系是否**活跃**（G15 折叠口径：
+// 成员 = joined 减 left）。判据 = 最近一次 join 的 seq 大于最近一次 leave 的 seq。
+//
+// 为什么各记各的最大 seq 再比大小（而不是"leave 到达就删 join"）：Apply 允许乱序/重复
+// （表重建时事件不保证有序到达）——leave(7) 先于 join(5) 到达时，按 seq 比大小仍然得到
+// "已离开"的正确结论；删记录的做法则会因到达顺序不同得到不同结果。
+//
+// **"是否 leave 过"用 lefts 的键存在性判**（不是 "leave.seq > 0" 哨兵，F5）：seq 是存储层
+// 分配的全局序号，**导入 / 合成 / 尚未落库的事件可能没有 seq（0）**——拿 seq>0 当哨兵会把
+// "leave 过但 seq=0"当成"从没 leave 过"→ 成员关系被静默复活（宿主据此判断"显式离开过"
+// 时也会判错 → 自动 gate 把显式离开撤销）。
+//
+// 边界：join 与 leave 的 seq **相等**（都是 0，无法比大小）时按 **leave 赢**处理（保守：
+// 显式离开不该被自动复活；要回来得显式再 join）。
+func (st *sessionState) gateActiveLocked(gateID string) bool {
+	j, ok := st.joins[gateID]
+	if !ok {
+		return false
+	}
+	if l, lefted := st.lefts[gateID]; lefted && j.seq <= l.seq {
+		return false
+	}
+	return true
+}
+
+// activeGatesLocked 返回本 session 的活跃 gate 集合（joined 减 left；调用方持锁）。
+func (st *sessionState) activeGatesLocked() map[string]bool {
+	out := make(map[string]bool, len(st.joins))
+	for gateID := range st.joins {
+		if st.gateActiveLocked(gateID) {
+			out[gateID] = true
+		}
+	}
+	return out
 }
 
 // mainAgent 推主 agent：**不作为任何 agent.spawned 的 child 出现**的最早 agent。
@@ -92,8 +142,9 @@ type Table struct {
 	// agents 是全局索引（agent_id → agent），供 K18 Discover 与 Inquiry 预备；
 	// 权威存储在各自 sessionState 里（同一指针）。
 	agents map[contracts.Ulid]*agentState
-	// gates 是 gate_id → join 过它的 session 集合（**历史**成员，含已结束的 session；
-	// 活跃成员再叠 live 过滤，见 GateMembers）。
+	// gates 是 gate_id → **活跃成员** session 集合（G15 折叠口径：joined 减 left）。
+	// 含"已结束但未显式离开"的 session——session 结束（进程没了）不等于 leave，
+	// 结束只是不再算活跃成员（GateMembers 再叠 live 过滤）；显式 leave 才从本集合摘除。
 	gates map[string]map[contracts.Ulid]struct{}
 }
 
@@ -160,6 +211,8 @@ func (t *Table) Apply(ev *contracts.Event) {
 		t.applyTerminalLocked(st, ev, StatusFailed, seq)
 	case KindGateJoined:
 		t.applyGateJoinedLocked(st, ev, seq)
+	case KindGateLeft:
+		t.applyGateLeftLocked(st, ev, seq)
 	}
 }
 
@@ -215,6 +268,8 @@ func (t *Table) sessionLocked(id contracts.Ulid) *sessionState {
 		agents:  make(map[contracts.Ulid]*agentState),
 		isChild: make(map[contracts.Ulid]bool),
 		joins:   make(map[string]gateJoin),
+		lefts:   make(map[string]gateLeft),
+		joinGen: make(map[string]int),
 	}
 	t.sessions[id] = st
 	return st
@@ -317,6 +372,7 @@ func (t *Table) applyTerminalLocked(st *sessionState, ev *contracts.Event, statu
 	touchAgent(ag, seq)
 }
 
+// applyGateJoinedLocked 折 gate.joined：LWW 记 join 事实 + 届数计数 + 维护活跃成员集合。
 func (t *Table) applyGateJoinedLocked(st *sessionState, ev *contracts.Event, seq int64) {
 	var p contracts.GateJoinedPayload
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
@@ -326,16 +382,66 @@ func (t *Table) applyGateJoinedLocked(st *sessionState, ev *contracts.Event, seq
 	if !ok {
 		return // 坏 gate_id：跳过（S9 在写入侧就拒了，这里是纵深防御）
 	}
-	if cur, exists := st.joins[gateID]; exists && cur.seq > seq {
-		return // 旧事件盖不掉新 join（LWW + seq 守卫）
+	// >= 而非 >：**同 seq 的重复 Apply 必须空转**——否则 joinGen（届数计数）会被
+	// 重复事件累加，host 算出来的确定性事件 id 跟着漂（幂等要求 Apply 可重复）。
+	if cur, exists := st.joins[gateID]; exists && cur.seq >= seq {
+		return // 旧事件（或同一事件的重复投递）盖不掉新 join
 	}
 	st.joins[gateID] = gateJoin{gateID: gateID, source: string(p.Source), seq: seq, ts: ev.TS, eventID: ev.ID}
-	members := t.gates[gateID]
-	if members == nil {
-		members = make(map[contracts.Ulid]struct{})
-		t.gates[gateID] = members
+	st.joinGen[gateID]++
+	// gate 定义持久化（G17b）：记了 join 事实就要确保枚举里看得见这个 gate——哪怕它
+	// 随后被 leave 终止（成员走光了 gate 仍在，见 ensureGateLocked）。乱序重放时
+	// leave 可能先到、把键建出来；这里两种到达顺序都保证"有事实就有键"。
+	t.ensureGateLocked(gateID)
+	if st.gateActiveLocked(gateID) {
+		t.addGateMemberLocked(gateID, st.id)
 	}
-	members[st.id] = struct{}{}
+}
+
+// applyGateLeftLocked 折 gate.left（G15）：LWW 记 leave 事实，若本次 leave 盖过 join
+// （成员关系就此终止）则把 session 从该 gate 的活跃成员集合摘除。
+func (t *Table) applyGateLeftLocked(st *sessionState, ev *contracts.Event, seq int64) {
+	var p contracts.GateLeftPayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		return // 宽容（D7）
+	}
+	gateID, ok := NormalizeGateID(p.GateID)
+	if !ok {
+		return
+	}
+	if cur, exists := st.lefts[gateID]; exists && cur.seq >= seq {
+		return // 重复/乱序的旧 leave：折叠态不变（幂等）
+	}
+	st.lefts[gateID] = gateLeft{seq: seq, ts: ev.TS, eventID: ev.ID}
+	// 同 join：leave 事实也说明"这个 gate 存在过"（乱序重放时 leave 可能先于 join 到达）。
+	t.ensureGateLocked(gateID)
+	if !st.gateActiveLocked(gateID) {
+		t.removeGateMemberLocked(gateID, st.id)
+	}
+}
+
+// ensureGateLocked 确保 gate 在枚举里有一个键（成员集合可为空；调用方持锁）。
+//
+// gate 定义是持久化的（G17b）：成员关系可以终止（leave / session 结束），"这个 gate
+// 存在过"不能从枚举面消失——所以键**建了就不删**（成员集合走空即 0 成员）。
+func (t *Table) ensureGateLocked(gateID string) {
+	if _, ok := t.gates[gateID]; !ok {
+		t.gates[gateID] = make(map[contracts.Ulid]struct{})
+	}
+}
+
+// addGateMemberLocked / removeGateMemberLocked 维护 gate → 活跃成员集合（调用方持锁）。
+func (t *Table) addGateMemberLocked(gateID string, sid contracts.Ulid) {
+	t.ensureGateLocked(gateID)
+	t.gates[gateID][sid] = struct{}{}
+}
+
+func (t *Table) removeGateMemberLocked(gateID string, sid contracts.Ulid) {
+	if members, ok := t.gates[gateID]; ok {
+		delete(members, sid)
+		// 故意**不删空 gate 键**：gate 定义是持久化的（G17b）——成员走光了 gate 仍在，
+		// Gates() 仍列得出它（成员数 0）。删键会让"这个 gate 存在过"从枚举面消失。
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +455,7 @@ func (t *Table) applyGateJoinedLocked(st *sessionState, ev *contracts.Event, seq
 type SessionRow struct {
 	SessionID   string `json:"session_id"`
 	MainAgentID string `json:"main_agent_id"`
-	// Gates 是该 session 的 gate 成员关系（join 历史折叠，字典序）。
+	// Gates 是该 session 的**活跃** gate 成员关系（G15：joined 减 left，字典序）。
 	Gates []string `json:"gates"`
 	// AgentCount 是该 session 的 agent 数（含主 agent 与全部 subagent）。
 	AgentCount int `json:"agent_count"`
@@ -379,8 +485,9 @@ type AgentRow struct {
 // GateRow 是一个 gate 的行（K12：gate 定义持久化、成员关系是活的）。
 type GateRow struct {
 	GateID string `json:"gate_id"`
-	// Members 是 join 过该 gate 的 session（**历史**成员，含已结束的 session，
-	// 字典序）。活跃成员 = 这个集合 ∩ 当前存活 session（GateMembers）。
+	// Members 是该 gate 的**活跃成员** session（G15 折叠口径：joined 减 left，
+	// 字典序）。含"已结束但未显式离开"的 session（结束 ≠ 离开）；要再叠"本进程存活"
+	// 的交集见 GateMembers。join/leave 全史实在事件流里（可回放），本行只答"现在谁是成员"。
 	Members []string `json:"members"`
 }
 
@@ -470,10 +577,14 @@ func sessionRowLocked(st *sessionState) SessionRow {
 	}
 }
 
+// sortedGateIDs 返回 session 的**活跃** gate 成员关系（G15：joined 减 left，字典序）。
+// 已显式离开的 gate 不出现在这里（leave 是成员关系的终止，见 gateActiveLocked）。
 func sortedGateIDs(st *sessionState) []string {
 	out := make([]string, 0, len(st.joins))
 	for gateID := range st.joins {
-		out = append(out, gateID)
+		if st.gateActiveLocked(gateID) {
+			out = append(out, gateID)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -591,7 +702,6 @@ func (t *Table) Agent(agentID contracts.Ulid) (AgentRow, bool) {
 	}, true
 }
 
-// GatesOf 返回某 session 的 gate 成员关系（join 历史折叠，字典序）。
 // PrimaryAgent 返回该 session 的主 agent id（口径同 core/durable.PrimaryAgentID：
 // 不作为任何 agent.spawned 的 child 出现的最早 agent）。
 //
@@ -614,7 +724,7 @@ func (t *Table) PrimaryAgent(sessionID contracts.Ulid) (contracts.Ulid, bool) {
 	return main, true
 }
 
-// GatesOf 返回某 session 的 gate 成员关系（join 历史折叠，字典序）。
+// GatesOf 返回某 session 的**活跃** gate 成员关系（G15：joined 减 left，字典序）。
 func (t *Table) GatesOf(sessionID contracts.Ulid) []string {
 	if t == nil {
 		return []string{}
@@ -628,8 +738,10 @@ func (t *Table) GatesOf(sessionID contracts.Ulid) []string {
 	return sortedGateIDs(st)
 }
 
-// InGate 报告 session 是否（曾）加入该 gate——宿主用它做显式 join 的幂等去重
-// （已在网内的重复 join 不再落一条重复事件）。
+// InGate 报告 session 当前是否**在该 gate 内**（活跃成员；G15：leave 之后再 join 又回来）。
+//
+// 宿主用它做显式 join 的幂等去重（已在网内的重复 join 不再落一条重复事件）；leave 之后
+// 返回 false → 再次 join 会落**新一届**的事件（成员关系恢复，见 JoinGeneration）。
 func (t *Table) InGate(sessionID contracts.Ulid, gateID string) bool {
 	if t == nil {
 		return false
@@ -644,8 +756,113 @@ func (t *Table) InGate(sessionID contracts.Ulid, gateID string) bool {
 	if !ok {
 		return false
 	}
-	_, joined := st.joins[id]
-	return joined
+	return st.gateActiveLocked(id)
+}
+
+// JoinGeneration 返回该 (session, gate) 已折叠的 join 次数——"下一次 join 是第几届"。
+//
+// 为什么需要它（G15）：gate.joined 的 Event.ID 是**确定性导出**的（存储层
+// ON CONFLICT(id) DO NOTHING 兜住并发/重复 join，见 host 的 newGateJoinedEvent）。
+// 若 id 只由 (session, gate, source) 决定，leave 之后的**重 join** 会撞上第一次的 id
+// 被存储层吃掉 → 成员关系永远恢复不了。把届数编进 id：同届并发 join 仍撞同一 id
+// （去重不变量不变），重 join 是新的一届 → 新 id（恢复成立）。
+//
+// 计数只由**事件折叠**推进（Apply 幂等：同 seq 重复投递不累加），故跨重启稳定——
+// 重启后全量重放得到同一个届数，重 join 的 id 与崩溃前算出来的一致。
+func (t *Table) JoinGeneration(sessionID contracts.Ulid, gateID string) int {
+	if t == nil {
+		return 0
+	}
+	id, ok := NormalizeGateID(gateID)
+	if !ok {
+		return 0
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	st, ok := t.sessions[sessionID]
+	if !ok {
+		return 0
+	}
+	return st.joinGen[id]
+}
+
+// ActiveJoin 返回该 (session, gate) 当前**活跃成员关系**对应的 join 事实（G15）。
+//
+// host 的 leave 用它拿"被终止的成员关系的来源"（leave payload 的 source 要与对应
+// gate.joined 的 source 同值，审计时才对得上）。不在网内 → ok=false。
+func (t *Table) ActiveJoin(sessionID contracts.Ulid, gateID string) (GateJoin, bool) {
+	if t == nil {
+		return GateJoin{}, false
+	}
+	id, ok := NormalizeGateID(gateID)
+	if !ok {
+		return GateJoin{}, false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	st, ok := t.sessions[sessionID]
+	if !ok || !st.gateActiveLocked(id) {
+		return GateJoin{}, false
+	}
+	j := st.joins[id]
+	return GateJoin{
+		GateID:    j.gateID,
+		SessionID: string(st.id),
+		Source:    j.source,
+		Seq:       j.seq,
+		TS:        j.ts,
+		EventID:   string(j.eventID),
+	}, true
+}
+
+// LeftGate 报告该 (session, gate) 是否**曾被显式离开过**（有 leave 事实；不论之后有没有再 join）。
+//
+// 用途（F1）：宿主要区分两种"当前不在网内"——
+//   - **从没 join 过** → 自动 gate 该把它加进来；
+//   - **join 过又 leave 过**（用户显式离开）→ 自动 gate **不该**把它复活：显式 leave 的
+//     语义强于"自动 gate 策略"，否则进程一重启就把用户的显式离开**静默撤销**了
+//     （用户看到的现象：明明 leave 了，重启后又出现在那个 gate 里）。
+//
+// 判据 = lefts 里的**键存在性**（不是 "seq > 0" 哨兵——见 gateActiveLocked 的说明）。
+func (t *Table) LeftGate(sessionID contracts.Ulid, gateID string) bool {
+	if t == nil {
+		return false
+	}
+	id, ok := NormalizeGateID(gateID)
+	if !ok {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	st, ok := t.sessions[sessionID]
+	if !ok {
+		return false
+	}
+	_, lefted := st.lefts[id]
+	return lefted
+}
+
+// SharedGates 返回两个 session 的**活跃 gate 交集**（字典序；空 = 不相交）。
+//
+// 口径与 VisiblePeers 的 PeerRow.Gates **同源**（同一个 sharedGates 计算）：水平可见性
+// 只承认"gate 相交"，故对外暴露的 gate 列表必须是**交集**，绝不是某个成员的**全量**
+// （全量会把"它还在别的 gate 里"这种查询方无权知道的事泄露出去——K11：不在网内的 gate
+// 只给存在性 + 计数，不给成员身份）。
+func (t *Table) SharedGates(a, b contracts.Ulid) []string {
+	if t == nil {
+		return []string{}
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	me, ok := t.sessions[a]
+	if !ok {
+		return []string{}
+	}
+	other, ok := t.sessions[b]
+	if !ok {
+		return []string{}
+	}
+	return sharedGates(me.activeGatesLocked(), other)
 }
 
 // Gates 返回全部 gate（字典序）。
@@ -677,10 +894,11 @@ func (t *Table) gatesLocked() []GateRow {
 	return out
 }
 
-// GateMembers 返回某 gate 的**活跃成员**（K12：成员关系是活的）。
+// GateMembers 返回某 gate 的**活跃成员**（K12：成员关系是活的；G15：joined 减 left）。
 //
-// 活跃成员 = 事件折叠出的 join 历史 ∩ 当前存活 session。已结束的 session 仍在
-// Gates() 的历史成员里（可审计），但不出现在这里。
+// 活跃成员 = 事件折叠出的成员关系（joined 减 left）∩ 当前存活 session。已结束的 session
+// 仍在 Gates() 的成员里（结束 ≠ 离开），但不出现在这里；显式 leave 过的 session 两边都不在
+// （成员关系已终止，事实留在事件流里可回放）。
 func (t *Table) GateMembers(gateID string) []SessionRow {
 	if t == nil {
 		return []SessionRow{}
@@ -705,7 +923,10 @@ func (t *Table) GateMembers(gateID string) []SessionRow {
 	return out
 }
 
-// JoinHistory 返回全部 join 事实（按 seq 升序；审计用）。
+// JoinHistory 返回全部 join **事实**（按 seq 升序；审计用）。
+//
+// 只折 join（leave 是另一条事实，不进本清单）：join 发生过就是发生过，之后的 leave 不
+// 擦除它——"谁何时以何来源加入过"答这里；"现在谁在网内"答 Gates()/GateMembers()/InGate()。
 func (t *Table) JoinHistory() []GateJoin {
 	if t == nil {
 		return []GateJoin{}
@@ -741,9 +962,10 @@ func (t *Table) joinHistoryLocked() []GateJoin {
 
 // VisiblePeers 返回 sessionID 的**水平可见对端**（K11①）。
 //
-// 规则：只有 session 的**主 agent**之间互相可见，条件 gates(A) ∩ gates(B) ≠ ∅；
-// 对端必须是**存活** session（成员关系是活的，G17b）。别 session 的 subagent 完全不可见
-// （粒度是 session 的主 agent，不是 agent）。
+// 规则：只有 session 的**主 agent**之间互相可见，条件活跃 gates(A) ∩ 活跃 gates(B) ≠ ∅
+// （G15：任一侧显式 leave 了该 gate → 不再相交 → 互不可见）；对端必须是**存活** session
+// （成员关系是活的，G17b）。别 session 的 subagent 完全不可见（粒度是 session 的主 agent，
+// 不是 agent）。
 //
 // 查询方自己不在结果里；未知/无事件的 session → 空。
 func (t *Table) VisiblePeers(sessionID contracts.Ulid) []PeerRow {
@@ -760,13 +982,13 @@ func (t *Table) visiblePeersLocked(sessionID contracts.Ulid) []PeerRow {
 	if !ok {
 		return []PeerRow{}
 	}
-	mine := me.joins
+	mine := me.activeGatesLocked()
 	out := make([]PeerRow, 0, len(t.sessions))
 	for _, other := range t.sessions {
 		if other.id == me.id || !other.live {
 			continue
 		}
-		shared := sharedGates(mine, other.joins)
+		shared := sharedGates(mine, other)
 		if len(shared) == 0 {
 			continue
 		}
@@ -787,11 +1009,11 @@ func (t *Table) visiblePeersLocked(sessionID contracts.Ulid) []PeerRow {
 	return out
 }
 
-// sharedGates 求两个 gate 集合的交集（字典序）。
-func sharedGates(a, b map[string]gateJoin) []string {
-	out := make([]string, 0, len(a))
-	for gateID := range a {
-		if _, ok := b[gateID]; ok {
+// sharedGates 求"我的活跃 gate 集合"与另一个 session 的活跃成员关系的交集（字典序）。
+func sharedGates(mine map[string]bool, other *sessionState) []string {
+	out := make([]string, 0, len(mine))
+	for gateID := range mine {
+		if other.gateActiveLocked(gateID) {
 			out = append(out, gateID)
 		}
 	}

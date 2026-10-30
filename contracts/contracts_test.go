@@ -172,6 +172,46 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Model == nil || *p.Model == "" {
 				t.Errorf("line %d: model.turn 应带非空 model（成本统计按模型分组）", lineNo)
 			}
+			// reasoning 是思维链整段（G14）：带了就必须非空（不拿空串占位——
+			// "解析不到就缺省"才是诚实口径）。
+			if p.Reasoning != nil && *p.Reasoning == "" {
+				t.Errorf("line %d: model.turn reasoning 带了就必须非空（解析不到应缺省）", lineNo)
+			}
+		case "model.delta":
+			var p ModelDeltaPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ModelDeltaPayload: %v", lineNo, err)
+				break
+			}
+			// G13：流事件 durable=false 且不占 seq（F8/陷阱 11）——样本必须钉住这两条。
+			if ev.Durable {
+				t.Errorf("line %d: model.delta 必须 durable=false（流事件）", lineNo)
+			}
+			if ev.Seq != nil {
+				t.Errorf("line %d: model.delta 不得携带 seq（durable=false ⇒ seq 缺省）", lineNo)
+			}
+			if p.Turn < 1 {
+				t.Errorf("line %d: model.delta turn = %d，应 ≥1（同一 Run 内从 1 递增）", lineNo, p.Turn)
+			}
+			// text/reasoning 至少一个非空（没有可显示内容的片段不得发布）。
+			if (p.Text == nil || *p.Text == "") && (p.Reasoning == nil || *p.Reasoning == "") {
+				t.Errorf("line %d: model.delta 的 text/reasoning 至少一个非空", lineNo)
+			}
+		case "gate.left":
+			var p GateLeftPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into GateLeftPayload: %v", lineNo, err)
+				break
+			}
+			// G15：形状与 gate.joined 对称（gate_id + source），来源在同一枚举内。
+			if p.GateID == "" {
+				t.Errorf("line %d: gate.left gate_id 不能为空", lineNo)
+			}
+			switch p.Source {
+			case GateJoinSourceAutoRepo, GateJoinSourceAutoWorkflow, GateJoinSourceExplicit:
+			default:
+				t.Errorf("line %d: gate.left source = %q 不在枚举内", lineNo, p.Source)
+			}
 		case "gate.joined":
 			var p GateJoinedPayload
 			if err := json.Unmarshal(ev.Payload, &p); err != nil {
@@ -409,7 +449,8 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 	// and must decode into its type (x-kind-payload in event.json is the source).
 	for _, kind := range []string{
 		"tool.call.intent", "tool.call.completed", "tool.call.failed",
-		"context.assembled", "user.prompt", "model.turn", "gate.joined",
+		"context.assembled", "user.prompt", "model.turn", "model.delta",
+		"gate.joined", "gate.left",
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
 		"review.recorded", "conflict.predicted", "hub.alert",
 		"btw.forked", "workflow.activated", "workflow.milestone",

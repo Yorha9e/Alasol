@@ -213,8 +213,11 @@ func (l *Loop) publishUserPrompt(ctx context.Context, prompt string) {
 // usage **只做成本记录**（J21）：绝不回填 context 快照（快照=事前估算为正式口径），更不接入
 // 任何预算/门禁判断——这里只是把 provider 上报的 token 数原样搬进事件，供后续成本统计读。
 // causation=nil（模型的响应是 originating 事实，无单一上游事件）。
+//
+// G14：reasoning（思维链整段）**provider 上报才带**——解析不到就是空串，空串不留字段
+// （不拿空串占位，"缺省"才是"没有"的诚实表示）。
 func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResult) {
-	ev, err := l.newEvent(KindModelTurn, nil, contracts.ModelTurnPayload{
+	payload := contracts.ModelTurnPayload{
 		Text: mr.Text,
 		// model 名随事件落库（成本统计按模型分组用，J21）：它**不是凭据**（模型名可安全
 		// 进事件/日志），仅用于聚合口径。
@@ -223,7 +226,11 @@ func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResu
 			InputTokens:  mr.Usage.InputTokens,
 			OutputTokens: mr.Usage.OutputTokens,
 		},
-	})
+	}
+	if mr.Reasoning != "" {
+		payload.Reasoning = &mr.Reasoning
+	}
+	ev, err := l.newEvent(KindModelTurn, nil, payload)
 	if err != nil {
 		l.publishLoopError(ctx, turn, phaseModelTurn, err)
 		return
@@ -231,6 +238,63 @@ func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResu
 	if _, err := l.publish(ctx, ev); err != nil {
 		l.publishLoopError(ctx, turn, phaseModelTurn, err)
 	}
+}
+
+// publishModelDelta 发一条 model.delta **流事件**（G13：打字机效果的增量片段）。
+//
+// 与三条既有通道的关系（都是独立通道，互不占用）：
+//
+//	X1 三段写路径（intent/completed/failed）   —— durable 事实，执行前提
+//	user.prompt / model.turn 旁路              —— durable 事实，可回放
+//	model.delta（本函数）                      —— **流事件**，不可回放
+//
+// 流事件口径（F8/陷阱 11，逐条对应）：
+//   - **不入库**：bus 对 durable=false 的批次不调用 store.Append → 不占 seq；
+//   - **不进 Result.Events**：调用方不拿它的返回值计数（它也没有"落库条数"的含义）；
+//   - **不阻塞 Run**：best-effort，发布失败即丢（订阅通道满时 bus 自己会计数 Lagging；
+//     为一条打字机片段补 durable loop.error 是把噪声放大成事实，不做）；
+//   - **不幂等**：转发性投递，订阅者可能收到重复/丢失——流事件的已知取舍（bus 包 doc）。
+//
+// text / reasoning 都空的片段不发（没有可显示的内容；provider 侧本就不该发，
+// 这里是纵深防御）。
+//
+// **归组口径（已知边界，别当精确口径用）**：payload 的 turn 是**每次 Run 内**的轮次号，
+// 而 model.delta **没有 run 判别位**（run_id / started_at 都没加——加它要走全链：
+// schema + 生成物 + 样本 + 消费端）→ **同 session 并发跑两轮时，两轮的 turn 会撞号，
+// 订阅端无法可靠归组**。归组只对"单 session 串行跑"成立（宿主默认口径：一个 session
+// 同时只跑一轮）。契约侧的同一说明见 contracts/schema/event.json 的 ModelDeltaPayload。
+func (l *Loop) publishModelDelta(ctx context.Context, turn int, ev core.ProviderEvent) {
+	payload := contracts.ModelDeltaPayload{Turn: int64(turn)}
+	if ev.Text != "" {
+		text := ev.Text
+		payload.Text = &text
+	}
+	if ev.Reasoning != "" {
+		reasoning := ev.Reasoning
+		payload.Reasoning = &reasoning
+	}
+	if payload.Text == nil && payload.Reasoning == nil {
+		return
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return // 不可达（纯字符串结构体）；真失败就当这条片段丢了
+	}
+	// 手工装配而不是走 newEvent：那个恒设 Durable=true（三段写路径/旁路观测都是事实事件），
+	// 流事件必须 Durable=false 且**无 seq**（bus 会拒：durable=false 携带 seq = 违约）。
+	stream := contracts.Event{
+		V:         1,
+		ID:        core.NewUlid(), // 框架 id（订阅端可据此去重呈现）
+		Kind:      KindModelDelta,
+		TS:        nowRFC3339(),
+		SessionID: l.sessionID,
+		AgentID:   l.agentID,
+		Durable:   false,
+		Payload:   raw,
+	}
+	// 经同一个 publish：ctx 已死时它派生 settle ctx（流事件不落库，通知立刻返回，
+	// 不会真的等满 5s）；返回值忽略（流事件没有落库计数含义）。
+	_, _ = l.publish(ctx, stream)
 }
 
 // policySnapshot 把判定时刻的策略结论序列化成 intent 的 policy_snapshot

@@ -33,6 +33,7 @@ type hubFlags struct {
 	maxSessionRows    *int
 	cwd               *string
 	runID             *string
+	reasoningEffort   *string
 	onlineRows        *int
 	onlineLineTokens  *int
 	onlineLevel       *string
@@ -76,21 +77,24 @@ type hubFlags struct {
 // registerHubFlags 把共有 flag 注册到 fs（serve 额外有 -addr，chat 也有但可忽略）。
 func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 	return &hubFlags{
-		dbPath:            fs.String("db", "alasol.db", "事件库路径（SQLite）"),
-		addr:              fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
-		model:             fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
-		baseURL:           fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
-		apiKeyEnv:         fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
-		approval:          fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal | protocol（protocol=经 WS/HTTP 面应答审批，无人应答=deny）"),
-		allow:             fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
-		ask:               fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
-		maxTurns:          fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
-		contextBudget:     fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
-		system:            fs.String("system", "", "系统提示"),
-		indexerBatch:      fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
-		maxSessionRows:    fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
-		cwd:               fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
-		runID:             fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
+		dbPath:         fs.String("db", "alasol.db", "事件库路径（SQLite）"),
+		addr:           fs.String("addr", "127.0.0.1:8720", "监听地址（只接受 loopback，N5b）"),
+		model:          fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
+		baseURL:        fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
+		apiKeyEnv:      fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
+		approval:       fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal | protocol（protocol=经 WS/HTTP 面应答审批，无人应答=deny）"),
+		allow:          fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
+		ask:            fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
+		maxTurns:       fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),
+		contextBudget:  fs.Int64("context-budget", 0, "上下文窗口预算 token（0=默认；只用于占比）"),
+		system:         fs.String("system", "", "系统提示"),
+		indexerBatch:   fs.Int("indexer-batch", 0, "索引器单批处理上限（0=默认）"),
+		maxSessionRows: fs.Int("max-session-rows", 0, "/api/sessions 行数上限（0=默认 200，K15）"),
+		cwd:            fs.String("cwd", "", "工作目录（空=进程 cwd）：自动 gate repo:<repo_id> 按它算（K12/S14）"),
+		runID:          fs.String("run-id", "", "工作流运行 id（空=不加 workflow gate；工作流引擎在 v3）"),
+		reasoningEffort: fs.String("reasoning-effort", "",
+			"模型思维链强度档位（G14）：low|medium|high|xhigh（空=不传，端点用默认档）。"+
+				"经 provider 透传 reasoning_effort；思维链原文进 model.turn.reasoning / model.delta.reasoning"),
 		onlineRows:        fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
 		onlineLineTokens:  fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
 		onlineLevel:       fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
@@ -195,6 +199,10 @@ func serveMain(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// 档位白名单（fail-close）：**配置被拒 = exit 2**（与 run / resume 同一口径；F2）。
+	if rejectInvalidReasoningEffort(cfg) {
+		return 2
+	}
 	h, err := host.New(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)
@@ -267,6 +275,8 @@ func printBanner(addr string, opts bannerOptions) {
 	fmt.Printf("  上下文   http://%s/api/context/{session_id}\n", addr)
 	fmt.Printf("  可见性   http://%s/api/peers?session_id=...（K11 水平可见性）\n", addr)
 	fmt.Printf("  加 gate  curl -X POST http://%s/api/gates/join -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
+	fmt.Printf("  离 gate  curl -X POST http://%s/api/gates/leave -d '{\"session_id\":\"...\",\"gate_id\":\"...\"}'\n", addr)
+	fmt.Printf("  枚举 gate curl http://%s/api/gates?session_id=...（全部 gate 存在性+成员数；在网内的带成员详情）\n", addr)
 	fmt.Printf("  在线表配置 http://%s/api/online-table/config（GET 读 / POST 运行期调，K15 不重启）\n", addr)
 	if opts.GraphEnabled {
 		// 图投影（v2-S2，G2f 可选投影）：启用了才提示——没启用时打这行会让人以为有数据。

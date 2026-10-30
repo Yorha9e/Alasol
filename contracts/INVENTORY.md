@@ -29,7 +29,8 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 | kind | durable | 说明 |
 |---|---|---|
 | `user.prompt` | true | **对话入流**（F1，v1-S1）：用户提示原文；Run 开始落（旁路观测，不计 Result.Events） |
-| `model.turn` | true | **对话入流**（F1，v1-S1）：模型回复 + `ModelTurnUsage`（usage **只进成本统计**，J21——不回填快照） |
+| `model.turn` | true | **对话入流**（F1，v1-S1）：模型回复 + `ModelTurnUsage`（usage **只进成本统计**，J21——不回填快照）+ 可选 `reasoning`（思维链整段，G14；provider 解析不到则缺省） |
+| `model.delta` | **false** | **流式增量片段**（`ModelDeltaPayload`，G13 打字机效果）：`turn`（本轮次号）+ `text`/`reasoning` 至少一个增量片段。**durable=false**（F8/陷阱 11）：总线直发订阅者、**不入库、不占 seq、不回放**（转发性投递不幂等，丢了就是丢了）；WS 订阅默认收得到，`durable_only=true` 收不到。样本里有一条（`sample-events.ndjson`，非 durable 样本同样过 TS 校验）。**同 session 并发 Run 的 delta 不可归组（已知边界）**：`turn` 是**每次 Run 内**的轮次号（并发 Run 会撞号），payload **没有 run 判别位**（run_id / started_at 未加——加它要走全链：schema + 生成物 + 样本 + 消费端）→ 归组只对**单 session 串行跑**成立（宿主默认口径：一个 session 同时只跑一轮）；并发时只能拿 envelope 的 ts / 到达序近似切分，**不得当精确口径** |
 | `tool.call.intent` | true | **三段事件之①**（X1）：tool_call_id / 参数 / idempotent / replay 标记 / 外部可核验锚点（如 commit sha） |
 | `tool.call.completed` | true | **三段事件之③a**（X1）：结果（Tool 返回值契约） |
 | `tool.call.failed` | true | **三段事件之③b**（X1）：失败（错误为普通事件，M1/M8） |
@@ -43,7 +44,8 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 | `checkpoint.created` | true | durable checkpoint 四要素（X3） |
 | `session.resumed` | true | resume 流程完成标记（X4） |
 | `session.resume_claimed` | true | in-flight 原子认领（X5 防并发重放） |
-| `gate.joined` | true | session 加入 gate（K12，v1-S2）：`gate_id` + `source`（auto_repo/auto_workflow/explicit）；无 `gate.left`——离开 = session 结束 |
+| `gate.joined` | true | session 加入 gate（K12，v1-S2）：`gate_id` + `source`（auto_repo/auto_workflow/explicit）；活跃成员 = join 折叠 **减** `gate.left`（见下一行） |
+| `gate.left` | true | session **显式离开** gate（G15，补"只能加不能减"缺漏）：`gate_id` + `source`（被终止的成员关系的来源，审计用）。幂等（已不在网内的重复 leave 不落事件）；leave 之后再 join 恢复可见。成员折叠口径 = joined 减 left（同 session+gate，按 seq 序折叠，乱序 Apply 稳定） |
 | `agentlink.broadcast` | true | 广播消息（K18，v1-S3）：`target`（gate/subtree）+ `text`；拉模型投递，收件方 = 目标 ∩ 发送方可见集（K11/K27） |
 | `agentlink.handoff` | true | 结构化交接（K18，v1-S3）：broadcast + 开放结构 `payload`（工作流自定义，框架不解释） |
 | `context.compacted` | true | **一次压缩动作的事实记录**（`ContextCompactedPayload`，v2-S1 级联 C 案）：两级压缩 L1/L2 + 兜底三级 + 留存降级（full→l1→l2 最老先降、永不回升）；`action`=downgrade/split/budget_warning/fallback（压缩模型失败→退化截断，**留痕**），`tier`=full/l1/l2，`seq_from`/`seq_to`=被压原文机器区间，`ref`=stage:N@e:from..e:to（阶段号 + seq 锚，跨 Run 稳定）给 LLM，`usage`/`model`=压缩模型调用的 token 计量与模型名（成本统计口径，J21）。**refs 永不指摘要**；压缩输入=goal ledger+被压区间全文（永不读他阶段摘要，J17/J18/J19）；阶段大小分布/L1L2 残留/降级兜底触发可从事件流+`context.assembled` 复盘（13 §9） |

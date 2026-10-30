@@ -77,6 +77,12 @@ type Config struct {
 	// RunID 是 hub 级默认工作流运行 id（K12：有则自动加入 workflow:<run_id>）。
 	// 空 = 不加 workflow gate。工作流引擎在 v3，这里只留钩子。
 	RunID string
+	// ReasoningEffort 是模型思维链强度档位（G14；空 = **不传**给 provider，端点用默认档）。
+	// 原样进每轮 ModelRequest.ReasoningEffort → provider 透传 reasoning_effort 给端点。
+	// 取值是网关支持的档位（low/medium/high/xhigh）——这里做**白名单校验**（fail-close：
+	// 打错的档位在启动期就报错，而不是在一轮模型调用里拿到一个离现场很远的 400）。
+	// 网关新增档位时改 ValidateReasoningEffort 一处即可。
+	ReasoningEffort string
 	// Provider 覆盖（测试注入脚本 provider；nil = openai 真实实现）。
 	Provider core.Provider
 	// Approver 覆盖（测试注入；nil = 按 Approval 选）。
@@ -272,6 +278,11 @@ func (c *Config) validate() error {
 		!discovery.ValidGateID(discovery.WorkflowGate(runID)) {
 		return fmt.Errorf("host: Config.RunID %q 不合法（含空白/控制字符，或拼成 workflow gate 后超过 %d 字符）",
 			c.RunID, discovery.MaxGateIDLen)
+	}
+	// 思维链档位（G14）：空 = 不传（端点默认档）；非空必须落在已知档位集内
+	// （打错的档位启动期就拒，别拖到模型调用里 400）。
+	if err := ValidateReasoningEffort(c.ReasoningEffort); err != nil {
+		return err
 	}
 	// hub 监控阈值（K9）：负值拒绝；0 = 用框架默认。
 	if c.MonitorCPUPercent < 0 {
@@ -485,4 +496,66 @@ func (c *Config) onlineTableOverrides() loop.OnlineTableUpdate {
 		u.WindowLines = &c.OnlineTableWindow
 	}
 	return u
+}
+
+// 已知的思维链档位集（G14）。口径与 Config.ReasoningEffort 的注释一致：
+// low/medium/high 是 OpenAI o 系与 DeepSeek 都认的档位；xhigh 是部分网关的加码档。
+// 网关新增档位 → 在这里加一个常量 + 进 knownReasoningEfforts，别处不用改。
+const (
+	ReasoningEffortLow    = "low"
+	ReasoningEffortMedium = "medium"
+	ReasoningEffortHigh   = "high"
+	ReasoningEffortXHigh  = "xhigh"
+)
+
+// knownReasoningEfforts 是档位白名单（ValidateReasoningEffort 的唯一事实源）。
+var knownReasoningEfforts = map[string]bool{
+	ReasoningEffortLow:    true,
+	ReasoningEffortMedium: true,
+	ReasoningEffortHigh:   true,
+	ReasoningEffortXHigh:  true,
+}
+
+// ValidateReasoningEffort 校验思维链档位（G14）：空（trim 后）= 不传，合法；
+// 非空必须落在白名单内（**大小写敏感**，陷阱 17：档位是协议面的枚举值，不做大小写折叠——
+// "High" 与 "high" 对端点不是同一个值，静默改写用户的输入比拒绝更危险）。
+//
+// 为什么fail-close 到白名单而不是"非空即放行"：打错的档位（typo、别的厂商的私有值）
+// 放行出去只会在**一轮模型调用**里被端点 400，错误信息离配置现场很远；启动期拒绝
+// 能把"哪个配置值错了"直接摆到使用者面前。
+func ValidateReasoningEffort(v string) error {
+	eff := strings.TrimSpace(v)
+	if eff == "" {
+		return nil // 空 = 不传（端点默认档）
+	}
+	if !knownReasoningEfforts[eff] {
+		return fmt.Errorf("host: ReasoningEffort %q 不是已知档位（支持: low | medium | high | xhigh；空=不传）", v)
+	}
+	return nil
+}
+
+// ReasoningEffortValue 归一化档位值（trim；空 = 不传）。装配处（cmd）与宿主共用，
+// 避免"flag 传了 ' high '、provider 收到 ' high '"这种口径漂移。
+func ReasoningEffortValue(v string) string { return strings.TrimSpace(v) }
+
+// ResolveReasoningEffort 解析思维链档位（**三路径同口径的唯一入口**：run / resume /
+// serve 都在这儿取值 + 校验）。
+//
+// 取值口径：显式 flag > 配置文件 > 空（空 = 不传，端点用默认档）。
+//
+// 校验口径：白名单（唯一事实源 = ValidateReasoningEffort）。**fail-close**：打错的档位
+// 在**启动期**就报错，而不是拖到一轮模型调用里拿到一个离配置现场很远的 400。
+//
+// 为什么放在 host（而不是各 cmd 自己判）：三条装配路径（alasol run / alasol resume /
+// alasol serve）必须**同口径**——同一份配置在 serve 下被拒、在 run 下却能跑起来，
+// 是最坑人的那种不一致。
+func ResolveReasoningEffort(flagVal, fileVal string) (string, error) {
+	v := ReasoningEffortValue(flagVal)
+	if v == "" {
+		v = ReasoningEffortValue(fileVal)
+	}
+	if err := ValidateReasoningEffort(v); err != nil {
+		return "", err
+	}
+	return v, nil
 }

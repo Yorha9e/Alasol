@@ -243,17 +243,18 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	//    **ContextStrategy 故意留空**：挂上的上下文策略会注入 ledger/rules 两张注入区
 	//    （v2-S1 tiered），那正是"fork 不带 ledger/gate"要防的事——旁支只带**对话历史**。
 	fl, err := loop.New(loop.Config{
-		Provider:      h.provider,
-		Bus:           h.bus,
-		Registry:      h.reg,
-		Policy:        h.engine,
-		Approver:      h.approver,
-		SessionID:     forkSID,
-		AgentID:       forkAgent,
-		Model:         h.cfg.Model,
-		System:        h.cfg.System,
-		MaxTurns:      h.cfg.MaxTurns,
-		ContextBudget: h.contextBudgetFor(h.cfg.ContextStrategy),
+		Provider:        h.provider,
+		Bus:             h.bus,
+		Registry:        h.reg,
+		Policy:          h.engine,
+		Approver:        h.approver,
+		SessionID:       forkSID,
+		AgentID:         forkAgent,
+		Model:           h.cfg.Model,
+		System:          h.cfg.System,
+		MaxTurns:        h.cfg.MaxTurns,
+		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位与主 session 同源（G14）
+		ContextBudget:   h.contextBudgetFor(h.cfg.ContextStrategy),
 	})
 	if err != nil {
 		btw := BtwResult{

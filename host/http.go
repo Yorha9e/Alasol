@@ -37,6 +37,9 @@ var httpLog = slog.Default()
 //	GET /api/context/{session_id}→ 最新 ContextSnapshot；没有 → 404
 //	GET /api/peers?session_id=   → PeersView（K11 水平可见性：经 gate 相交的对端主 agent）
 //	POST /api/gates/join         → PeersView（K12 显式 join_gate；幂等）
+//	POST /api/gates/leave        → PeersView（G15 显式 leave_gate；幂等——重复 leave 无害）
+//	GET /api/gates?session_id=   → GatesView（G15 枚举面：全部 gate 的存在性 + 活跃成员数；
+//	                               caller 在网内的 gate 额外带成员详情——K11 分层口径）
 //
 // 图投影（v2-S2，G2f **可选投影**，默认关闭）：
 //
@@ -130,6 +133,9 @@ func (h *Hub) Handler() http.Handler {
 	reg("GET", "/api/context/{session_id}", h.serveContext)
 	reg("GET", "/api/peers", h.servePeers)
 	reg("POST", "/api/gates/join", h.serveGateJoin)
+	// G15 gate 管理面：显式 leave（幂等）+ 枚举（存在性/成员数 + caller 可见的成员详情）。
+	reg("POST", "/api/gates/leave", h.serveGateLeave)
+	reg("GET", "/api/gates", h.serveGates)
 
 	// 图投影（v2-S2，G2f 可选投影）：change_impact 影响面报告（G21/W16）。
 	// 未启用时 503（明说"没开"，不返回空影响面——"没有影响面"对 escalate 是危险答案）。
@@ -449,6 +455,72 @@ func (h *Hub) serveGateJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	if view.Peers == nil {
 		view.Peers = []discovery.PeerRow{}
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// serveGateLeave 服务 POST /api/gates/leave（G15 显式 leave_gate；幂等）。
+//
+// 请求体与 join **同形**：{"session_id":"<ulid>","gate_id":"..."}。
+// 200 → 离开后的 PeersView（已不在网内时直接返回当前可见面，**不落事件**——重复 leave 无害）；
+// 400 → 体不是 JSON / session_id 不合法 / gate_id 不合法；404 → session 不受本 hub 托管。
+//
+// 回归口径（G15）：join→leave→不可见→rejoin 恢复；leave 落一条 durable gate.left
+// （可回放：发现表从事件流重建后成员关系一致）。
+func (h *Hub) serveGateLeave(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionID string `json:"session_id"`
+		GateID    string `json:"gate_id"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxGateJoinBody))
+	if err := dec.Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
+		return
+	}
+	sid, err := parseSessionID(body.SessionID)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
+		return
+	}
+	if _, ok := discovery.NormalizeGateID(body.GateID); !ok {
+		writeJSONError(w, http.StatusBadRequest, "bad_gate_id",
+			fmt.Sprintf("gate_id 不合法（空 / 超过 %d 字符 / 含空白或控制字符）: %q", discovery.MaxGateIDLen, body.GateID))
+		return
+	}
+	view, err := h.LeaveGate(r.Context(), sid, body.GateID)
+	if err != nil {
+		writeHubError(w, err)
+		return
+	}
+	if view.Peers == nil {
+		view.Peers = []discovery.PeerRow{}
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// serveGates 服务 GET /api/gates?session_id=<ulid>（G15 枚举面）。
+//
+//	session_id 可省：省了 = 纯枚举（全部 gate 的存在性 + 活跃成员数，无成员详情）；
+//	            带了  = caller 在网内的 gate 额外带成员详情（K11 分层口径，见 GatesView）。
+//	200 → GatesView（gates 可能是空数组 = 还没有任何 gate）；
+//	400 → session_id 不合法；500 → 读库失败。
+func (h *Hub) serveGates(w http.ResponseWriter, r *http.Request) {
+	var sid contracts.Ulid
+	if raw := strings.TrimSpace(r.URL.Query().Get("session_id")); raw != "" {
+		parsed, err := parseSessionID(raw)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
+			return
+		}
+		sid = parsed
+	}
+	view, err := h.Gates(r.Context(), sid)
+	if err != nil {
+		writeHubError(w, err)
+		return
+	}
+	if view.Gates == nil {
+		view.Gates = []GateView{}
 	}
 	writeJSONBody(w, http.StatusOK, view)
 }

@@ -32,6 +32,10 @@ func tuiMain(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// 档位白名单（fail-close）：**配置被拒 = exit 2**（与 run / resume 同一口径；F2）。
+	if rejectInvalidReasoningEffort(cfg) {
+		return 2
+	}
 	// 审批桥：先建，注入 hub；TUI 里同一个桥把请求渲染到审批面。
 	appr := tui.NewApprover()
 	cfg.Approver = appr

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -303,6 +304,10 @@ func (h *Hub) Peers(ctx context.Context, sessionID contracts.Ulid) (PeersView, e
 //
 // 幂等：已在网内的重复 join **不落重复事件**（F7 只增不减不等于"同一请求重复记一笔"），
 // 直接返回当前可见面。session 必须由本 hub 托管（否则 404，见 ErrSessionNotHosted）。
+//
+// G15：leave 之后的**重 join** 会落一条**新一届**的 gate.joined（届数编进确定性事件 id，
+// 见 newGateJoinedEvent 与 discovery.JoinGeneration）——否则重 join 的事件会被 store 的
+// 去重当成"第一次那条"吃掉，成员关系永远恢复不了。
 func (h *Hub) JoinGate(ctx context.Context, sessionID contracts.Ulid, gateID string) (PeersView, error) {
 	if h == nil {
 		return PeersView{}, errors.New("host: Hub 为 nil")
@@ -327,7 +332,7 @@ func (h *Hub) JoinGate(ctx context.Context, sessionID contracts.Ulid, gateID str
 	// （bus.Publish）之间不是原子的——两个并发 join 都过判重 → 各落一条
 	// gate.joined（文档宣称的幂等只对**顺序**调用成立）。
 	//
-	// 锁的粒度是 session：同一 session 的 join 串行，不同 session 互不阻塞。
+	// 锁的粒度是 session：同一 session 的 join/leave 串行，不同 session 互不阻塞。
 	// 跨进程不需要：session 由一个 hub 托管（session 亲和写，G25）。
 	jm := h.joinMutex(sessionID)
 	jm.Lock()
@@ -341,7 +346,9 @@ func (h *Hub) JoinGate(ctx context.Context, sessionID contracts.Ulid, gateID str
 		return h.viewOf(sessionID), nil // 幂等：不重复落事件（刚扫平过，直接取）
 	}
 
-	ev, err := newGateJoinedEvent(sessionID, agentID, autoGate{gateID: id, source: contracts.GateJoinSourceExplicit})
+	// 届数 = 已折叠的 join 次数（leave 之后的重 join 是新的一届 → 新 id）。
+	gen := h.disc.JoinGeneration(sessionID, id)
+	ev, err := newGateJoinedEvent(sessionID, agentID, autoGate{gateID: id, source: contracts.GateJoinSourceExplicit}, gen)
 	if err != nil {
 		return PeersView{}, err
 	}
@@ -357,10 +364,74 @@ func (h *Hub) JoinGate(ctx context.Context, sessionID contracts.Ulid, gateID str
 	return h.viewOf(sessionID), nil
 }
 
-// joinMutex 返回该 session 的 join 互斥锁（惰性建；per-session 粒度）。
+// LeaveGate 显式离开一个 gate（G15：补"只能加不能减"的缺漏），返回离开后的可见面。
 //
-// 为什么需要它：「判重 + 发布」不是原子的 → 并发 join 会各落一条 gate.joined。
-// 把两件事收敛进同一把锁就原子了（同 session 串行，不同 session 互不阻塞）。
+// 幂等：已不在网内的重复 leave **不落事件**、直接返回当前可见面（"重复 leave 无害"）。
+// session 必须由本 hub 托管（否则 404，见 ErrSessionNotHosted）——与 JoinGate 同口径。
+//
+// 成员折叠口径（core/discovery）：成员 = joined 减 left；leave 之后再 join 恢复可见
+// （重 join 是新一届事件，见 JoinGate）。
+func (h *Hub) LeaveGate(ctx context.Context, sessionID contracts.Ulid, gateID string) (PeersView, error) {
+	if h == nil {
+		return PeersView{}, errors.New("host: Hub 为 nil")
+	}
+	if !core.ValidUlid(sessionID) {
+		return PeersView{}, fmt.Errorf("host: session_id 不是合法 ULID（26 字符 Crockford base32）: %q", sessionID)
+	}
+	id, ok := discovery.NormalizeGateID(gateID)
+	if !ok {
+		return PeersView{}, fmt.Errorf("host: gate_id 不合法（空 / 超过 %d 字符 / 含空白或控制字符）: %q",
+			discovery.MaxGateIDLen, gateID)
+	}
+	if !h.hostsSession(sessionID) {
+		return PeersView{}, fmt.Errorf("%w: %s", ErrSessionNotHosted, sessionID)
+	}
+	agentID, ok := h.mainAgentOf(sessionID)
+	if !ok {
+		return PeersView{}, fmt.Errorf("host: session %s 没有主 agent（先跑一轮 prompt）", sessionID)
+	}
+
+	// 与 join 共用 per-session 锁：「判活跃 + 发布」要原子——两个并发 leave 都过判定 →
+	// 各落一条 gate.left（幂等只对顺序调用成立）。
+	jm := h.joinMutex(sessionID)
+	jm.Lock()
+	defer jm.Unlock()
+
+	if _, err := h.discFeed.catchUp(ctx); err != nil {
+		return PeersView{}, fmt.Errorf("host: 扫事件流: %w", err)
+	}
+	if !h.disc.InGate(sessionID, id) {
+		return h.viewOf(sessionID), nil // 幂等：不在网内 → 不落事件
+	}
+	// leave 的 payload 带"被终止的成员关系的来源"（与对应 gate.joined 的 source 同值）。
+	cur, ok := h.disc.ActiveJoin(sessionID, id)
+	if !ok {
+		// 理论上不可达（InGate 为真就有活跃 join）；真发生就别猜 source，按显式加入记账。
+		cur = discovery.GateJoin{GateID: id, Source: string(contracts.GateJoinSourceExplicit)}
+	}
+	// 被终止的那一届 = 最近一次 join 的届数（已折叠 join 次数 - 1）。确定性 id 让
+	// 重复 leave 在存储层再去重一次（幂等双保险）。
+	gen := h.disc.JoinGeneration(sessionID, id) - 1
+	ev, err := newGateLeftEvent(sessionID, agentID, id, contracts.GateJoinSource(cur.Source), gen)
+	if err != nil {
+		return PeersView{}, err
+	}
+	if err := h.bus.Publish(ctx, ev); err != nil {
+		return PeersView{}, fmt.Errorf("host: 落 gate.left 事件: %w", err)
+	}
+	if _, err := h.discFeed.catchUp(ctx); err != nil {
+		hubLog.Warn("host: leave 后发现表 catch-up 失败（下次 API 请求会重试）",
+			"session_id", string(sessionID), "err", err.Error())
+	}
+	return h.viewOf(sessionID), nil
+}
+
+// joinMutex 返回该 session 的 gate 成员关系写锁（惰性建；per-session 粒度）。
+//
+// 为什么需要它：「判重（InGate）+ 发布」不是原子的 → 并发 join 会各落一条 gate.joined、
+// 并发 leave 会各落一条 gate.left。把"判定 + 发布"收敛进同一把锁就原子了（同 session 的
+// join/leave 串行，不同 session 互不阻塞）。G15 起 join 与 leave **共用**它：成员关系的
+// 写面（加入/离开）必须互斥，否则"刚 leave 完又被并发 join 盖回"这类交错没有唯一结论。
 func (h *Hub) joinMutex(sessionID contracts.Ulid) *sync.Mutex {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -385,6 +456,85 @@ func (h *Hub) GateMembers(ctx context.Context, gateID string) ([]discovery.Sessi
 	}
 	// 剔掉 /btw 旁支 fork（v3-S2 K29）：旁支不是一等会话，不该出现在 gate 成员面。
 	return h.filterForkGateMembers(h.disc.GateMembers(gateID)), nil
+}
+
+// GatesView 是 GET /api/gates 的形状（G15 枚举面）。
+//
+// # 可见性口径（如实定口径，写清）
+//
+// "枚举全部 gate"与 K11 的可见性哲学（成员身份只对 gate 相交者可见）是有冲突的，
+// 这里按**分层**调和，不搞"要么全给要么不给"：
+//
+//   - **全部 gate 的存在性 + 活跃成员数**：任何调用方都能看到（gate 定义是持久化的事实，
+//     "有几个 gate、各有多活跃"不泄露成员身份）；
+//   - **成员详情**：只对**在该 gate 内**的调用方返回（Joined=true 的行）——gate 相交
+//     才看得见彼此，与 Peers 的口径同源。
+type GatesView struct {
+	// SessionID 回显查询方（空 = 纯枚举：只有存在性 + 计数，没有成员详情）。
+	SessionID string `json:"session_id"`
+	// Gates 是全部 gate（字典序）：存在性 + 活跃成员数（+ 查询方在网内的成员详情）。
+	Gates []GateView `json:"gates"`
+}
+
+// GateView 是一个 gate 的枚举行（G15）。
+type GateView struct {
+	GateID string `json:"gate_id"`
+	// MemberCount 活跃成员数（G15 折叠口径：joined 减 left ∩ 本进程存活；
+	// /btw 旁支 fork 不计入——旁支不是一等会话，K29）。
+	MemberCount int `json:"member_count"`
+	// Joined 查询方是否在该 gate 内（true = 下面的 Members 对查询方可见）。
+	Joined bool `json:"joined"`
+	// Members 活跃成员详情——**仅查询方在该 gate 内时返回**（K11：gate 相交才看得见
+	// 彼此）。不在网内的 gate 只给存在性 + 计数，不给成员身份。
+	//
+	// 每一行的 `gates` 字段只列**与查询方相交**的 gate（与 /api/peers 的 PeerRow.gates
+	// 同源）：成员的**全部** gate 成员关系不该泄露给查询方（它不在的那些 gate，查询方
+	// 连存在性都不该从成员行里读到——那种 gate 只给存在性 + 计数）。
+	Members []discovery.SessionRow `json:"members,omitempty"`
+}
+
+// Gates 枚举 gate（G15 管理面）：全部 gate 的存在性 + 活跃成员数；sessionID 非空且
+// 在网内的 gate 额外带成员详情（口径见 GatesView）。
+//
+// sessionID 为空 = 纯枚举（存在性 + 计数）。sessionID 非空但**不受本 hub 托管** → 不报错：
+// 枚举面是**读面**，不承担写面的托管校验（join/leave 才要求托管，见 ErrSessionNotHosted）。
+//
+// ⚠ **别把它读成"Joined 恒 false"**：发现表折的是**事件流**（共享库口径——同一事件库里
+// 可能还有别的进程写的 gate.joined/gate.left），不是"本进程托管的 session 名单"。所以一个
+// 不受本 hub 托管的 session **仍可能在网内**（Joined=true）：它可能是同库另一个进程
+// 托管的 session，也可能是本进程重启前的遗留成员关系。判定口径只有一个 = 发现表折叠出
+// 的**活跃成员关系**（joined 减 left，core/discovery 的 InGate）。
+func (h *Hub) Gates(ctx context.Context, sessionID contracts.Ulid) (GatesView, error) {
+	if h == nil {
+		return GatesView{}, errors.New("host: Hub 为 nil")
+	}
+	if sessionID != "" && !core.ValidUlid(sessionID) {
+		return GatesView{}, fmt.Errorf("host: session_id 不是合法 ULID（26 字符 Crockford base32）: %q", sessionID)
+	}
+	if _, err := h.discFeed.catchUp(ctx); err != nil {
+		return GatesView{}, fmt.Errorf("host: 扫事件流: %w", err)
+	}
+	view := GatesView{SessionID: string(sessionID), Gates: []GateView{}}
+	for _, g := range h.disc.Gates() {
+		members := h.filterForkGateMembers(h.disc.GateMembers(g.GateID))
+		row := GateView{GateID: g.GateID, MemberCount: len(members)}
+		if sessionID != "" && h.disc.InGate(sessionID, g.GateID) {
+			row.Joined = true
+			row.Members = members
+			// 成员行的 Gates 只填**与查询方相交**的 gate（与 /api/peers 的 PeerRow.Gates
+			// 同源：sharedGates）。
+			//
+			// 为什么不能填全量：SessionRow.Gates 默认是"该 session 的**全部**活跃 gate"。
+			// 直接把它塞进成员行 = 把该成员的**其他** gate 成员关系泄露给查询方——哪怕
+			// 查询方并不在那些 gate 里（K11：不在网内的 gate 只给存在性 + 计数，不给成员
+			// 身份；否则"它还在 team:secret 里"这条信息就泄出去了）。
+			for i := range row.Members {
+				row.Members[i].Gates = h.disc.SharedGates(sessionID, contracts.Ulid(row.Members[i].SessionID))
+			}
+		}
+		view.Gates = append(view.Gates, row)
+	}
+	return view, nil
 }
 
 // peersView 组装可见面（先扫描追平）。
@@ -426,18 +576,58 @@ func (h *Hub) mainAgentOf(sessionID contracts.Ulid) (contracts.Ulid, bool) {
 //
 // agentID 是该 session 的主 agent（gate.joined 事件的 envelope.agent_id：契约必填，
 // 且语义上"是主 agent 代表这个 session 加入 gate"）。
+//
+// # 两条护栏（F1：自动 gate 不得静默撤销用户的显式离开，也不得每次重启多落一条 join）
+//
+// 自动 gate 的加入是**幂等**的：一个 session 对同一个自动 gate 至多有一条"当前有效"的
+// 成员关系。于是：
+//
+//	① **已是活跃成员** → 不重发 join。
+//	   否则每次进程重启都会按新的 JoinGeneration 算出**新的确定性 id** → store 的
+//	   ON CONFLICT(id) DO NOTHING 去重失效 → 每次重启多落一条 gate.joined（届数虚涨，
+//	   事件流被无意义地灌水）。
+//
+//	② **曾显式离开过**（有 leave 事实且当前不活跃）→ **不自动复活**。
+//	   显式 leave（POST /api/gates/leave）的语义强于"自动 gate 策略"：用户明确说过
+//	   "这个 session 不在这个 gate 里"，重启不该把它悄悄加回去（那等于撤销用户的决定）。
+//	   要回来得**显式** join（JoinGate 走显式路径，不受本护栏限制）。
+//
+// **取舍（如实写明）**：自动 gate 的"复活"能力因此被取消——显式离开过的自动 gate，
+// 只能靠显式 join 回来。另一条边界：leave 只针对**那一个 gate id**；若会话的
+// CWD / run_id 变了（自动 gate 的 id 随之变了），那是**另一个** gate，照常加入。
+//
+// 判据都在发现表里（core/discovery）：InGate = 当前活跃成员；LeftGate = 曾显式离开过。
 func (h *Hub) joinAutoGates(ctx context.Context, sessionID, agentID contracts.Ulid, spec SessionSpec) error {
 	gates := h.autoGatesFor(spec)
 	if len(gates) == 0 {
 		return nil
 	}
+	// 先扫平再判：发现表的水位可能还没追上刚发布的事件（重启后重建的表要重放全量）——
+	// 不扫平就判，会把"其实早已 join / leave 过"当成"没有"，于是又发一条 join。
+	if _, err := h.discFeed.catchUp(ctx); err != nil {
+		return fmt.Errorf("host: 扫事件流: %w", err)
+	}
 	evs := make([]contracts.Event, 0, len(gates))
 	for _, g := range gates {
-		ev, err := newGateJoinedEvent(sessionID, agentID, g)
+		// ① 已是活跃成员 → 不重发（幂等：重启不该多落一条 gate.joined）。
+		if h.disc.InGate(sessionID, g.gateID) {
+			continue
+		}
+		// ② 曾显式离开过 → 不自动复活（显式 leave 的语义强于自动 gate 策略）。
+		if h.disc.LeftGate(sessionID, g.gateID) {
+			continue
+		}
+		// 届数从发现表折出来（全新 session = 0；重启后重放历史 = 已发生的 join 次数）——
+		// 与显式 join 同一把尺（JoinGate），存储层去重不变量一致。
+		gen := h.disc.JoinGeneration(sessionID, g.gateID)
+		ev, err := newGateJoinedEvent(sessionID, agentID, g, gen)
 		if err != nil {
 			return err
 		}
 		evs = append(evs, ev)
+	}
+	if len(evs) == 0 {
+		return nil // 全都已是成员 / 曾显式离开 → 不落任何事件
 	}
 	return h.bus.Publish(ctx, evs...)
 }
@@ -478,24 +668,54 @@ func (h *Hub) autoGatesFor(spec SessionSpec) []autoGate {
 
 // newGateJoinedEvent 组一条 gate.joined durable 事件（契约增量：F7 只增）。
 //
-// **Event.ID 是确定性导出**的（由 session_id + gate_id + source 哈希而来，26 字符
-// Crockford base32 = ULID 形态 ✅，core.ValidUlid 校验通过）：同一个
-// (session, gate, source) 的 join 事件**恒是同一个 id** → store 的
+// **Event.ID 是确定性导出**的（由 session_id + gate_id + source + **届数**哈希而来，
+// 26 字符 Crockford base32 = ULID 形态 ✅，core.ValidUlid 校验通过）：
+// 同一个 (session, gate, source, gen) 的 join 事件**恒是同一个 id** → store 的
 // ON CONFLICT(id) DO NOTHING 在**存储层**兜住并发重复（与 X5 spawn_request_id 同款
 // 手法 ✅：幂等不靠调用方自觉）。
 //
-// 为什么需要它：host 侧虽用 per-session 锁把「判重 + 发布」收成一段临界区，但那是
-// **单进程**的保护；确定性 id 让"同一 join 只落一条事件"成为存储层的不变量，
-// 跨进程/绕过锁时同样成立。
-func newGateJoinedEvent(sessionID, agentID contracts.Ulid, g autoGate) (contracts.Event, error) {
+// gen 是"第几届"（discovery.JoinGeneration：已折叠的 join 次数）。为什么把它编进 id：
+// 只按 (session, gate, source) 哈希的话，**leave 之后的重 join** 会撞上第一次的 id 被
+// 存储层吃掉 → 成员关系永远恢复不了（G15 回归：join→leave→rejoin 必须恢复可见）。
+// 带上届数后：同届的并发 join 仍撞同一 id（去重不变量不变），重 join 是新的一届 → 新 id。
+//
+// 为什么需要确定性 id：host 侧虽用 per-session 锁把「判重 + 发布」收成一段临界区，
+// 但那是**单进程**的保护；确定性 id 让"同一届 join 只落一条事件"成为存储层的不变量，
+// 跨进程/绕过锁/发现表丢失时同样成立（届数由事件折叠推出，重启后重放仍一致）。
+func newGateJoinedEvent(sessionID, agentID contracts.Ulid, g autoGate, gen int) (contracts.Event, error) {
 	raw, err := json.Marshal(contracts.GateJoinedPayload{GateID: g.gateID, Source: g.source})
 	if err != nil {
 		return contracts.Event{}, fmt.Errorf("host: 序列化 gate.joined payload: %w", err)
 	}
 	return contracts.Event{
 		V:         1,
-		ID:        contracts.Ulid(core.ShortHash("gate-joined:" + string(sessionID) + ":" + g.gateID + ":" + string(g.source))),
+		ID:        contracts.Ulid(core.ShortHash("gate-joined:" + string(sessionID) + ":" + g.gateID + ":" + string(g.source) + ":" + strconv.Itoa(gen))),
 		Kind:      discovery.KindGateJoined,
+		TS:        time.Now().UTC().Format(time.RFC3339),
+		SessionID: sessionID,
+		AgentID:   agentID,
+		Durable:   true,
+		Payload:   raw,
+	}, nil
+}
+
+// newGateLeftEvent 组一条 gate.left durable 事件（G15；契约增量：F7 只增）。
+//
+// 与 gate.joined **对称**：确定性 id（"gate-left:<session>:<gate>:<gen>"）让重复 leave
+// 在存储层再去重一次（幂等双保险——发布端已按 InGate 判过重，这里是跨进程/绕过锁时的
+// 兜底）。gen 是**被终止的那一届**（= 该成员关系的 join 届数；调用方传
+// JoinGeneration-1）——同一届成员关系的重复 leave 撞同一 id，下一届的 leave 是新 id。
+//
+// source 记被终止的成员关系的来源（与对应 gate.joined 的 source 同值，审计对得上）。
+func newGateLeftEvent(sessionID, agentID contracts.Ulid, gateID string, source contracts.GateJoinSource, gen int) (contracts.Event, error) {
+	raw, err := json.Marshal(contracts.GateLeftPayload{GateID: gateID, Source: source})
+	if err != nil {
+		return contracts.Event{}, fmt.Errorf("host: 序列化 gate.left payload: %w", err)
+	}
+	return contracts.Event{
+		V:         1,
+		ID:        contracts.Ulid(core.ShortHash("gate-left:" + string(sessionID) + ":" + gateID + ":" + strconv.Itoa(gen))),
+		Kind:      discovery.KindGateLeft,
 		TS:        time.Now().UTC().Format(time.RFC3339),
 		SessionID: sessionID,
 		AgentID:   agentID,

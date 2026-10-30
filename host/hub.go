@@ -140,7 +140,7 @@ type Hub struct {
 	// mergeCache：session → review 结论缓存（V6 合并门禁读面；p3 修：全量读事件流是 O(n)，
 	// 缓存靠"探测读"**精确**失效——见 host/mergegate.go 的 reviewsFor）。
 	mergeCache map[contracts.Ulid]*mergeReviewCache
-	// joinLocks：session → join 互斥锁（per-session；见 joinMutex）。
+	// joinLocks：session → gate 成员关系写锁（per-session；join/leave 共用，见 joinMutex）。
 	joinLocks map[contracts.Ulid]*sync.Mutex
 	// injectWarned：注入区被截断的告警**只报一次**（工厂是 per-Run 的，不去重就是每轮一条）。
 	injectWarned bool
@@ -672,18 +672,19 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		return nil, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
 	}
 	lp, err := loop.New(loop.Config{
-		Provider:      h.provider,
-		Bus:           h.bus,
-		Registry:      h.reg,
-		Policy:        h.engine,
-		Approver:      h.approver,
-		SessionID:     sessionID,
-		AgentID:       agentID,
-		Model:         h.cfg.Model,
-		System:        system,
-		MaxTurns:      h.cfg.MaxTurns,
-		ContextBudget: h.contextBudgetFor(strategyKind),
-		Store:         h.store, // goal ledger 生产者（J19/X6）与手动 checkpoint（X3）经它
+		Provider:        h.provider,
+		Bus:             h.bus,
+		Registry:        h.reg,
+		Policy:          h.engine,
+		Approver:        h.approver,
+		SessionID:       sessionID,
+		AgentID:         agentID,
+		Model:           h.cfg.Model,
+		System:          system,
+		MaxTurns:        h.cfg.MaxTurns,
+		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位（G14；空 = 不传）
+		ContextBudget:   h.contextBudgetFor(strategyKind),
+		Store:           h.store, // goal ledger 生产者（J19/X6）与手动 checkpoint（X3）经它
 		// 在线表注入（K14/K15）：主 agent 的 prompt 末尾恒带在线表；配置运行期可调。
 		// subagent 的 loop 不传这两项（nil = 不注入，K11：只有主 agent 参与水平可见性）。
 		OnlineTable:       h.onlineConfig,

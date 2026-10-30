@@ -66,6 +66,18 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		ask = fc.Ask
 	}
 
+	// reasoning_effort（G14）：显式 flag > 文件（无 env——档位不是凭据，但也没必要多一条来源）。
+	// 空 = 不传（端点默认档）。
+	//
+	// **这里只取值，不校验**：本函数是"flag + 文件 → host.Config"的搬运工，档位合法性
+	// 由 host.Config.validate 判（唯一事实源 = host.ValidateReasoningEffort）——serve 路径
+	// 的 fail-close 就在那儿。run / resume 两条**不经 host.Config** 的路径自己调
+	// host.ResolveReasoningEffort（同一个白名单）→ 三路径同口径。
+	reasoningEffort := host.ReasoningEffortValue(*f.reasoningEffort)
+	if reasoningEffort == "" {
+		reasoningEffort = host.ReasoningEffortValue(fc.ReasoningEffort)
+	}
+
 	// max_turns / context_budget：flag 非零才用 flag；否则用文件（0=未设）。
 	maxTurns := *f.maxTurns
 	if maxTurns == 0 {
@@ -93,6 +105,9 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		MaxSessionRows: *f.maxSessionRows,
 		CWD:            strings.TrimSpace(*f.cwd),
 		RunID:          strings.TrimSpace(*f.runID),
+
+		// 思维链档位（G14）：显式 flag > 文件；空 = 不传（host 侧白名单校验）。
+		ReasoningEffort: reasoningEffort,
 
 		// 协议面一轮对话的整轮上限（秒；0 = 框架默认 600）。只有 flag 面（无 env/文件面）：
 		// 这是**协议面**的时钟，不影响 CLI/TUI 的交互式对话。
@@ -156,6 +171,29 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		cfg.Provider = testProviderOverride
 	}
 	return cfg, nil
+}
+
+// rejectInvalidReasoningEffort 在 host.New **之前**校验思维链档位（白名单）。
+//
+// 返回 true = 配置被拒（调用方打印提示后 exit 2）。
+//
+// # 为什么要单独判一次（host.Config.validate 里已经有一遍）
+//
+// **退出码口径**：配置被拒 = 退出码 2（run / resume 就是这个口径）；而 host.New 失败
+// 一律 exit 1（那是"装配失败"，含非配置类原因）。同一个坏档位在 serve 下报 1、在 run 下
+// 报 2 —— 脚本没法用退出码区分"配置写错了"和"跑挂了"。故配置类的问题要在 host.New
+// **之前**单独判一次。
+//
+// 只判**档位**（其余配置项仍由 host.Config.validate 判、仍走 exit 1）：统一"档位写错 = 2"
+// 这一条，不动其它配置错误的既有退出码（既有行为不变）。
+//
+// 校验口径的唯一事实源 = host.ValidateReasoningEffort（run / resume / serve 三路径同口径）。
+func rejectInvalidReasoningEffort(cfg host.Config) bool {
+	if err := host.ValidateReasoningEffort(cfg.ReasoningEffort); err != nil {
+		fmt.Fprintln(os.Stderr, "思维链档位不合法:", err)
+		return true
+	}
+	return false
 }
 
 // flagIfSet 返回 flag 值（若显式设置）否则空串（让下游回落文件/默认）。

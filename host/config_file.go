@@ -48,6 +48,9 @@ type FileConfig struct {
 	Allow []string `toml:"allow"`
 	// Ask 需要人审的工具名。
 	Ask []string `toml:"ask"`
+	// ReasoningEffort 模型思维链强度档位（G14；空 = 不传，端点用默认档）。
+	// 取值 low/medium/high/xhigh（host.Config.validate 白名单校验）。
+	ReasoningEffort string `toml:"reasoning_effort"`
 
 	// OnlineTable 在线表注入（K14/K15）默认参数。
 	OnlineTable OnlineTableFileConfig `toml:"online_table"`

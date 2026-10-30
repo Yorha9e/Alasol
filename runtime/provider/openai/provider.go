@@ -25,19 +25,23 @@ const chatCompletionsPath = "/chat/completions"
 // 网关的 5xx 页面可能几百 KB，全塞进事件/日志会把它们撑爆。
 const maxErrorBody = 1024
 
-// 流式事件的 kind（core.ProviderEvent.Kind 的 v0 子集，I3 的开放字符串）。
-// loop / UI 侧应对照这些常量而不是裸字符串字面量。
+// 流式事件的 kind（**core 是唯一事实源**：core.ProviderEvent.Kind 的 v0 子集，I3 的
+// 开放字符串）。这里只做**别名**——loop / UI 侧对照 core.Kind* 常量或本包的同名常量，
+// 不再各写一份字面量（改值时只改 core 一处）。
 const (
 	// KindTextDelta 增量文本（Text=片段）。
-	KindTextDelta = "text.delta"
+	KindTextDelta = core.KindTextDelta
+	// KindReasoningDelta 增量思维链（Reasoning=片段；G14）。与 KindTextDelta 同层级：
+	// 都是"边收边发"的增量，消费端按 Kind 分流到正文/思维链两个显示区。
+	KindReasoningDelta = core.KindReasoningDelta
 	// KindToolCallStart 一个工具调用开始（ToolCall.ID / ToolCall.Name 已知，Args 可能还空）。
-	KindToolCallStart = "toolcall.start"
+	KindToolCallStart = core.KindToolCallStart
 	// KindToolCallDelta 工具调用参数片段（ToolCall.ID 已锁定，Args=**这一个片段**的原始字节）。
-	KindToolCallDelta = "toolcall.delta"
+	KindToolCallDelta = core.KindToolCallDelta
 	// KindDone 正常结束（Text=最终全文，ToolCall=nil）。
-	KindDone = "done"
+	KindDone = core.KindDone
 	// KindError 失败（Text=错误文案）；返回前必发，发完照常返回 error。
-	KindError = "error"
+	KindError = core.KindError
 )
 
 // Options 是 Provider 的装配参数（零值可用：BaseURL 落默认值、无 APIKey、无流式）。
@@ -192,6 +196,9 @@ type chatRequest struct {
 	Stream   bool          `json:"stream"`
 	// StreamOptions 仅流式下发：让最后一个 chunk 带 usage（否则流式拿不到 token 计量）。
 	StreamOptions *chatStreamOptions `json:"stream_options,omitempty"`
+	// ReasoningEffort 思维链强度档位（G14；**仅当调用方设置才下发**——nil/空 = 不发该字段，
+	// 让端点用自己的默认档）。取值由网关解释（low/medium/high/xhigh…），本包原样透传。
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 }
 
 type chatStreamOptions struct {
@@ -264,6 +271,13 @@ func (p *Provider) buildRequest(req core.ModelRequest) ([]byte, error) {
 		Messages: msgs,
 		Tools:    tools,
 		Stream:   p.stream,
+	}
+	// 思维链档位（G14）：trim 后非空才下发（"   " 这种空白串等于没设——发了反而让
+	// 端点收到一个它不认识的档位）。nil = 不传，端点用默认档。
+	if req.ReasoningEffort != nil {
+		if eff := strings.TrimSpace(*req.ReasoningEffort); eff != "" {
+			cr.ReasoningEffort = &eff
+		}
 	}
 	if p.stream {
 		cr.StreamOptions = &chatStreamOptions{IncludeUsage: true}
@@ -358,7 +372,10 @@ func (p *Provider) runOnce(body io.Reader, emit func(core.ProviderEvent)) (core.
 	}
 
 	ch := cr.Choices[0]
-	res := core.ModelResult{Text: string(ch.Message.Content)}
+	res := core.ModelResult{
+		Text:      string(ch.Message.Content),
+		Reasoning: reasoningOf(ch.Message.ReasoningContent, ch.Message.Reasoning),
+	}
 	for i, tc := range ch.Message.ToolCalls {
 		if strings.TrimSpace(tc.Function.Name) == "" {
 			return fail(emit, fmt.Errorf("openai: choices[0].tool_calls[%d]（id=%q）缺少 function.name", i, tc.ID))
@@ -375,6 +392,12 @@ func (p *Provider) runOnce(body io.Reader, emit func(core.ProviderEvent)) (core.
 
 	// 非流式也按流式的形状补发事件：一条全文 delta + 每个工具一条 start + done。
 	// 消费端因此不必区分两种模式。
+	//
+	// G14：思维链同样补发一条 reasoning.delta（在正文之前——思维链在时间上先于正文），
+	// 消费端把两类片段分流到正文/思维链两个显示区即可。
+	if res.Reasoning != "" {
+		emitEvent(emit, core.ProviderEvent{Kind: KindReasoningDelta, Reasoning: res.Reasoning})
+	}
 	if res.Text != "" {
 		emitEvent(emit, core.ProviderEvent{Kind: KindTextDelta, Text: res.Text})
 	}
@@ -446,12 +469,13 @@ type toolAccum struct {
 
 // streamAccumulator 累积一次流式调用的全部增量。
 type streamAccumulator struct {
-	emit    func(core.ProviderEvent)
-	text    strings.Builder
-	order   []int // tool_call 的 index 出现顺序（保序：模型并行调用的顺序有意义）
-	byIndex map[int]*toolAccum
-	usage   *core.Usage
-	done    bool
+	emit      func(core.ProviderEvent)
+	text      strings.Builder
+	reasoning strings.Builder // 思维链整段（G14：逐段组装，与 text 同口径）
+	order     []int           // tool_call 的 index 出现顺序（保序：模型并行调用的顺序有意义）
+	byIndex   map[int]*toolAccum
+	usage     *core.Usage
+	done      bool
 	// indexlessFallback 记录"曾用过缺 index 的位置兜底"——一旦流里出现第二个
 	// 调用，兜底那次归属就是猜的 → 必须 fail-loud（见 applyToolCalls）。
 	indexlessFallback bool
@@ -494,6 +518,12 @@ func (a *streamAccumulator) handleLine(line string) error {
 		if delta := choice.Delta.Content; delta != "" {
 			a.text.WriteString(string(delta))
 			emitEvent(a.emit, core.ProviderEvent{Kind: KindTextDelta, Text: string(delta)})
+		}
+		// 思维链增量（G14）：边收边发（与正文同口径），整段留在 accumulator 里
+		// 供 result() 组装。两个字段名都看（reasoning_content 优先，见 reasoningOf）。
+		if rd := reasoningOf(choice.Delta.ReasoningContent, choice.Delta.Reasoning); rd != "" {
+			a.reasoning.WriteString(rd)
+			emitEvent(a.emit, core.ProviderEvent{Kind: KindReasoningDelta, Reasoning: rd})
 		}
 		if err := a.applyToolCalls(choice.Delta.ToolCalls); err != nil {
 			return err // fail-loud：缺 index 且无法安全归并（见 applyToolCalls）
@@ -610,7 +640,7 @@ func (a *streamAccumulator) applyToolCalls(deltas []chunkToolCall) error {
 
 // result 按 index 出现顺序组装 ModelResult（流已结束、尚未校验）。
 func (a *streamAccumulator) result() core.ModelResult {
-	res := core.ModelResult{Text: a.text.String()}
+	res := core.ModelResult{Text: a.text.String(), Reasoning: a.reasoning.String()}
 	if len(a.order) > 0 {
 		res.ToolCalls = make([]core.ToolCallReq, 0, len(a.order))
 		for _, idx := range a.order {

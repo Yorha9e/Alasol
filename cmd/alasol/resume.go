@@ -50,6 +50,8 @@ func resumeMain(args []string) int {
 	model := fs.String("model", "", "模型名（续跑时用；缺省回落 env ALASOL_MODEL）")
 	baseURL := fs.String("base-url", "", "OpenAI 兼容端点（续跑时用；空=官方）")
 	apiKeyEnv := fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名（续跑时用）")
+	reasoningEffort := fs.String("reasoning-effort", "",
+		"模型思维链强度档位（G14，续跑时用）：low|medium|high|xhigh（空=不传，端点用默认档）")
 
 	// 沙箱（v2-S4）：**重放同样要受约束**（F9）。
 	//
@@ -91,6 +93,19 @@ func resumeMain(args []string) int {
 	}
 	if fc == nil {
 		fc = &host.FileConfig{}
+	}
+
+	// ReasoningEffort（G14）：续跑（-continue）那一轮同样透传档位——与 run/serve 同一条
+	// 配置面（显式 flag > 文件；空 = 不传）。
+	//
+	// **白名单校验在启动期**（fail-close，与 run/serve 同一口径）：打错的档位在这里就
+	// 报错（**在任何重放 / 模型调用之前**——重放会真的执行工具，档位错了就该先拒），
+	// 而不是拖到续跑那一轮模型调用里拿到一个离现场很远的 400（唯一事实源 =
+	// host.ValidateReasoningEffort）。
+	reasoningEffortVal, err := host.ResolveReasoningEffort(*reasoningEffort, fc.ReasoningEffort)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "思维链档位不合法:", err)
+		return 2
 	}
 
 	// registry：内置 read/write/bash（resume 重放工具用）。
@@ -165,15 +180,18 @@ func resumeMain(args []string) int {
 	agentID := durable.PrimaryAgentID(events)
 
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
+	//
+	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
 	lp, err := loop.New(loop.Config{
-		Provider:  prov,
-		Bus:       bus.New(st),
-		Registry:  reg,
-		Policy:    policy.New(), // 重放不重跑策略链（M9：T0 已授权）；此引擎不被 Replay 用到
-		SessionID: sid,
-		AgentID:   agentID, // 真实主 agent（续跑事件的归属）
-		Model:     modelName,
-		Store:     st,
+		Provider:        prov,
+		Bus:             bus.New(st),
+		Registry:        reg,
+		Policy:          policy.New(), // 重放不重跑策略链（M9：T0 已授权）；此引擎不被 Replay 用到
+		SessionID:       sid,
+		AgentID:         agentID, // 真实主 agent（续跑事件的归属）
+		Model:           modelName,
+		ReasoningEffort: reasoningEffortVal,
+		Store:           st,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "构造 resume loop:", err)

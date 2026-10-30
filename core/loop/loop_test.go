@@ -239,6 +239,13 @@ func (p *mockProvider) reqs() []core.ModelRequest {
 
 func cloneRequest(req core.ModelRequest) core.ModelRequest {
 	out := core.ModelRequest{Model: req.Model, System: req.System}
+	// 思维链档位（G14）**必须一起克隆**：漏了它，克隆出来的请求与原请求在"档位"这件事上
+	// 就不再等价——用它断言透传的用例会假绿（"没带档位"其实只是克隆丢了）。
+	// 指针也要**深拷贝**（否则两个请求共享同一个 *string，改一个会影响另一个）。
+	if req.ReasoningEffort != nil {
+		eff := *req.ReasoningEffort
+		out.ReasoningEffort = &eff
+	}
 	if len(req.Messages) > 0 {
 		out.Messages = append([]core.Message(nil), req.Messages...)
 		for i := range out.Messages {

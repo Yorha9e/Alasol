@@ -34,6 +34,10 @@ type runnerOpts struct {
 	System     string
 	SessionEnv core.EnvScope
 
+	// ReasoningEffort 模型思维链强度档位（G14；空 = 不传）。透传给 loop.Config →
+	// ModelRequest.ReasoningEffort → provider 的 reasoning_effort。
+	ReasoningEffort string
+
 	// CheckpointEvery 每 N 轮自动 checkpoint（X3；0 = 只手动）。透传给 loop.Config。
 	CheckpointEvery int
 
@@ -159,6 +163,7 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		MaxTurns:        opts.MaxTurns,
 		Store:           st, // 阶段 8：同一 store 供 checkpoint / resume
 		CheckpointEvery: opts.CheckpointEvery,
+		ReasoningEffort: opts.ReasoningEffort, // 思维链档位（G14；空 = 不传）
 	}
 	lp, err := loop.New(cfg)
 	if err != nil {

@@ -42,7 +42,17 @@ const (
 	KindUserPrompt = "user.prompt"
 	// KindModelTurn 一轮 provider 返回的事实（F1，含 usage 只做成本记录，J21）。每轮一条。
 	KindModelTurn = "model.turn"
+	// KindModelDelta 流式增量片段（G13：打字机效果）。**durable=false 的流事件**
+	// （F8/陷阱 11）：不入库、不占 seq、不进 Result.Events——总线直发订阅者，
+	// 与 X1 三段写路径、user.prompt/model.turn 旁路是**第四条独立通道**。
+	KindModelDelta = "model.delta"
 )
+
+// provider 流事件 kind：**引用 core 的常量**（core 是唯一事实源——core 不 import
+// runtime，依赖方向相反，所以常量住在 core 而不是这里；见 core.KindTextDelta 等）。
+//
+// 为什么不再在本包镜像一份字面量：镜像过的两份会悄悄分叉（改了一边忘了另一边 →
+// loop 的 switch 收不到 provider 发的事件，**静默**丢片段，没有任何报错）。
 
 // 失败分类码（M4：可重试/致命分类用的开放字符串；这里固化 loop 自己产生的几种）。
 const (
@@ -102,6 +112,10 @@ type Config struct {
 	// context.assembled 事件里 ContextSnapshot.tokens_budget 的占比分母（J21），
 	// v0 不据此做任何装配/压缩决策。
 	ContextBudget int64
+	// ReasoningEffort 思维链强度档位（G14；空 = **不传**给 provider）。
+	// 原样进每轮 core.ModelRequest.ReasoningEffort，由 provider 透传给端点
+	// （取值如 low/medium/high/xhigh；档位集随网关演进，loop 不校验）。
+	ReasoningEffort string
 	// Agents 多 agent 环境（阶段 5）。nil = 单 agent 模式（默认，向后兼容）：
 	// 不注入 spawn/complete、不用 agent 树、不过滤工具。
 	Agents *Agents
@@ -158,6 +172,9 @@ type Loop struct {
 	sessionEnv core.EnvScope
 	maxTurns   int
 	agents     *Agents
+
+	// reasoningEffort 思维链档位（G14；空 = 不传）。见 Config.ReasoningEffort。
+	reasoningEffort string
 
 	// contextBudget 是 ContextSnapshot.tokens_budget 的取值来源（占比分母，J21）。
 	contextBudget int64
@@ -261,6 +278,7 @@ func New(cfg Config) (*Loop, error) {
 		sessionEnv:      cfg.SessionEnv,
 		maxTurns:        maxTurns,
 		agents:          cfg.Agents,
+		reasoningEffort: strings.TrimSpace(cfg.ReasoningEffort),
 		contextBudget:   budget,
 		store:           cfg.Store,
 		checkpointEvery: cfg.CheckpointEvery,
@@ -397,7 +415,7 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
 		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts)
 
-		mr, err := l.provider.Run(ctx, req, l.emit)
+		mr, err := l.provider.Run(ctx, req, l.emitFunc(ctx, turn))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// 取消导致的失败按取消处理（不要把"被取消"包装成模型错误）。
@@ -498,11 +516,23 @@ func (l *Loop) request(history []core.Message, ot *onlineTable, st *runState) co
 		msgs = append(msgs, ot.message)
 	}
 	return core.ModelRequest{
-		Model:    l.model,
-		System:   l.system,
-		Messages: msgs,
-		Tools:    l.visibleTools(strategyToolsOf(st)), // 框架工具（策略 + ledger）
+		Model:           l.model,
+		System:          l.system,
+		Messages:        msgs,
+		Tools:           l.visibleTools(strategyToolsOf(st)), // 框架工具（策略 + ledger）
+		ReasoningEffort: l.reasoningEffortPtr(),              // 思维链档位（G14；nil = 不传）
 	}
+}
+
+// reasoningEffortPtr 把档位配置折成请求字段（G14）：空 = nil（provider 不下发
+// reasoning_effort，端点用自己的默认档）；非空 = 指针（provider trim 后原样透传）。
+//
+// 返回的是 Loop 字段的地址——它在 New 之后不可变（并发 Run 只读），故安全。
+func (l *Loop) reasoningEffortPtr() *string {
+	if l.reasoningEffort == "" {
+		return nil
+	}
+	return &l.reasoningEffort
 }
 
 // requestWithStrategy 是挂了 context_strategy（v2-S1）时的请求组装：先让策略把 history
@@ -546,10 +576,11 @@ func (l *Loop) requestWithStrategy(ctx context.Context, history []core.Message, 
 		msgs = append(out, ot.message)
 	}
 	return core.ModelRequest{
-		Model:    l.model,
-		System:   l.system,
-		Messages: msgs,
-		Tools:    tools,
+		Model:           l.model,
+		System:          l.system,
+		Messages:        msgs,
+		Tools:           tools,
+		ReasoningEffort: l.reasoningEffortPtr(), // 思维链档位（G14；nil = 不传）
 	}, parts
 }
 
@@ -714,12 +745,26 @@ func (l *Loop) toolVisible(name string) bool {
 	return dec.Verdict != contracts.EffectDeny
 }
 
-// emit 接收 provider 的流式事件。
+// emitFunc 造第 turn 轮的流事件出口（G13：点亮 v0 那个故意留空的 emit 扩展点）。
 //
-// v0 **不转发、不落库**：model.delta 是 durable=false 的流事件（F8/陷阱 11：不入库、
-// 不占 seq），转发性投递对订阅者不幂等；v0 只把 Provider.Run 的返回值（最终结果）
-// 用于写路径。将来要实时 UI 时在这里 Publish 一条 Durable:false 的事件即可。
-func (l *Loop) emit(core.ProviderEvent) {}
+// provider 边收边发的增量片段经这里 Publish 成 **durable=false** 的 model.delta 流事件
+// （F8/陷阱 11：不入库、不占 seq、不进 Result.Events、回放面没有它——见 publishModelDelta）。
+// 其余 kind（toolcall.* / done / error）v0 仍不转发：零行为变化（X1 三段写路径与
+// user.prompt/model.turn 旁路的形状一字不动，delta 是**新旁路**）。
+//
+// 为什么是工厂而不是 Loop 方法：delta 载荷要带**本轮次号**（ModelDeltaPayload.turn），
+// 发布还要受 Run 的 ctx 约束——两者都是 Run 的局部量，闭包捕获即可，Loop 本身保持
+// 无可变状态（并发 Run 安全，与 harness 的 mockProvider 也照旧工作）。
+func (l *Loop) emitFunc(ctx context.Context, turn int) func(core.ProviderEvent) {
+	return func(ev core.ProviderEvent) {
+		switch ev.Kind {
+		case core.KindTextDelta, core.KindReasoningDelta:
+			l.publishModelDelta(ctx, turn, ev)
+		}
+		// 其它 kind（toolcall.start/delta、done、error）：v0 不转发。工具调用的
+		// 事实已由 X1 三段写路径完整记录（intent/completed/failed），流式副本是冗余。
+	}
+}
 
 // nowRFC3339 返回 UTC 的 RFC 3339 时间戳（契约 ts 字段格式；与 policy 同口径）。
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }

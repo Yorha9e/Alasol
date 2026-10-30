@@ -27,6 +27,8 @@ func runMain(args []string) int {
 	maxTurns := fs.Int("max-turns", 0, "最大轮数（0=默认 20）")
 	checkpointEvery := fs.Int("checkpoint-every", 0, "每 N 轮自动 checkpoint（X3；0=只手动）")
 	system := fs.String("system", "", "系统提示")
+	reasoningEffort := fs.String("reasoning-effort", "",
+		"模型思维链强度档位（G14）：low|medium|high|xhigh（空=不传，端点用默认档）")
 	configPath := fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15）")
 
 	sandboxEnabled := fs.Bool("sandbox", false,
@@ -62,6 +64,16 @@ func runMain(args []string) int {
 	}
 	// base_url：flag > env > 文件。
 	baseURLVal, _ := host.Precedence(*baseURL, os.Getenv("ALASOL_BASE_URL"), fc.BaseURL)
+	// reasoning_effort（G14）：显式 flag > 文件；空 = 不传（端点默认档）。
+	//
+	// **白名单校验在启动期**（fail-close，与 serve 路径同一口径）：打错的档位在这里就
+	// 报错，而不是拖到一轮模型调用里拿到一个离现场很远的 400。校验的唯一事实源是
+	// host.ValidateReasoningEffort（网关新增档位只改那一处）。
+	reasoningEffortVal, err := host.ResolveReasoningEffort(*reasoningEffort, fc.ReasoningEffort)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "思维链档位不合法:", err)
+		return 2
+	}
 	// 凭据：env > 文件（api-key-env 名 flag>文件>默认）。
 	keyEnv := host.ResolveAPIKeyEnv(*apiKeyEnv, fc.APIKeyEnv)
 	apiKey := host.ResolveCredential(keyEnv, fc.APIKey)
@@ -79,6 +91,7 @@ func runMain(args []string) int {
 		MaxTurns:                  *maxTurns,
 		CheckpointEvery:           *checkpointEvery,
 		System:                    *system,
+		ReasoningEffort:           reasoningEffortVal, // G14；空 = 不传
 		SessionEnv:                sessionEnvFromProcess(),
 		Sandbox:                   sandboxEnabledFlag(flagSet(fs, "sandbox"), *sandboxEnabled, fc),
 		SandboxWriteDirs:          sandboxRunDirs(fs, *sandboxWriteDirs, fc),

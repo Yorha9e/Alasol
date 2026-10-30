@@ -27,6 +27,9 @@ type capturedRequest struct {
 	Messages      []map[string]any `json:"messages"`
 	Tools         []map[string]any `json:"tools"`
 	StreamOptions map[string]any   `json:"stream_options"`
+	// ReasoningEffort 思维链档位（G14）：**指针**——JSON 里缺省时为 nil，
+	// 借此区分"没发该字段"与"发了空串"（契约口径：不设就不发）。
+	ReasoningEffort *string `json:"reasoning_effort"`
 }
 
 // newTestServer 起一个 httptest 服务，把请求体解码后交给 check（可为 nil），

@@ -457,6 +457,13 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		SessionEnv: l.sessionEnv, // 同 session 注入域
 		MaxTurns:   l.maxTurns,   // 每层独立轮数上限（层数由深度闸门限制）
 		Agents:     l.agents,     // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
+		// 思维链档位（G14）**透传给子 agent**：与 model 同源（子 agent 用父的档位，
+		// 除非类型另行绑定——类型目前没有档位字段）。
+		//
+		// 为什么必须透传：档位是**每轮请求**的字段（ModelRequest.ReasoningEffort），
+		// 子 loop 不带它 → 子 agent 的每轮请求都不带 reasoning_effort → 端点用默认档。
+		// 那就是"父 agent 开了 high、子 agent 静默退回默认档"的能力漂移（用户看不出来）。
+		ReasoningEffort: l.reasoningEffort,
 	}
 	return New(cfg)
 }

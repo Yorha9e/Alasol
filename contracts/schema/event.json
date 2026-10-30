@@ -28,6 +28,8 @@
         "session.resumed": "SessionResumedPayload",
         "session.resume_claimed": "ResumeClaimedPayload",
         "gate.joined": "GateJoinedPayload",
+        "gate.left": "GateLeftPayload",
+        "model.delta": "ModelDeltaPayload",
         "agentlink.broadcast": "AgentLinkBroadcastPayload",
         "agentlink.handoff": "AgentLinkHandoffPayload",
         "context.compacted": "ContextCompactedPayload",
@@ -490,7 +492,7 @@
     },
     "ModelTurnPayload": {
       "type": "object",
-      "description": "model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。model 为本轮模型名（成本统计按模型分组用；provider 不上报或缺省时可为空）。",
+      "description": "model.turn —— 一轮 provider 返回的事实（F1）。每轮模型调用后落一条；text 为本轮文本输出（工具调用轮可为空/前言，收敛轮为最终答复）。usage 只进成本统计（J21），绝不接入预算/门禁判断。model 为本轮模型名（成本统计按模型分组用；provider 不上报或缺省时可为空）。reasoning 为本轮**思维链整段**（G14：provider 上报 reasoning_content/reasoning 时原样收录；解析不到就缺省——不猜、不留空串占位）。",
       "required": ["text"],
       "properties": {
         "text": {
@@ -501,9 +503,32 @@
           "type": "string",
           "description": "本轮模型名（成本统计按模型分组；可缺省）。"
         },
+        "reasoning": {
+          "type": "string",
+          "description": "本轮思维链整段（G14；provider 不上报思维链时可缺省）。"
+        },
         "usage": {
           "$ref": "#/$defs/ModelTurnUsage",
           "description": "token 计量（J21：只做成本记录，provider 不上报 usage 时可缺省）。"
+        }
+      }
+    },
+    "ModelDeltaPayload": {
+      "type": "object",
+      "description": "model.delta —— 一次模型调用的**流式增量片段**（G13：打字机效果）。**durable=false**（F8/陷阱 11）：不入库、不占 seq、不回放——总线直发订阅者，转发性投递对订阅者不幂等（丢了就是丢了）。turn 是本轮次号（同一 Run 内从 1 递增；订阅端据此把片段归组）；text / reasoning 至少一个非空（text = 正文增量，reasoning = 思维链增量 G14）——**两者都空 = 没有可显示的内容，发布端不得发**（这条\"至少一个\"是语义规则，schema 不做条件表达，由发布端与样本钉子保证）。envelope.session_id/agent_id = 发起该轮模型调用的 session/agent。**同 session 并发 Run 的 delta 不可归组（已知边界）**：turn 是**每次 Run 内**的轮次号（两次并发 Run 的 turn 会撞号），本 payload **没有 run 判别位**（run_id / started_at 都没加——加它要走全链：schema + 生成物 + 样本 + 消费端）——故同一 session 上**并发跑两轮**时，订阅端**无法**把两轮的片段可靠归组；归组只对**单 session 串行跑**成立（宿主默认口径：一个 session 同时只跑一轮）。真撞上并发，只能拿 envelope 的 ts / 到达序近似切分，**不得当精确口径**用。",
+      "required": ["turn"],
+      "properties": {
+        "turn": {
+          "type": "integer",
+          "description": "本轮次号（**每次 Run 内**从 1 递增；JSON integer 序号非 id）。**同 session 并发 Run 时撞号**（payload 无 run 判别位，见本 $defs 的说明）——不可跨 Run 归组。"
+        },
+        "text": {
+          "type": "string",
+          "description": "正文增量片段（与 reasoning 至少一个非空）。"
+        },
+        "reasoning": {
+          "type": "string",
+          "description": "思维链增量片段（G14；与 text 至少一个非空）。"
         }
       }
     },
@@ -514,7 +539,7 @@
     },
     "GateJoinedPayload": {
       "type": "object",
-      "description": "gate.joined —— 一个 session 加入一个 gate 的事实（K12：自动 repo:/workflow: + 显式 join_gate）。**gate 定义持久化、成员关系是活的**（G17b）：本事件只记 join 历史（F7 只增不删、不改义，没有 gate.left——离开即 session 结束），活跃成员 = 事件折叠出的 join 历史 ∩ 当前存活 session（session 生命周期 = 进程生命周期，不需要租约/心跳/离线保留）。崩溃重启后老成员全部失活，发现表从事件流重放重建 join 历史；resume 的 session 由宿主重新激活（自动 gate 重算 + 历史重放）。envelope.agent_id = 发起 join 的该 session 主 agent。",
+      "description": "gate.joined —— 一个 session 加入一个 gate 的事实（K12：自动 repo:/workflow: + 显式 join_gate）。**gate 定义持久化、成员关系是活的**（G17b）：本事件只记 join 历史，活跃成员 = 事件折叠出的 join 历史 **减** gate.left（同 session+gate 的 left 之后再 joined 又回来；按 seq 序折叠）∩ 当前存活 session（session 生命周期 = 进程生命周期，不需要租约/心跳/离线保留）。崩溃重启后老成员全部失活，发现表从事件流重放重建 join/leave 历史；resume 的 session 由宿主重新激活（自动 gate 重算 + 历史重放）。envelope.agent_id = 发起 join 的该 session 主 agent。",
       "required": ["gate_id", "source"],
       "properties": {
         "gate_id": {
@@ -524,6 +549,21 @@
         "source": {
           "$ref": "#/$defs/GateJoinSource",
           "description": "本次 join 的来源（审计用：自动还是显式）。"
+        }
+      }
+    },
+    "GateLeftPayload": {
+      "type": "object",
+      "description": "gate.left —— 一个 session **显式离开**一个 gate 的事实（G15：补\"只能加不能减\"的缺漏；F7 只增）。形状与 gate.joined 对称：gate_id + source。source 记的是**被终止的成员关系的来源**（当初是以 auto_repo/auto_workflow/explicit 哪种方式加入的——审计用，便于把 leave 与对应的 join 对上）。活跃成员折叠口径：成员 = joined 减 left（同 session+gate 的 left 之后再 joined 又回来，按 seq 序折叠，乱序 Apply 也稳定）。**幂等**：已不在网内的重复 leave 由发布端去重（不落事件）；leave 之后再 join 恢复可见。envelope.agent_id = 发起 leave 的该 session 主 agent。",
+      "required": ["gate_id", "source"],
+      "properties": {
+        "gate_id": {
+          "type": "string",
+          "description": "gate 标识（S16 命名空间，与 gate.joined 同一命名空间；按整串比较）。"
+        },
+        "source": {
+          "$ref": "#/$defs/GateJoinSource",
+          "description": "被终止的成员关系的来源（审计用：与对应 gate.joined 的 source 同值）。"
         }
       }
     },
