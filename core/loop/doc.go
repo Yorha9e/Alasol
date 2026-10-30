@@ -52,13 +52,27 @@
 //	  replay 取自 registry 里的工具描述、policy_snapshot）
 //	         │  intent 落盘成功才允许继续（落盘失败 → 拒绝执行，Run 返回 error）
 //	         ▼
-//	② 执行（deny 时不执行）：registry 取执行器 Entry.Impl.(core.ToolExecutor)，
-//	   执行 ctx = core.WithEnv(ctx, 执行env)
+//	② 执行（deny 时不执行；Run ctx 已取消/超时时**也不执行**）：registry 取执行器
+//	   Entry.Impl.(core.ToolExecutor)，执行 ctx = core.WithEnv(ctx, 执行env)
 //	         ▼
 //	③ tool.call.completed（result=ToolResult）或 tool.call.failed（error 模型可读，M5/M8）
 //
 // 崩溃语义（X1）：**有 intent 无 result = 未知结果，不盲目重跑**。本层只保证写路径顺序
 // （intent durable 成功才执行），恢复/重放在阶段 8 按 X2 的 replay 语义处理。
+//
+// 审计与执行是**两条分开的纪律**（审批超时断链修复，events.go publish）：
+// **审计必须留痕**——Run ctx 已取消/超时（如 ask 审批一直等到 PromptRunTimeout 兜底才
+// fail-close deny 收场）后，intent / failed / loop.error 经短命 settle ctx
+// （WithoutCancel + 5s/次，失败即丢）照样落盘，事件流不留断点；**执行必须守约**——
+// settle ctx 绝不流进工具执行，**执行前显式查 ctx.Err()**：ctx 已死（取消/超时）就
+// **绝不执行**（落 failed，如实写"因 Run 上下文取消/超时未执行"），执行本身也严格尊重
+// 原 ctx（取消即中止、不编造结果）。
+//
+// 为什么护栏必须**显式**：settle ctx 让"ctx 已死 ⇒ intent 落盘失败 ⇒ 绝不执行"这条
+// **隐式**护栏失效（ctx 死了 intent 照样落得下）。护栏不能靠副作用兜底——只能自己查。
+// 同一条纪律覆盖多 agent 生命周期工具（spawn）：ctx 已死就不派生（建子节点、跑子 loop
+// 都是副作用），已派生出来的子节点必须**收口**（agent.failed + Tree.Fail），不许停在
+// running（树里留下常驻僵尸节点，事后没人说得清它怎么了）。
 //
 // # 阶段 8 durable 集成（core/durable）
 //
@@ -72,6 +86,10 @@
 //
 //   - 策略无命中 / 引擎为 nil / Approver 为 nil（= DenyAll）/ 审批出错 → 一律 deny，不执行；
 //   - 工具未注册 / 注册实现不是 core.ToolExecutor → 不执行，落 failed；
+//   - Run ctx 已取消/超时 → 执行前显式挡住（绝不执行），落 failed 记"因 Run 上下文
+//     取消/超时未执行"（审计要能分辨"没执行"与"执行失败"）；生命周期工具 spawn 同款
+//     （不派生子 agent，落 failed 记"因 Run 上下文取消/超时未发起"）；已派生的子节点
+//     必须收口（agent.failed + Tree.Fail），不许停在 running；
 //   - 执行器 panic 被隔离成一次普通失败（E5 同款失败隔离），不带崩 loop；
 //   - env 键未获准（policy deny）→ 不注入。
 //

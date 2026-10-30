@@ -94,7 +94,19 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 		if !known {
 			code = CodeToolNotFound
 		}
-		return l.failToolCall(ctx, &intentID, tc.ID, denyMessage(tc.Name, dec, known), code, policySnapshot(dec), events)
+		// 语义诚实（审计要能分辨两种事实）：**人审明确拒绝**（人点了 deny）与
+		// **没人来得及答**（审批失败 / 无人应答 / ctx 取消或超时）是两种事实，文案必须
+		// 可区分（审计靠它分辨"被拒"与"没人答"）。
+		//
+		// 判据取**判定里记下的成因**（dec.Reason），**不取事后读到的 ctx.Err() 快照**——
+		// 两者是不同瞬间：人明确拒绝后 ctx 可能恰好到期（判据竞态），按快照加"超时"前缀
+		// 会把"被拒绝"误记成"没人来得及答"，审计归因就错了。
+		// 注意：此处无论哪种收场都**不执行**（deny 路径本来就不走执行）。
+		msg := denyMessage(tc.Name, dec, known)
+		if isNoAnswerDeny(dec.Reason) {
+			msg = denyTimeoutPrefix + msg
+		}
+		return l.failToolCall(ctx, &intentID, tc.ID, msg, code, policySnapshot(dec), events)
 	}
 
 	// allow 之后的装配检查：未知工具 / 无工具描述 / 执行器不是 ToolExecutor
@@ -114,6 +126,21 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeExecutorMissing, nil, events)
 	}
 	exec := rt.exec
+
+	// ②′ 执行前护栏（fail-close）：Run ctx 已取消/超时 → **绝不执行**。
+	//
+	// 为什么必须**显式**查（不能靠"intent 落盘失败"顺带挡住）：审计落盘现在走 settle ctx
+	// （WithoutCancel + 5s/次，见 events.go publish）——ctx 死了**照样落得下** intent。于是
+	// "ctx 已死 ⇒ intent 落盘失败 ⇒ 绝不执行"这条**隐式**护栏就没了（护栏回退 = 取消/
+	// 超时之后仍有副作用）。护栏不能靠副作用兜底，只能自己查：ctx 已死 = 这一轮已被
+	// 取消/超时，**不许再有副作用**（执行侧严格尊重原 ctx：取消即中止、不编造结果）。
+	//
+	// 失败事件如实写"因 Run 上下文取消/超时未执行"——审计要能分辨"没执行"与"执行失败"。
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		msg := fmt.Sprintf("因 Run 上下文取消/超时未执行：工具 %s 未被执行（%v）——Run 上下文已结束（取消/超时），fail-close：ctx 已死不再发起任何副作用",
+			tc.Name, ctxErr)
+		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeToolError, nil, events)
+	}
 
 	// ② 执行：执行 env 只经 ctx 传递（H12/H19：值永不进事件/日志）。
 	execScope, secrets := l.buildExecEnv(ctx, desc)
@@ -424,6 +451,49 @@ func denyMessage(name string, dec contracts.Decision, known bool) string {
 		extra = fmt.Sprintf("（另：工具 %q 未在注册表注册）", name)
 	}
 	return fmt.Sprintf("fail-close: 工具 %s 的策略判定为 %s，未执行：%s%s", name, dec.Verdict, reason, extra)
+}
+
+// denyTimeoutPrefix 是"**没人来得及答**"这一类 deny 的文案前缀（与"人审明确拒绝"区分）。
+//
+// 审计要能分辨两种事实：人点了 deny（**被拒绝**）与审批没等到人（**没人来得及答**）——
+// 处置与复盘口径不同，故文案必须可区分。前缀里的"非人审明确拒绝"是**标记位**
+// （测试按它在/不在断言归因对不对）。
+const denyTimeoutPrefix = "审批未放行（超时/无人应答/审批失败，非人审明确拒绝）→ fail-close 未放行、未执行："
+
+// isNoAnswerDeny 判定 deny 的成因是不是"**没人应答**"这一类（非人审明确拒绝）。
+//
+// 判据是**判定里记下的原因**（contracts.Decision.Reason）——成因标记与 core/policy、
+// host 协议审批、runtime 终端审批的 fail-close 文案同源：
+//
+//   - "审批失败"：审批人报错/超时（policy.Decide 的审批错误出口）；
+//   - "无人应答"：没有人应答（协议面/终端面审批人的无人应答出口）；
+//   - "上下文已结束" / "ctx 超时" / "ctx 取消" / ctx 错误原文：审批前、或读到答复后
+//     Run 上下文已取消/超时（policy 与各审批人的文案都把这几种写法混着用）。
+//
+// "人审未放行"（人明确拒答）**不算**：那是"被拒绝"，不是"没人答"。
+//
+// 为什么不用 ctx.Err() 快照当判据：人明确拒绝后 ctx 可能恰好到期（判据竞态）——
+// 快照是**另一个瞬间**的事实，按它归因会把"被拒绝"误记成"没人来得及答"。
+//
+// 已知边角：判据是**文案匹配**（成因目前只以自由文本存在），人写的备注若恰好含
+// "审批失败/无人应答"这类词会被误判——比"漏判"少见的误判方向，代价可接受。
+// 长期修法是让 policy.Decide 直接给出**结构化成因码**（别再靠文案匹配）。
+func isNoAnswerDeny(reason *string) bool {
+	if reason == nil {
+		return false
+	}
+	for _, marker := range []string{
+		"审批失败",             // 审批人报错/超时（policy.Decide 的审批错误出口）
+		"无人应答",             // 没有人应答（协议面/终端面审批人的无人应答出口）
+		"上下文已结束",           // 审批前、或读到答复后 Run 上下文已取消/超时
+		"ctx 超时", "ctx 取消", // 同上（审批人文案里的写法）
+		"deadline exceeded", "context canceled", // 同上（ctx 错误的原文）
+	} {
+		if strings.Contains(*reason, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // toolResultText 把 ToolResult 拍成回填给模型的文本（text 块拼接，结构化块原样带上）。

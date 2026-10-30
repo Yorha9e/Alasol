@@ -52,7 +52,8 @@ const (
 	CodeToolNotFound = "tool_not_found"
 	// CodeExecutorMissing 注册实现不是 core.ToolExecutor（装配错误）。
 	CodeExecutorMissing = "executor_missing"
-	// CodeToolError 执行器返回 error 或 panic（一次普通失败，不是进程崩溃）。
+	// CodeToolError 工具调用没成（执行器返回 error 或 panic，或因 Run ctx 取消/超时
+	// **未执行**）——都是一次普通失败，不是进程崩溃。
 	CodeToolError = "tool_error"
 	// CodeBadArguments 工具参数不满足契约（不是合法 JSON 对象）→ 普通失败，模型可改。
 	CodeBadArguments = "bad_arguments"

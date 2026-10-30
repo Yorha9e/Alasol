@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -75,11 +76,41 @@ func (l *Loop) newAgentEvent(agentID contracts.Ulid, kind string, causation *con
 	}, nil
 }
 
+// auditSettleTimeout 是审计事件 settle ctx 的**单次 publish 预算**（5s）。
+//
+// 口径（别读成别的）：这是**每一次 publish** 的预算，**不是**整轮收场的硬上界——
+// 一轮里可能有多次 publish（intent / failed / loop.error …），各自 5s、**可以叠加**；
+// 预算耗尽或库不可用时，那条审计**落不下即丢**（best-effort）：宁可丢一条，也不把这次
+// 调用的收场无限期拖住（宿主库卡死时尤其重要——不能无界挂起）。
+const auditSettleTimeout = 5 * time.Second
+
 // publish 经 bus 发布一批 durable 事件，返回成功落库条数（用于 Result.Events 计数）。
 //
 // bus.Publish 对 durable 事件是"整批入库成功才通知"，失败即返回 error——调用方据此
 // 判定事实是否已落地（X1：intent 没落地就不许执行）。
+//
+// # 两条纪律分开：审计必须留痕，执行必须守约
+//
+// Run ctx 已取消/超时（典型联调实测：policy.Decide 在 ask 上阻塞等审批，一直等到
+// PromptRunTimeout 兜底才 fail-close deny 收场）时，这批 durable 事件是那次工具调用
+// 仅存的审计痕迹——拿原 ctx 发布会被 store 以 "begin: context deadline exceeded"
+// 拒掉，事件流从此对这次调用**零留痕**（intent/failed/loop.error 整链断裂）。
+// 故此处派生短命 settle ctx（WithoutCancel + 5s）**专供事件发布**；它绝不会流进
+// 工具执行 / 审批等待 / 模型调用——执行侧仍严格拿原 ctx（取消即中止、不编造结果，
+// X1 语义不变）。
+//
+// 原 ctx 仍活时原样透传：发布仍受 Run 期限约束，既有行为零变化。
+//
+// settle ctx 只在**原 ctx 已死**时派生，且**只服务这一次 publish**（每次 publish 各拿一份
+// 5s 预算 → 可叠加；落不下即丢，best-effort）。它绝不跨调用外传，更绝不流进执行侧。
 func (l *Loop) publish(ctx context.Context, evs ...contracts.Event) (int, error) {
+	if ctx != nil && ctx.Err() != nil {
+		// 原 ctx 已死（取消/超时）：派生短命 settle ctx（WithoutCancel + 5s 预算）专供本次
+		// 发布——审计必须留痕（见上）。**只用于发布**：调用方拿到的仍是原 ctx 的语义。
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), auditSettleTimeout)
+		defer cancel()
+	}
 	if err := l.bus.Publish(ctx, evs...); err != nil {
 		return 0, err
 	}
@@ -110,6 +141,9 @@ func (l *Loop) emitFailed(
 
 // emitFailedBestEffort 是 emitFailed 的尽力而为版：用于 ctx 已取消、store 可能也不可用
 // 的场景（X1：有意图就要有结果——能记就记，记不下也不掩盖取消语义）。
+//
+// 注意：ctx 已死不等于记不下——publish 会为已死的 ctx 派生 settle ctx（见上），
+// 此处"尽力"的真正残余失败是 store 本身不可用（库已关等），此时返回 0 继续收场。
 func (l *Loop) emitFailedBestEffort(
 	ctx context.Context,
 	causation *contracts.Ulid,

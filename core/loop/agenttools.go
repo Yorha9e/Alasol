@@ -196,6 +196,19 @@ func (l *Loop) runSpawn(ctx context.Context, turn int, tc core.ToolCallReq, st *
 		return l.failAgentTool(ctx, &intentID, tc.ID, fmt.Sprintf("spawn request_id 不是合法 ULID（26 字符 Crockford base32）：%q（X5 幂等键）", sa.RequestID), CodeBadArguments, nil, events)
 	}
 
+	// ②′ 发起前护栏（fail-close，与普通工具同款）：Run ctx 已取消/超时 → **不派生子 agent**。
+	//
+	// 为什么必须**显式**查：审计落盘走 settle ctx（events.go publish）——ctx 死了 intent 照样
+	// 落得下，于是"ctx 已死 ⇒ intent 落盘失败 ⇒ 绝不执行"这条**隐式**护栏在 spawn 路径上
+	// 同样失效（修复前它顺带挡住了 spawn：intent 落盘失败 → 整轮中止，子根本没发起）。
+	// ctx 已死 = 这一轮已被取消/超时 → **不许再有副作用**：建子节点、跑子 loop 都是副作用。
+	// 失败事件如实写"因 Run 上下文取消/超时未发起"（审计要能分辨"没发起"与"发起失败"）。
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		msg := fmt.Sprintf("因 Run 上下文取消/超时未发起：spawn 未派生子 agent（%v）——Run 上下文已结束（取消/超时），fail-close：ctx 已死不再发起任何副作用",
+			ctxErr)
+		return l.failAgentTool(ctx, &intentID, tc.ID, msg, CodeToolError, nil, events)
+	}
+
 	// 三闸门（K17，运行时强制）：树内原子判定 + 建节点。X5：同 requestID 重复 Spawn 返回
 	// **同一个**已建的 child（不新建）。
 	child, spawnErr := l.agents.Tree.Spawn(l.agentID, sa.AgentType, sa.Role, reqID)
@@ -244,9 +257,21 @@ func (l *Loop) runSpawn(ctx context.Context, turn int, tc core.ToolCallReq, st *
 	}
 	events += childRes.Events
 
-	// ctx 取消优先：尽力补一条 failed，再向上传取消语义（不把"被取消"吞成 summary）。
+	// ctx 取消优先：子 loop 被 ctx 中止（childErr = ctx.Err()）→ 子节点**必须收口**，
+	// 不能停在 running（没人再会管它 → 树里留下一个常驻僵尸节点，事后无法复盘它怎么了）。
+	// 收口按 agent 生命周期的既有惯例（与"子 agent 异常收敛"同款）：agent.failed 事件
+	// + Tree.Fail；再补一条 tool.call.failed 留痕，最后向上传取消语义（不把"被取消"吞成
+	// summary——被取消不是产出）。
+	//
+	// 只在子节点**仍在 running** 时收口：子已自行 complete（终态）时不可逆地改判
+	// （Complete/Fail 互斥），那种情况它本来就已收口，无需也不该再记 agent.failed。
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		events += l.emitFailedBestEffort(ctx, &intentID, tc.ID, "spawn 被取消: "+ctxErr.Error(), CodeToolError, nil)
+		reason := "spawn 被取消: " + ctxErr.Error()
+		if node, ok := l.agents.Tree.Get(child.ID); ok && node.Status == agents.StatusRunning {
+			events += l.emitAgentFailed(ctx, &intentID, child.ID, reason, CodeAgentFailed)
+			_ = l.agents.Tree.Fail(child.ID, errors.New(reason))
+		}
+		events += l.emitFailedBestEffort(ctx, &intentID, tc.ID, reason, CodeToolError, nil)
 		return "", events, nil, ctxErr
 	}
 

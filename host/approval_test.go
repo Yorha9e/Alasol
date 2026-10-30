@@ -3,6 +3,7 @@ package host_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -104,6 +105,48 @@ func waitEventKind(t *testing.T, c *transport.Client, want string, timeout time.
 		}
 	}
 	return false
+}
+
+// collectEventKinds 收 WS 消息直到超时，返回这段窗口里**本 session**见到的事件 kind 集合
+// （非事件消息 / 解不开的载荷 / 别的 session 的事件跳过）。
+//
+// 与 waitEventKind 的分工：waitEventKind 为"等到某一条"而消费流，会把同时段的其他
+// 事件丢掉；需要**同时断言多条事件在不在**（如审批超时后的 intent+failed 留痕 +
+// completed 缺席）时用本函数，一次收集全窗口。
+//
+// 两个卫生口径（别省）：
+//   - **按 session_id 过滤**：WS 订阅收的是**全局**事实流，别的 session 的事件也会进来；
+//     不过滤就会把"别处发生的 tool.call.completed"当成"这次执行了"（假阳性）。
+//   - **recv 错误要区分**：只有"本次 500ms 窗口没等到消息"（ctx 超时）可以继续收；
+//     **连接错误必须 fail**——把它当"没消息"吞掉，测试会在断连后继续空等窗口，
+//     最后报出一句与真实原因无关的失败。
+func collectEventKinds(t *testing.T, c *transport.Client, sessionID contracts.Ulid, timeout time.Duration) map[string]bool {
+	t.Helper()
+	kinds := map[string]bool{}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		recvCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		m, err := c.RecvContext(recvCtx)
+		cancel()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				continue // 本次窗口没等到消息：继续收
+			}
+			t.Fatalf("recv: %v（连接错误：不是窗口到期，必须立刻失败而不是继续空等）", err)
+		}
+		if m.Kind != transport.KindEvent {
+			continue
+		}
+		var ev contracts.Event
+		if err := json.Unmarshal(m.Payload, &ev); err != nil {
+			continue
+		}
+		if ev.SessionID != sessionID {
+			continue // 别的 session 的事件不算（WS 订阅收的是全局事实流）
+		}
+		kinds[ev.Kind] = true
+	}
+	return kinds
 }
 
 // waitWSKind 收 WS 消息直到一条指定 kind 的（非事件消息会被跳过），返回它。
@@ -478,10 +521,16 @@ func TestProtocolApprovalEndToEndFailClose(t *testing.T) {
 	}
 
 	req := recvApprovalRequest(t, c)
-	// **不应答**：等过短超时（1s）+ 余量，断言 tool.call.completed **绝不出现**
-	// （fail-close：无人应答 = deny，工具不执行；超时的 ctx 会让随后的 intent 落盘也失败，
-	// 于是整轮中止——无论哪种都不得出现 completed）。
-	if waitEventKind(t, c, "tool.call.completed", 4*time.Second) {
+	// **不应答**：收一段事件窗口（短超时 1s + 余量），一次断言两件事：
+	//   - intent + failed **都在**（审批等到 Run ctx 超时后，审计事件经 settle ctx
+	//     照样落盘——修复前这条链是断的：超时的 ctx 让 intent 落盘失败，
+	//     整轮以写路径断裂收场，事件流对这次调用零留痕）；
+	//   - completed **绝不出现**（fail-close：无人应答 = deny，工具不执行）。
+	kinds := collectEventKinds(t, c, sid, 5*time.Second)
+	if !kinds["tool.call.intent"] || !kinds["tool.call.failed"] {
+		t.Fatalf("fail-close 后事件流应留下 intent + failed（审计留痕），得到 %v", kinds)
+	}
+	if kinds["tool.call.completed"] {
 		t.Fatal("fail-close 破了：无人应答却执行了工具（tool.call.completed 出现）")
 	}
 
