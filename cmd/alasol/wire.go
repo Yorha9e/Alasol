@@ -12,6 +12,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
@@ -19,6 +20,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/mcp"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
+	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/tools"
 )
@@ -64,6 +66,13 @@ type runnerOpts struct {
 	// 硬塞进命令行既难写又容易把凭据泄进 shell 历史与 ps 输出（H12/H19）。
 	// 零值 = 不装 MCP（不连外部进程、不注册工具，与 v2 行为一致）。
 	MCP mcp.Config
+
+	// BlobDir 是大 payload 外置 blob 的仓库目录（v4-3-A，G2e/D4；**空 = 关** = 零行为变化）。
+	// 只走文件配置面（TOML `[blob]`）——不给 flag（与 multi_agent 同款：一个目录路径 +
+	// 一个阈值，结构化数据 + 默认关）。
+	BlobDir string
+	// BlobMaxInline 是 result 内联阈值（字节；<=0 = 不外置，即使配了 BlobDir）。
+	BlobMaxInline int64
 
 	// provider 覆盖（测试注入脚本 provider；nil = openai）
 	provider core.Provider
@@ -157,6 +166,28 @@ func newRunner(opts runnerOpts) (*runner, error) {
 	}
 
 	b := bus.New(st)
+
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：**dir 非空才建**（默认关 = 零行为变化，
+	// completed 载荷逐字节等价）。与 host.New 同口径：目录建不出来 = "显式要的能力没起来"
+	// → 装配失败（exit 1），不静默不外置。
+	//
+	// 阈值（BlobMaxInline）<= 0 = 不外置（存储仍建——读侧/诊断需要它）。
+	var blobStore storage.Blob
+	if dir := strings.TrimSpace(opts.BlobDir); dir != "" {
+		bs, berr := blobfs.New(dir)
+		if berr != nil {
+			st.Close()
+			if sbEnv != nil {
+				_ = sbEnv.Close()
+			}
+			if mcpMgr != nil {
+				_ = mcpMgr.Close()
+			}
+			return nil, fmt.Errorf("建 blob 外置存储 %q: %w", dir, berr)
+		}
+		blobStore = bs
+	}
+
 	cfg := loop.Config{
 		Provider:        prov,
 		Bus:             b,
@@ -172,6 +203,10 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		Store:           st, // 阶段 8：同一 store 供 checkpoint / resume
 		CheckpointEvery: opts.CheckpointEvery,
 		ReasoningEffort: opts.ReasoningEffort, // 思维链档位（G14；空 = 不传）
+		// D4：大 payload 外置（v4-3-A，G2e）——loop 侧只管**写**（外置）；读侧经
+		// host 的 GET /api/blobs/{id}（CLI 这条路径没有 HTTP 面，全文仍在 blob 里）。
+		BlobSink:      blobStore,
+		BlobMaxInline: opts.BlobMaxInline,
 	}
 	lp, err := loop.New(cfg)
 	if err != nil {

@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agentlink"
 	"github.com/Yorha9e/alasol/core/discovery"
+	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/runtime/worktree"
 	"github.com/Yorha9e/alasol/ui/web"
 )
@@ -46,6 +48,12 @@ var httpLog = slog.Default()
 //	GET /api/graph/impact?roots=a,b&kind=…&depth=…&limit=…&core=…&diff_files=…&diff_added=…&diff_deleted=…
 //	  → ImpactReport（change_impact 影响面：一跳/传递下游 + 触及的核心接口 + diff 规模
 //	     + Scale + suggest_escalate；G21/W16）。未启用 → 503 graph_disabled
+//
+// 大 payload 外置 blob 读面（v4-3-A，G2e/D4；默认关 = BlobDir 空）：
+//
+//	GET /api/blobs/{id}                  → 二进制全文（流式；Content-Type/Content-Length 取自 blob meta）。
+//	  tool.call.completed 的 result 超阈值被外置后，事件里只留 binary_ref 指向的 id + 摘要 text；
+//	  消费方（UI / 审计 / 回放）拿这个 id 经本端点取回**完整** result JSON。未启用 / id 不存在 → 404。
 //
 // 多 worktree 隔离（v1-S5 D：并行任务各占一个工作区）：
 //
@@ -150,6 +158,10 @@ func (h *Hub) Handler() http.Handler {
 	// 图投影重建（v3-S3，N2 运维入口）：崩溃遗留的重建窗口（rebuilding=1）会让影响面/
 	// 冲突预测一直不可用；启动期会自动恢复一次，这个端点供人工重试。
 	reg("POST", "/api/graph/rebuild", h.serveGraphRebuild)
+
+	// 大 payload 外置 blob 读面（v4-3-A，G2e/D4）：按 Event.binary_ref 的 id 取回全文。
+	// 未启用（Config.BlobDir 空）或 id 不存在 → 404；流式回内容（大对象不整个进内存）。
+	reg("GET", "/api/blobs/{id}", h.serveBlob)
 
 	// 合并门禁（v3-S3 清 V6/V7 挂账）：review 记录 + 合并前查放行 + 合并后冲突预测。
 	reg("POST", "/api/merge/review", h.serveMergeReview)
@@ -403,11 +415,83 @@ func (h *Hub) serveContext(w http.ResponseWriter, r *http.Request) {
 
 // parseSessionID 校验路径里的 session id（S1/S9：不合则拒绝，不修复）。
 func parseSessionID(raw string) (contracts.Ulid, error) {
+	return parseULID(raw, "session_id")
+}
+
+// parseULID 校验一个 ULID 形态的 id，**文案点名它是哪一路 id**（F11）。
+//
+// 为什么要点名：同一个校验器被多个端点复用时，若文案写死成"session_id"，别的端点（如
+// GET /api/blobs/{id}）就会**串味**——调用方传的是 blob id，报错却说 session_id 不合法，
+// 会把人引到错误的参数上（"是不是 session_id 写错了？"）。故 what 由调用方给（本端点的
+// 参数名/语义名），文案如实写它。
+//
+// 不合则拒绝，不修复（S1/S9：不猜、不截断、不补全）。
+func parseULID(raw, what string) (contracts.Ulid, error) {
 	id := contracts.Ulid(strings.TrimSpace(raw))
 	if !core.ValidUlid(id) {
-		return "", fmt.Errorf("session_id 不是合法 ULID（26 字符 Crockford base32）: %q", raw)
+		return "", fmt.Errorf("%s 不是合法 ULID（26 字符 Crockford base32）: %q", what, raw)
 	}
 	return id, nil
+}
+
+// serveBlob 服务 GET /api/blobs/{id}（v4-3-A，G2e/D4 读面）：按 Event.binary_ref 的 id
+// 取回被外置的**完整**内容，流式回给调用方（大对象不整个进内存，F12）。
+//
+//	200 → 二进制全文（Content-Type / Content-Length 取自 blob 的 meta）
+//	400 → id 不是合法 ULID（文案**点名 blob id**，不报 session_id——F11）
+//	404 → blob 未启用（Config.BlobDir 空）或 id 不存在 / 已回收（Delete 过）
+//	500 → 读取出错（含存储损坏：meta 在但内容缺失/半截——blobfs 给明确错误）
+//
+// 托管口径同其他端点：这是**读面**，只读不写；写（外置）在 loop 侧（X1 completed 路径）。
+func (h *Hub) serveBlob(w http.ResponseWriter, r *http.Request) {
+	// blob id 用**自己的**校验文案（F11）：400 要点名 blob id，不许报"session_id 不合法"。
+	id, err := parseULID(r.PathValue("id"), "blob id")
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_blob_id", err.Error())
+		return
+	}
+	if h.blob == nil {
+		// 未启用：没有任何外置内容可取（与"关 = 零行为变化"一致）。
+		writeJSONError(w, http.StatusNotFound, "blob_disabled",
+			"大 payload 外置未启用（Config.BlobDir 空；没有 binary_ref 内容可取）")
+		return
+	}
+	meta, err := h.blob.Stat(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "blob_not_found",
+				fmt.Sprintf("blob %s 不存在或已回收（Delete 只删内容，事件里的引用原样留着）", id))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "blob_stat_failed", err.Error())
+		return
+	}
+	rc, err := h.blob.Get(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "blob_not_found",
+				fmt.Sprintf("blob %s 不存在或已回收", id))
+			return
+		}
+		// 存储损坏（meta 在内容不在 / 半截）等 → 500，明确报错（不静默回空/半截内容）。
+		writeJSONError(w, http.StatusInternalServerError, "blob_read_failed", err.Error())
+		return
+	}
+	defer rc.Close()
+	ct := meta.MediaType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	if meta.Size >= 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(meta.Size, 10))
+	}
+	w.WriteHeader(http.StatusOK)
+	// 流式拷贝（io.Copy 用 32KB 缓冲，不把大对象整个读进内存）。
+	if _, err := io.Copy(w, rc); err != nil {
+		// 响应头已发，无法再改状态码；只留痕（客户端中途断开是常态，不算服务端故障）。
+		httpLog.Warn("host: 流式回 blob 中断", "id", string(id), "err", err.Error())
+	}
 }
 
 // servePeers 服务 GET /api/peers?session_id=<ulid>（K11 水平可见性）。

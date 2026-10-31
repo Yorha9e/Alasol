@@ -164,13 +164,31 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	}
 
 	// ③a completed：结果 durable 落盘（X1）。
-	doneEv, err := l.newEvent(KindToolCallCompleted, &intentID, contracts.ToolCallCompletedPayload{
+	//
+	// D4（v4-3-A，G2e）：result 超阈值时整体外置 blob——payload 换摘要形态、envelope.BinaryRef
+	// 指过去。**只改 completed 的 result 载荷内容 + BinaryRef**，intent→completed 三段结构与
+	// 落盘序一字不动（intent 已在上方落盘，这里照旧 publish 一条 completed）。关（未挂 blob /
+	// 阈值 0）= externalizeResult 直接返回 nil、payload 一字不动 → 与现状逐字节等价（酸测试）。
+	// 外置失败 = fail-open（原样内联完整 result），不破坏"有 intent 就要有 completed"（X1）。
+	//
+	// **崩溃窗口（如实记口径，消不掉）**：fail-open 只覆盖 Put **返错**这一种失败。blob 写成功、
+	// completed 落盘前进程崩掉 → 磁盘上多一份没人引用的 blob（孤儿内容）；本实现"先写 blob
+	// 成功、再落引用"的顺序保证**引用与内容最终一致**（引用不会指向空处），崩溃续跑按事件里的
+	// `binary_ref` 调 blob.Get 补取全文。孤儿 blob 的回收策略未做（磁盘单调增长 + 崩溃残留
+	// 临时文件/孤儿目录），挂账见 11 施工计划。
+	//
+	// 注意：回填给模型的始终是**完整** res（末尾 toolResultText(res)）——外置只瘦身事件流，
+	// 不让模型看不到完整工具输出。
+	payload := contracts.ToolCallCompletedPayload{
 		ToolCallID: tc.ID, // 与 intent 同一个黑盒 id（S4：原样往返）
 		Result:     res,
-	})
+	}
+	binaryRef := l.externalizeResult(ctx, &payload)
+	doneEv, err := l.newEvent(KindToolCallCompleted, &intentID, payload)
 	if err != nil {
 		return "", events, err
 	}
+	doneEv.BinaryRef = binaryRef // nil = 不外置（默认/酸测试路径）
 	n, err = l.publish(ctx, doneEv)
 	events += n
 	if err != nil {

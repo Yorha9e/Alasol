@@ -60,6 +60,16 @@ func runMain(args []string) int {
 	if fc == nil {
 		fc = &host.FileConfig{}
 	}
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：阈值负值 → **启动即拒**（fail-close）。
+	//
+	// 口径与 serve 装配面**同款**（共享函数 host.ValidateBlobMaxInline = 唯一事实源）：
+	// 负阈值没有合理语义，静默当成 0 = 悄悄把外置关掉（用户以为大输出外置了、实际全量
+	// 内联，现场无任何线索）。run / resume 两条不经 host.Config 的装配面**也走这道闸**——
+	// 否则同一个坏配置在 serve 上拒启动、在 run/resume 上静默失效（口径漂移）。
+	if err := host.ValidateBlobMaxInline(fc.Blob.MaxInline); err != nil {
+		fmt.Fprintln(os.Stderr, "blob 阈值不合法（TOML [blob].max_inline / host.Config.BlobMaxInline）:", err)
+		return 2
+	}
 	// model：flag > env > 文件。
 	modelName, _ := host.Precedence(*model, os.Getenv("ALASOL_MODEL"), fc.Model)
 	if strings.TrimSpace(modelName) == "" {
@@ -108,6 +118,11 @@ func runMain(args []string) int {
 		// MCP client（v3-S1，N1）：只走文件配置面（[[mcp.servers]]）。
 		// 默认关：一条都没有 = 不装 MCP（零外部进程、零工具）。
 		MCP: fc.MCP.MCPConfig(),
+
+		// 大 payload 外置 blob（v4-3-A，G2e/D4）：只走文件配置面（TOML `[blob]`）。
+		// dir 空 = 关 = 零行为变化（completed 载荷逐字节等价）；阈值 0 = 不外置。
+		BlobDir:       strings.TrimSpace(fc.Blob.Dir),
+		BlobMaxInline: fc.Blob.MaxInline,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

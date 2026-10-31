@@ -242,6 +242,11 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	//
 	//    **ContextStrategy 故意留空**：挂上的上下文策略会注入 ledger/rules 两张注入区
 	//    （v2-S1 tiered），那正是"fork 不带 ledger/gate"要防的事——旁支只带**对话历史**。
+	//
+	//    D4 大 payload 外置（v4-3-A，G2e）：旁支的 loop **同样挂 blob**（与主 session 同口径，
+	//    见 loopFor）——旁支的工具大输出同样不该进事件流。不挂 = "大输出不进事件流"这条规则
+	//    只在主 session 上成立（fork session 的事件流里留着几十 MB 的 result，与文档口径不符）。
+	//    关（未启用 blob / 阈值<=0）= 零行为变化（completed 载荷逐字节等价）。
 	fl, err := loop.New(loop.Config{
 		Provider:        h.provider,
 		Bus:             h.bus,
@@ -255,6 +260,8 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 		MaxTurns:        h.cfg.MaxTurns,
 		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位与主 session 同源（G14）
 		ContextBudget:   h.contextBudgetFor(h.cfg.ContextStrategy),
+		BlobSink:        h.blob,
+		BlobMaxInline:   h.cfg.BlobMaxInline,
 	})
 	if err != nil {
 		btw := BtwResult{

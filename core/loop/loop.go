@@ -15,6 +15,7 @@ import (
 	"github.com/Yorha9e/alasol/core/durable"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/storage"
 )
 
 // DefaultMaxTurns 是 Config.MaxTurns 缺省值（0 = 用它）：模型失控时强制收口，
@@ -149,6 +150,20 @@ type Config struct {
 	// （模型可见集 + X1 三段写路径），turn 末 Flush（X6：关键字段立即落盘、过程字段合并）。
 	// 注入后仍受策略链裁决（deny-all 默认）与 agent 类型白名单（R5）约束——框架工具非免检。
 	GoalLedger bool
+	// BlobSink 是大对象外置仓库（D4/G2e，v4-3-A；storage.Blob）。**nil = 不外置**（默认，
+	// 零行为变化酸测试）。非 nil 且 BlobMaxInline>0 时，tool.call.completed 的 result 超过
+	// BlobMaxInline 字节就整体外置进 blob，payload 换摘要形态、envelope.BinaryRef 指过去
+	// （X1 三段结构与落盘序一字不动，只改 completed 的 result 内容 + BinaryRef；见 blob.go）。
+	// 只用于**写**（外置）；读侧（取全文）由宿主经 GET /api/blobs/{id} 提供，loop 不读 blob
+	// （回填给模型的始终是完整 result，不外置那条也照常完整）。
+	BlobSink storage.Blob
+	// BlobMaxInline 是 result 内联阈值（字节；<=0 = 不外置，即使挂了 BlobSink）。result
+	// 序列化后**超过**它才外置。0/未配 = 不外置 = completed 载荷与现状逐字节等价（酸测试）。
+	//
+	// F4：实际判定用的是**有效阈值** = max(本值, 摘要预算)（见 blob.go 的
+	// blobEffectiveThreshold）——保证"外置 = 瘦身"是结构性事实（摘要不会比原文还大）。
+	// 本值配得比摘要预算还小时，(本值, 摘要预算] 区间的 result 不再外置（如实写明的代价）。
+	BlobMaxInline int64
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -195,6 +210,10 @@ type Loop struct {
 	ctxStrategy compaction.AssemblerFactory
 	// goalLedger 支撑 J19 goal ledger 生产者（opt-in；nil store = 即使开了也不注入）。
 	goalLedger bool
+	// blob / blobMaxInline 支撑 D4 大 payload 外置（G2e，v4-3-A；nil blob 或阈值<=0 = 关 =
+	// 零行为变化）。见 Config.BlobSink / Config.BlobMaxInline 与 blob.go 的挂接口径。
+	blob          storage.Blob
+	blobMaxInline int64
 }
 
 // Result 是一次 Run 的产出。
@@ -298,6 +317,8 @@ func New(cfg Config) (*Loop, error) {
 		onlineSource:    cfg.OnlineTableSource,
 		ctxStrategy:     cfg.ContextStrategy,
 		goalLedger:      cfg.GoalLedger,
+		blob:            cfg.BlobSink,
+		blobMaxInline:   cfg.BlobMaxInline,
 	}, nil
 }
 

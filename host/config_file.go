@@ -84,6 +84,34 @@ type FileConfig struct {
 	// 零行为变化）。装载期 fail-close（仅 MultiAgent 开时）：id 空/重名/**保留名(root)**、
 	// can_spawn 悬空/自环/成环、permission 级别非法、context_strategy.kind 越枚举 → 启动即拒并点名。
 	AgentTypes []AgentTypeFileConfig `toml:"agent_types"`
+	// Blob 大 payload 外置 blob（v4-3-A，G2e/D4）：[blob] 段。默认关（dir 空）= 不外置，
+	// completed 载荷与现状逐字节等价（酸测试）。配了 dir 且 max_inline>0 才启用外置。
+	Blob BlobFileConfig `toml:"blob"`
+}
+
+// BlobFileConfig 是大 payload 外置 blob 的文件级配置（v4-3-A，G2e/D4）。
+//
+// 形如：
+//
+//	[blob]
+//	dir = "C:\\Users\\me\\alasol\\blobs"   # 外置仓库根目录（空 = 关 = 零行为变化）
+//	max_inline = 65536                      # 阈值字节（0 = 不外置，即使配了 dir）
+//
+// 口径（与 host.Config.BlobDir / BlobMaxInline 一致）：
+//   - **dir 空 = 关**：不建存储、loop 不外置、/api/blobs/{id} 恒 404——与现状完全等价（酸测试）；
+//   - **max_inline 0 = 不外置**（即使配了 dir）：目录非空时仍建存储供读侧，但没有 result 会外置；
+//   - 只有"dir 非空 + max_inline>0"才真正启用：超阈值的 tool.call.completed result 整体进 blob，
+//     事件里留 binary_ref 引用 + 摘要 text（X1 三段结构不动，零契约改动——ToolResult 形状不变）；
+//   - **max_inline 负值 = 非法配置**（启动即拒，报错文案与 serve 装配面同款——唯一事实源 =
+//     host.ValidateBlobMaxInline；run / resume 装配面同样拒，不静默当成 0）。
+type BlobFileConfig struct {
+	// Dir blob 外置仓库根目录（runtime/store/blobfs 落地处；空 = 关）。
+	Dir string `toml:"dir"`
+	// MaxInline result 内联阈值（字节；超过才外置；0 = 不外置；负值非法 = 启动即拒）。
+	//
+	// F4：实际判定用的是**有效阈值** = max(本值, 摘要预算)（见 core/loop/blob.go）——
+	// 保证"外置 = 瘦身"是结构性事实（摘要不会比原文还大）。
+	MaxInline int64 `toml:"max_inline"`
 }
 
 // AgentTypeFileConfig 是一个**用户自定义** agent 类型的文件级声明（[[agent_types]] 的元素，

@@ -426,15 +426,24 @@ func (l *Loop) runComplete(ctx context.Context, turn int, tc core.ToolCallReq, s
 
 // finishSpawn 落 spawn 的 tool.call.completed（result = summary，含 taint 标注 / refs 核验），
 // 并把结果文本回填父（stop=nil：父在 spawn 后继续，不收敛）。
+//
+// D4（v4-3-A，G2e）：spawn 的 completed 与其它 completed **同口径**外置——
+// 这是 core/loop 里第三条写 tool.call.completed 的路径（另两条：runToolCall 的工具结果、
+// Replay 的重放结果）；只接其中一条 = "大 payload 不进事件流"在别的路径上失效。
+// 口径一字不变：只改 result 载荷内容 + envelope.BinaryRef，三段结构与落盘序不动；
+// 回填给父模型的仍是**完整** result（末尾 toolResultText(result)）。
 func (l *Loop) finishSpawn(ctx context.Context, intentID *contracts.Ulid, tcID contracts.ProviderId, summary contracts.AgentSummary, base int) (string, int, *contracts.AgentSummary, error) {
 	result := l.summaryToResult(ctx, summary)
-	doneEv, err := l.newEvent(KindToolCallCompleted, intentID, contracts.ToolCallCompletedPayload{
+	payload := contracts.ToolCallCompletedPayload{
 		ToolCallID: tcID,
 		Result:     result,
-	})
+	}
+	binaryRef := l.externalizeResult(ctx, &payload)
+	doneEv, err := l.newEvent(KindToolCallCompleted, intentID, payload)
 	if err != nil {
 		return "", base, nil, err
 	}
+	doneEv.BinaryRef = binaryRef // nil = 不外置（默认/酸测试路径）
 	n, err := l.publish(ctx, doneEv)
 	if err != nil {
 		return "", base + n, nil, fmt.Errorf("loop: spawn 的 completed 事件落盘失败: %w", err)
@@ -519,6 +528,17 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// 子 loop 不带它 → 子 agent 的每轮请求都不带 reasoning_effort → 端点用默认档。
 		// 那就是"父 agent 开了 high、子 agent 静默退回默认档"的能力漂移（用户看不出来）。
 		ReasoningEffort: l.reasoningEffort,
+		// D4（G2e，v4-3-A）：大 payload 外置的**仓库与阈值透传给子 agent**。
+		//
+		// 为什么必须透传：外置是**跨 agent 的一致口径**——父 agent 的工具大输出外置进 blob、
+		// 子 agent 的工具大输出不外置（留在事件流里），那"大输出不进事件流"这条规则就只在
+		// 主 agent 上成立（多 agent 模式下 D4 落空、与文档口径不符）。透传后：子 agent 的
+		// 大 result 同样外置（completed 的 BinaryRef 非空）。
+		//
+		// 关 = 零行为变化：父没挂 blob（l.blob == nil）或阈值 <=0 时，子拿到的也是 nil/<=0
+		// → 子 loop 的 externalizeResult 直接返回 nil（酸测试逐字节等价）。
+		BlobSink:      l.blob,
+		BlobMaxInline: l.blobMaxInline,
 	}
 	return New(cfg)
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/core/workflow"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
@@ -32,6 +33,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/indexer"
 	"github.com/Yorha9e/alasol/runtime/mcp"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
+	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/tools"
 	"github.com/Yorha9e/alasol/runtime/transport"
@@ -82,6 +84,11 @@ type Hub struct {
 	// graphEngine 是 v2-S2 图投影的读引擎（G2f：**可选投影**；nil = 未启用）。
 	// 未启用时宿主不建它、不驻留内存，索引器也不建图表（零图开销，酸测试）。
 	graphEngine *graph.Engine
+	// blob 是 v4-3-A 大 payload 外置仓库（G2e/D4；storage.Blob；nil = 未启用 = 零行为变化）。
+	// 开了才建（Config.BlobDir 非空）——所有 session 共享一个 blobfs.Store；loop 经它把超阈值的
+	// tool.call.completed result 外置（写），读侧经 GET /api/blobs/{id} 取全文。它不是第二状态源：
+	// 事件流才是"有没有这条 binary_ref 引用"的唯一事实（core/storage/blob.go）。
+	blob storage.Blob
 	// sandbox 是 v2-S4 沙箱执行环境（K8：可插拔 ExecutionEnv；nil = 未启用，
 	// 走 local）。启用时 Close 会撤掉 WER 排除项并收口残留 job 句柄。
 	sandbox *sandbox.Env
@@ -439,6 +446,21 @@ func New(cfg Config) (*Hub, error) {
 		agentTypes, agentTypeIDs = reg, ids
 	}
 
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：**默认不启用**（Config.BlobDir 空 = 不建存储、
+	// loop 不外置、/api/blobs 恒 404 = 零行为变化，酸测试）。配了目录才建一个所有 session
+	// 共享的 blobfs.Store；阈值 BlobMaxInline>0 时 loop 才会把超阈值的 completed result 外置
+	// （X1 三段结构不动，只改 completed 的 result 内容 + binary_ref）。blob 不是第二状态源
+	// （事件流才是引用的事实源）——建失败只是"显式要的能力没起来"，拒绝启动比静默不外置好排查。
+	var blobStore storage.Blob
+	if dir := strings.TrimSpace(cfg.BlobDir); dir != "" {
+		bs, berr := blobfs.New(dir)
+		if berr != nil {
+			return nil, fmt.Errorf("host: 建 blob 外置存储 %q: %w", dir, berr)
+		}
+		blobStore = bs
+		hubLog.Info("host: 已启用大 payload 外置 blob", "dir", dir, "max_inline_bytes", cfg.BlobMaxInline)
+	}
+
 	h := &Hub{
 		cfg:               cfg,
 		store:             st,
@@ -470,6 +492,7 @@ func New(cfg Config) (*Hub, error) {
 		agentTrees:        make(map[contracts.Ulid]*agents.Tree),
 		lifeCtx:           lifeCtx,
 		lifeCancel:        lifeCancel,
+		blob:              blobStore,
 	}
 
 	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持
@@ -816,6 +839,10 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		GoalLedger: h.cfg.GoalLedger,
 		// 多 agent 环境（v3-S6-B；nil = 单 agent 模式默认）。见上面的 agentsEnv 装配。
 		Agents: agentsEnv,
+		// 大 payload 外置 blob（v4-3-A，G2e/D4；nil sink / 阈值<=0 = 关 = 零行为变化）。
+		// h.blob 开了才非 nil（Config.BlobDir 非空）；阈值 cfg.BlobMaxInline>0 才真正外置。
+		BlobSink:      h.blob,
+		BlobMaxInline: h.cfg.BlobMaxInline,
 	})
 	if err != nil {
 		h.mu.Unlock()

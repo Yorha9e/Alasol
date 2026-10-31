@@ -161,6 +161,12 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		MultiAgent: fc.MultiAgent,
 		AgentTypes: fc.AgentTypeConfigs(),
 
+		// 大 payload 外置 blob（v4-3-A，G2e/D4）：**只走文件配置面**（TOML `[blob]`，
+		// 不给 flag——与 multi_agent 同款：一个目录路径 + 一个阈值，结构化数据 + 默认关）。
+		// dir 空 = 关 = 零行为变化（completed 载荷逐字节等价）；阈值 0 = 不外置。
+		BlobDir:       strings.TrimSpace(fc.Blob.Dir),
+		BlobMaxInline: fc.Blob.MaxInline,
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),

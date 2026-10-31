@@ -15,9 +15,11 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
+	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/verify"
 )
@@ -97,6 +99,16 @@ func resumeMain(args []string) int {
 	}
 	if fc == nil {
 		fc = &host.FileConfig{}
+	}
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：阈值负值 → **启动即拒**（fail-close）。
+	//
+	// 口径与 serve / run 装配面**同款**（共享函数 host.ValidateBlobMaxInline = 唯一事实源）：
+	// 负阈值没有合理语义，静默当成 0 = 悄悄把外置关掉（重放落下的 completed 照样全量内联，
+	// 现场无任何线索）。校验放在**任何重放 / 模型调用之前**——重放会真的执行工具，
+	// 阈值配错了就该先拒，不该先把工具跑一遍。
+	if err := host.ValidateBlobMaxInline(fc.Blob.MaxInline); err != nil {
+		fmt.Fprintln(os.Stderr, "blob 阈值不合法（TOML [blob].max_inline / host.Config.BlobMaxInline）:", err)
+		return 2
 	}
 
 	// ReasoningEffort（G14）：续跑（-continue）那一轮同样透传档位——与 run/serve 同一条
@@ -185,6 +197,19 @@ func resumeMain(args []string) int {
 	}
 	agentID := durable.PrimaryAgentID(events)
 
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：只走文件配置面（TOML `[blob]`，与 run 同口径）。
+	// dir 空 = 关 = 零行为变化；非空则建 blobfs——**重放路径落下的 completed 同样外置**
+	// （loop 侧口径，见 core/loop/replay.go）。
+	var blobStore storage.Blob
+	if dir := strings.TrimSpace(fc.Blob.Dir); dir != "" {
+		bs, berr := blobfs.New(dir)
+		if berr != nil {
+			fmt.Fprintln(os.Stderr, "建 blob 外置存储:", berr)
+			return 1
+		}
+		blobStore = bs
+	}
+
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	//
 	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
@@ -198,6 +223,10 @@ func resumeMain(args []string) int {
 		Model:           modelName,
 		ReasoningEffort: reasoningEffortVal,
 		Store:           st,
+		// D4：大 payload 外置（v4-3-A，G2e）——重放落下的 completed 与续跑那一轮的
+		// completed 同口径外置（否则"大 payload 不进事件流"在 resume 路径上失效）。
+		BlobSink:      blobStore,
+		BlobMaxInline: fc.Blob.MaxInline,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "构造 resume loop:", err)

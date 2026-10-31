@@ -70,13 +70,24 @@ func (l *Loop) Replay(ctx context.Context, op durable.Op) (durable.ReplayResult,
 	}
 
 	// 成功 → 落 completed（result  durable 落盘，X1 收口）。
-	doneEv, err := l.newReplayEvent(op, KindToolCallCompleted, causation, contracts.ToolCallCompletedPayload{
+	//
+	// D4（v4-3-A，G2e）：重放产出的 completed **同样走外置**（与原执行同口径，见
+	// toolcall.go 的 runToolCall）——重放落的是同一形状的事件（intent → completed），
+	// 不外置就会让"大 payload 不进事件流"这条规则在 **resume 重放路径**上失效：
+	// 一次重放就能把几十 MB 的 result 塞回事件流（事件流要被回放/转发/索引，F12）。
+	//
+	// 口径与原执行**逐字一致**：只改 completed 的 result 载荷内容 + envelope.BinaryRef；
+	// 三段结构与落盘序一字不动；外置失败 fail-open（原样内联，completed 仍落）。
+	payload := contracts.ToolCallCompletedPayload{
 		ToolCallID: intent.ToolCallID,
 		Result:     res,
-	})
+	}
+	binaryRef := l.externalizeResult(ctx, &payload)
+	doneEv, err := l.newReplayEvent(op, KindToolCallCompleted, causation, payload)
 	if err != nil {
 		return durable.ReplayResult{}, err
 	}
+	doneEv.BinaryRef = binaryRef // nil = 不外置（默认/酸测试路径）
 	if _, err := l.publish(ctx, doneEv); err != nil {
 		return durable.ReplayResult{}, fmt.Errorf("loop: 重放 %q 的 completed 事件落盘失败: %w", intent.ToolName, err)
 	}

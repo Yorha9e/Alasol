@@ -262,6 +262,26 @@ type Config struct {
 	// **只在 MultiAgent=true 时生效**：关 = 不建注册表、**也不校验**（零行为变化——用一个
 	// 根本用不到的扩展点不许拒绝宿主启动；口径见 host/hub.go 的 New 装配处）。
 	AgentTypes []contracts.AgentType
+
+	// ---- v4-3-A 大 payload 外置 blob（G2e / D4）----
+	//
+	// BlobDir 是 blob 外置仓库的根目录（runtime/store/blobfs 落地处）。**空 = 关**（默认）：
+	// 不建 blob 存储、loop 不外置、/api/blobs/{id} 恒 404——与现状完全等价（酸测试）。
+	// 非空 = 开：hub 建一个 blobfs.Store（所有 session 共享），tool.call.completed 的 result
+	// 超过 BlobMaxInline 字节就整体外置（X1 三段结构不动，只改 completed 的 result 内容 +
+	// envelope 的 binary_ref；见 core/loop/blob.go）。
+	BlobDir string
+	// BlobMaxInline 是 result 内联阈值（字节；**<=0 = 不外置**，即使配了 BlobDir）。result
+	// 序列化后**超过**它才外置进 blob。0/未配 = completed 载荷与现状逐字节等价（酸测试）。
+	// 典型值：64KB（65536）——比这大的工具输出进事件流会拖死回放/订阅/索引（F12 同款理由）。
+	//
+	// **负值非法**（启动即拒；唯一事实源 = ValidateBlobMaxInline，run / resume 装配面同款）：
+	// 负阈值没有合理语义，静默当成 0 = 悄悄把外置关掉（用户以为外置开着、实际全量内联，
+	// 现场零线索）。
+	//
+	// F4：实际判定用的是**有效阈值** = max(本值, 摘要预算)（见 core/loop/blob.go）——
+	// 保证"外置 = 瘦身"是结构性事实。
+	BlobMaxInline int64
 }
 
 // validate 校验并归一化配置。
@@ -440,6 +460,33 @@ func (c *Config) validate() error {
 	// 协议 prompt 超时（v3-S4，G1）：负值拒绝；0 = 用框架默认。
 	if c.PromptRunTimeoutSec < 0 {
 		return fmt.Errorf("host: Config.PromptRunTimeoutSec 不能为负（得到 %d；0 = 默认）", c.PromptRunTimeoutSec)
+	}
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：阈值负值拒绝；0/未配 = 不外置（关）。
+	// BlobDir 空 = 关（不建存储）；非空但阈值 0 = 建存储供读侧（/api/blobs）但不外置。
+	// 二者组合都不改 completed 载荷形状的默认路径——只有"目录非空 + 阈值>0"才启用外置。
+	//
+	// 校验走**共享函数** ValidateBlobMaxInline（唯一事实源）——run / resume 两条**不经
+	// host.Config** 的装配面也调它 → 三条装配面同一口径、同一句报错（口径漂移 = 同一个坏配置
+	// 在 serve 上拒启动、在 run/resume 上静默关掉外置）。
+	if err := ValidateBlobMaxInline(c.BlobMaxInline); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateBlobMaxInline 校验大 payload 外置阈值（v4-3-A，G2e/D4）：**负值拒绝**。
+//
+// 口径：0 = 不外置（关，零行为变化）；>0 = 超过它的 result 整体外置进 blob；<0 = 非法配置。
+//
+// 为什么负值必须**报错**而不是"当作 0（关）"：负阈值没有合理语义（"外置 -1 字节的东西"），
+// 静默当成 0 = **悄悄把外置关掉**——用户以为大输出外置了（事件流瘦身、读面有全文），
+// 实际全量内联（事件流膨胀、读面 404），而现场没有任何报错线索。fail-close：启动即拒。
+//
+// **唯一事实源**：host.Config.validate（serve 装配面）与 cmd/alasol 的 run / resume 装配面
+// 共用本函数 → 同一份判定、同一句报错（不许三处各写各的——那是口径漂移的温床）。
+func ValidateBlobMaxInline(n int64) error {
+	if n < 0 {
+		return fmt.Errorf("host: Config.BlobMaxInline 不能为负（得到 %d；0 = 不外置）", n)
 	}
 	return nil
 }
