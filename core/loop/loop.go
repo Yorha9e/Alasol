@@ -218,6 +218,18 @@ type Result struct {
 	// Taint 本次 Run 累积的最高污点级（Q7；空 = clean）。父 agent 据其在子异常冒泡时标注
 	// summary 的 taint；根 agent 上为信息量（v0 无根 summary）。
 	Taint string
+	// TruncatedByMaxTurns 本次 Run 是否**被 MaxTurns 截断**（模型还在要工具，但轮数用尽）。
+	//
+	// 为什么要有这个**显式**标记：Turns 只说"跑了几轮"，**分不清**"正常收敛在最后一轮"与
+	// "被 MaxTurns 截断"——两者 Turns 都等于上限（例：MaxTurns=1，单轮就收敛 → Turns=1；
+	// MaxTurns=1，模型发了工具调用被截断 → Turns=1，一模一样）。消费方（如 ACP 端点判
+	// stopReason=max_turn_requests）要的是**这个**语义，不该靠"轮数 ≥ 上限"去猜。
+	//
+	// 口径：true = 轮数用尽时模型仍在发起工具调用（护栏生效，Run **正常返回不报错**，
+	// Text = 最后一轮的文本）；false = 正常收敛（含子 agent complete 收敛）。
+	//
+	// **additive 字段**（不改既有字段语义、不动 X1 三段写路径）：不设它 = false。
+	TruncatedByMaxTurns bool
 }
 
 // New 构造 Loop 并校验必填项。
@@ -498,6 +510,12 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	}
 
 	// MaxTurns 截断：模型还在要工具但轮数用尽（防呆护栏生效）。
+	//
+	// **显式标记**截断（Result.TruncatedByMaxTurns）：走到这里 = 轮数用尽时模型**仍在**
+	// 发起工具调用（收敛的那轮会提前 return，不会落到这儿）。消费方据此判"这轮没跑完"
+	// （如 ACP 端点 → stopReason=max_turn_requests），不必靠"Turns ≥ 上限"去猜
+	// （正常收敛在最后一轮时 Turns 也等于上限）。
+	res.TruncatedByMaxTurns = true
 	res.Text = lastText
 	return res, nil
 }

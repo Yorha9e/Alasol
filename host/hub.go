@@ -904,6 +904,41 @@ func (h *Hub) Addr() string {
 	return h.cfg.Addr
 }
 
+// EventSource 是 hub 事件总线的**只读出口**（订阅面）。
+//
+// 为什么是接口而不是 *bus.Bus（F6）：*bus.Bus 上有导出的 Publish——返回它等于把
+// "往总线发事件"的写入口交给进程内消费者，名不副实（"只读出口"却带着笔）。
+// 事件的事实源是 loop 的三段写路径与旁路观测（X1/F1）：**订阅方只读，不写**。
+//
+// 只暴露 Subscribe：订阅方拿到的 *bus.Subscription 只有 Events/Lagging/Close（读 +
+// 释放自己的订阅），没有发布能力。
+type EventSource interface {
+	// Subscribe 注册一个订阅（按过滤器收事件）。
+	Subscribe(f bus.Filter) *bus.Subscription
+}
+
+// Bus 返回 hub 的进程内事件总线（**只读出口**：供进程内消费者订阅增量事件）。
+//
+// 唯一的进程内订阅方是 v4-2-B 的 ACP agent 端点（runtime/acp）：它把某 session 的
+// 事件（含 durable=false 的流式 model.delta，G13）桥成 ACP 的 session/update 通知。
+// 订阅方只**读**总线（bus.Subscribe），不 Publish——本出口**不暴露** Publish（F6：
+// 返回类型收窄成只暴露 Subscribe 的 EventSource，"只读出口"名副其实）。
+//
+// 口径：这是**接口层不暴露**（收窄返回类型，编译期就够不着 Publish），**不是运行时封禁**
+// ——bus 包本身仍有导出的 Publish（core/bus 的写入口，loop 的三段写路径在用）；本方法只是
+// **不把它交出去**。另找门路拿到 *bus.Bus 的进程内代码仍能 Publish——本出口管的是
+// "别把笔递出去"，不是"上锁"。
+// 返回 nil 仅当接收者为 nil 或 hub 没装总线（调用方判空）。
+//
+// 依赖方向纪律（09）：runtime 包**不 import host**（那是 cmd 的组合职责），故 acp 不能
+// 直接拿 *Hub；它经 cmd/alasol/acp.go 的适配层调本方法拿到 EventSource 再 Subscribe。
+func (h *Hub) Bus() EventSource {
+	if h == nil || h.bus == nil {
+		return nil
+	}
+	return h.bus
+}
+
 // Sessions 返回在线表（最新活跃在前，行数受 Config.MaxSessionRows 限制）。
 func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
 	if h == nil {

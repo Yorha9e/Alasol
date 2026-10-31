@@ -51,6 +51,8 @@ func main() {
 		code = resumeMain(os.Args[2:])
 	case "serve":
 		code = serveMain(os.Args[2:])
+	case "acp":
+		code = acpMain(os.Args[2:])
 	case "chat":
 		code = chatMain(os.Args[2:])
 	case "tui":
@@ -78,6 +80,9 @@ func usage() {
                                         -continue "<提示>" 续跑一轮对话：折叠整场 session 的
                                         对话、不区分 agent 视角）
   alasol serve  [flags]                 起常驻 hub：Web UI + WS 事件流 + HTTP API
+  alasol acp   [flags]                 起 ACP agent 端点（JSON-RPC 2.0 over stdio；K19 跨机：
+                                        ssh host alasol acp 接入，鉴权交 SSH；ask 审批经
+                                        session/request_permission，无人应答=deny fail-close）
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx / /cost
   alasol tui    [flags]                 三面 TUI（对话/审批/在线表，bubbletea，O6/B2）
   alasol models [flags]                 列出端点支持的模型（发现模型名）

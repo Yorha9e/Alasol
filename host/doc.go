@@ -187,8 +187,13 @@
 //     （HTTP + /ws）映到本地，再浏览器开 `http://localhost:<port>`。`alasol serve` 的
 //     banner 会打这条提示。TLS 由 SSH 隧道负责（hub 自身仍只监听 loopback，不暴露公网）。
 //  2. **`ssh host alasol acp`**（K19，v4-2-B）：SSH 拉起本机 `alasol acp` 子命令，
-//     以 **ACP agent**（JSON-RPC 2.0 over stdio）形态把 session 暴露成现成协议客户端
-//     可接入的端点——不自己发明分布式协议。ACP 端点本身在 v4-2-B，本刀只预留。
+//     以 **ACP agent**（JSON-RPC 2.0 over stdio，newline-delimited 帧）形态把 session
+//     暴露成现成协议客户端可接入的端点——**不自己发明分布式协议**。sessionId 用 hub 的
+//     session ULID 原样；ask 审批经 `session/request_permission` 回到这条 stdio 连接
+//     （无人应答/超时 = deny，fail-close）。实现在 **runtime/acp**（详见其包 doc 的
+//     K19 口径、外发面清单与 stdout 纯净性铁律）；本 host 只为它开一个**只读**事件订阅口
+//     `Hub.Bus()`（返回 `host.EventSource`——**只有 Subscribe，没有 Publish**；
+//     桥 model.delta / tool.call.* 成 session/update），不新增任何写入口。
 //
 // # N4b 六条件在 SSH 形态下的口径（逐条对账）
 //

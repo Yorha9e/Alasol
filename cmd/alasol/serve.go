@@ -88,7 +88,7 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		model:          fs.String("model", "", "模型名（原样传给 provider；缺省回落 env ALASOL_MODEL，无默认值——`alasol models` 可发现）"),
 		baseURL:        fs.String("base-url", "", "OpenAI 兼容端点（空=官方）"),
 		apiKeyEnv:      fs.String("api-key-env", "OPENAI_API_KEY", "持有 API key 的环境变量名"),
-		approval:       fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal | protocol（protocol=经 WS/HTTP 面应答审批，无人应答=deny）"),
+		approval:       fs.String("approval", "deny-all", "审批策略：deny-all | always-allow | terminal | protocol（protocol=经 WS/HTTP 面应答审批，无人应答=deny）。**acp 模式忽略本 flag**（审批恒走 ACP 的 session/request_permission，无人应答=deny）"),
 		allow:          fs.String("allow", "", "允许的工具名（逗号分隔；空=一切 deny）"),
 		ask:            fs.String("ask", "", "需要人审的工具名（逗号分隔；命中即去问 Approver）"),
 		maxTurns:       fs.Int("max-turns", 0, "最大轮数（0=默认 20）"),

@@ -81,7 +81,10 @@ import (
 // 它们共用这份预算（预算耗尽 → 后续审批立即按 deny 收场）。
 //
 // 可配：host.Config.PromptRunTimeoutSec（秒；0 = 用这个默认值）；cmd 侧 -prompt-timeout。
-const promptRunTimeout = 10 * time.Minute
+//
+// 与 ACP 端点（runtime/acp 的 defaultTurnTimeout）**同一个常量**（core.DefaultPromptRunTimeout）：
+// 同一个"-prompt-timeout"在 HTTP 面与 ACP 面上必须给出同一份整轮预算（F8）。
+const promptRunTimeout = core.DefaultPromptRunTimeout
 
 // 请求体大小上限（loopback 上也别裸奔）。
 const (
