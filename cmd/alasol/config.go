@@ -167,6 +167,18 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		BlobDir:       strings.TrimSpace(fc.Blob.Dir),
 		BlobMaxInline: fc.Blob.MaxInline,
 
+		// 向量引擎 + RAG 检索（v4-3-B，G2d）：**只走文件配置面**（TOML `[vectors]`，
+		// 不给 flag——与 [blob] / [[mcp.servers]] 同款：一个布尔开关 + 一个默认 top-k，
+		// 结构化数据 + 默认关）。enabled=false = 不建向量库、`vector_search` 工具不注册、
+		// /api/vectors* 两个端点不注册（404）= 零行为变化（酸测试）。
+		//
+		// **EmbeddingProvider 不在这里接**：文本转向量是宿主/provider 层的事
+		//（框架不算 embedding），配置面放"模型端点/密钥"等于承诺框架会算 embedding。
+		// 生产 = nil（工具不注册、检索/ingest 回 503 说明）；接入方在装配面注入
+		// host.Config.EmbeddingProvider（测试即如此注入 fake）。
+		VectorsEnabled: fc.Vectors.Enabled,
+		VectorsTopK:    fc.Vectors.TopK,
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),

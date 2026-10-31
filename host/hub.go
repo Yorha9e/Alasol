@@ -35,6 +35,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
+	"github.com/Yorha9e/alasol/runtime/store/vecmem"
 	"github.com/Yorha9e/alasol/runtime/tools"
 	"github.com/Yorha9e/alasol/runtime/transport"
 	"github.com/Yorha9e/alasol/runtime/worktree"
@@ -89,6 +90,20 @@ type Hub struct {
 	// tool.call.completed result 外置（写），读侧经 GET /api/blobs/{id} 取全文。它不是第二状态源：
 	// 事件流才是"有没有这条 binary_ref 引用"的唯一事实（core/storage/blob.go）。
 	blob storage.Blob
+	// vecs / vecIndex 是 v4-3-B 向量引擎（G2d：RAG 检索保留位）的读面/写面
+	// （**同一实例**：vecmem.Store 同时实现 storage.Retriever 与 storage.VectorIndex）。
+	// nil = 未启用（Config.VectorsEnabled=false）→ 工具不注册、/api/vectors* 端点不注册
+	// （404）= 零行为变化（酸测试）。开了才建（内存实现，可整体重建的缓存——丢了重建，
+	// 不丢事实 F5；所有 session 共享一个库）。
+	vecs     storage.Retriever
+	vecIndex storage.VectorIndex
+	// embed 是**文本 → 向量**的宿主槽位（框架不算 embedding；生产 nil = 未接）。
+	// nil 时：vector_search 工具不注册、检索/ingest 端点回 503 说明（见 host/vectors.go）。
+	embed EmbeddingProvider
+	// vecGate 是向量面的**重建闸**（复审轮 C3）：RWMutex + 在途重建计数。
+	// Clear+Upsert 的重建窗口跨一把写锁；重建在途时检索回"重建中"（不返回空库）。
+	// nil = 无闸（零值可用；Hub 直构的测试路径不碰向量面）。
+	vecGate *vectorGate
 	// sandbox 是 v2-S4 沙箱执行环境（K8：可插拔 ExecutionEnv；nil = 未启用，
 	// 走 local）。启用时 Close 会撤掉 WER 排除项并收口残留 job 句柄。
 	sandbox *sandbox.Env
@@ -461,6 +476,43 @@ func New(cfg Config) (*Hub, error) {
 		hubLog.Info("host: 已启用大 payload 外置 blob", "dir", dir, "max_inline_bytes", cfg.BlobMaxInline)
 	}
 
+	// 向量引擎（v4-3-B，G2d）：**默认不启用**（Config.VectorsEnabled=false = 不建库、
+	// vector_search 工具不注册、/api/vectors* 两个端点不注册（404）= 零行为变化，酸测试）。
+	// 开了才建一个所有 session 共享的**内存**向量库（runtime/store/vecmem）：它是
+	// **可整体重建的缓存**（SourceRef 指回事件流 e:<seq>/路径/blob id，丢了重建不丢事实，F5），
+	// 所以不做持久化；换持久化实现消费方零改动（G2b）。同一实例同时提供读面与写面
+	// （vecmem 两面都实现，G17 单写者纪律：写只经宿主的 ingest/Rebuild 入口）。
+	var (
+		vecStore  *vecmem.Store
+		vecReader storage.Retriever
+		vecWriter storage.VectorIndex
+	)
+	if cfg.VectorsEnabled {
+		vecStore = vecmem.New(cfg.VectorsTopK)
+		vecReader, vecWriter = vecStore, vecStore
+		hubLog.Info("host: 已启用向量引擎（内存实现，可整体重建）", "default_top_k", vecStore.DefaultK())
+	}
+	// 重建闸（复审轮 C3）：重建（Clear+Upsert）跨一把写锁，重建在途时检索回"重建中"。
+	// 恒建（极廉价：一把 mutex + 一个计数器）——向量面没开时没人用它。
+	vecGate := &vectorGate{}
+	// vector_search 工具（RAG 检索）：**只有"向量开着 + 配了 embedding 提供者"才注册**。
+	//
+	// 为什么没配提供者就不注册（而不是注册一个必然报错的工具）：模型给的是 query **文本**，
+	// 变不出向量（框架不算 embedding——那是 provider/模型层的事）→ 注册了也只是让模型
+	// 看见一个"调了就说用不了"的工具。不注册 = 可见集里没有它（R5：不暴露即不存在），
+	// 与"未开向量"同为**零行为变化**（酸测试：注入 fake 提供者才出现）。
+	// 策略链照走（deny-all 默认）：要放行得显式 allow = ["vector_search"]。
+	switch {
+	case vecStore != nil && cfg.EmbeddingProvider != nil:
+		if err := reg.RegisterTool(vectorSearchDescriptor(),
+			newVectorSearchExecutor(cfg.EmbeddingProvider, vecStore, vecGate)); err != nil {
+			return nil, fmt.Errorf("host: 注册向量检索工具 %s: %w", ToolVectorSearch, err)
+		}
+	case cfg.VectorsEnabled && cfg.EmbeddingProvider == nil:
+		hubLog.Warn("host: 向量引擎已启用但未配置 embedding 提供者——vector_search 工具不注册，" +
+			"检索/ingest 端点将回 503（框架不算 embedding：文本转向量由宿主/provider 层接）")
+	}
+
 	h := &Hub{
 		cfg:               cfg,
 		store:             st,
@@ -493,6 +545,10 @@ func New(cfg Config) (*Hub, error) {
 		lifeCtx:           lifeCtx,
 		lifeCancel:        lifeCancel,
 		blob:              blobStore,
+		vecs:              vecReader,
+		vecIndex:          vecWriter,
+		embed:             cfg.EmbeddingProvider,
+		vecGate:           vecGate,
 	}
 
 	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持

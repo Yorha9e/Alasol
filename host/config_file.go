@@ -87,6 +87,9 @@ type FileConfig struct {
 	// Blob 大 payload 外置 blob（v4-3-A，G2e/D4）：[blob] 段。默认关（dir 空）= 不外置，
 	// completed 载荷与现状逐字节等价（酸测试）。配了 dir 且 max_inline>0 才启用外置。
 	Blob BlobFileConfig `toml:"blob"`
+	// Vectors 向量引擎 + RAG 检索（v4-3-B，G2d）：[vectors] 段。默认关（enabled=false）=
+	// 不建向量库、`vector_search` 工具不注册、/api/vectors* 端点 404——零行为变化（酸测试）。
+	Vectors VectorsFileConfig `toml:"vectors"`
 }
 
 // BlobFileConfig 是大 payload 外置 blob 的文件级配置（v4-3-A，G2e/D4）。
@@ -112,6 +115,37 @@ type BlobFileConfig struct {
 	// F4：实际判定用的是**有效阈值** = max(本值, 摘要预算)（见 core/loop/blob.go）——
 	// 保证"外置 = 瘦身"是结构性事实（摘要不会比原文还大）。
 	MaxInline int64 `toml:"max_inline"`
+}
+
+// VectorsFileConfig 是向量引擎 + RAG 检索的文件级配置（v4-3-B，G2d）。
+//
+// 形如：
+//
+//	[vectors]
+//	enabled = true      # 是否装配向量引擎（默认 false = 关 = 零行为变化）
+//	top_k = 10          # 检索默认 top-k（K=0 时生效；0 = vecmem 默认 10；负值非法 = 启动即拒）
+//
+// 口径（与 host.Config.VectorsEnabled / VectorsTopK 一致）：
+//   - **enabled 默认 false = 关**：不建向量库、`vector_search` 工具不注册、
+//     GET /api/vectors/search 与 POST /api/vectors 都不注册（404）——与现状完全等价（酸测试）；
+//   - **top_k** 只是 K=0 时的默认上限（调用方显式给 K 仍以 K 为准）；
+//   - **没有 dir**：vecmem 是**内存实现**（可整体重建的缓存，丢了重建，见包 doc）——
+//     要持久化是换实现的事（SQLite / 向量数据库），消费方零改动（G2b）；
+//   - **Filter 口径**（实现支持过滤，不报 ErrUnsupported）：对条目 Payload JSON 的
+//     **顶层字符串字段**做字节精确匹配（AND 语义；键缺失/值非字符串 → 不命中）。
+//
+// 另有一条**与配置无关**的硬口径（写在代码常量里，不给配置面开洞）：**单批 ingest ≤512 条**
+// （一条文本 = 一次 embedding 提供者调用、批内串行）——超出 → 400 并点名上限（见
+// host/vectors.go 的 maxVectorTexts）。
+//
+// 注意：本段**没有 embedding 提供者**——文本转向量是宿主/provider 层的事
+// （框架不算 embedding），配置面放一个"模型端点/密钥"反而像在承诺框架会算 embedding。
+// 生产未接提供者时：库建了但检索/ingest 端点回 503 说明、工具不注册（零行为变化）。
+type VectorsFileConfig struct {
+	// Enabled 是否装配向量引擎（默认 false = 关 = 零行为变化）。
+	Enabled bool `toml:"enabled"`
+	// TopK 检索默认 top-k（0 = vecmem 默认 10；负值非法 = 启动即拒）。
+	TopK int `toml:"top_k"`
 }
 
 // AgentTypeFileConfig 是一个**用户自定义** agent 类型的文件级声明（[[agent_types]] 的元素，

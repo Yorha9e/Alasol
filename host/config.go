@@ -14,6 +14,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/mcp"
+	"github.com/Yorha9e/alasol/runtime/store/vecmem"
 )
 
 // DefaultAddr 是 HTTP/WS 的默认监听地址（N5b：只监听 loopback）。
@@ -282,6 +283,27 @@ type Config struct {
 	// F4：实际判定用的是**有效阈值** = max(本值, 摘要预算)（见 core/loop/blob.go）——
 	// 保证"外置 = 瘦身"是结构性事实。
 	BlobMaxInline int64
+
+	// ---- v4-3-B 向量引擎 + RAG 接入（G2d）----
+	//
+	// VectorsEnabled 是否装配向量引擎（G2d：RAG 检索保留位）。**默认 false = 零行为变化**
+	// （酸测试）：不建向量库、`vector_search` 工具不注册、GET/POST /api/vectors* 两个端点
+	// 都不注册（404）——与 v4-3-A 之前的形态逐字节等价。开了才建一个所有 session 共享的
+	// 内存向量库（runtime/store/vecmem）。
+	//
+	// 形态对齐 Config.BlobDir / Config.Graph：opt-in 布尔开关，默认关、零开销。
+	VectorsEnabled bool
+	// VectorsTopK 是向量检索的默认 top-k（K=0 时生效；**<=0 = vecmem 默认 10**）。
+	// 负值 = 非法配置（启动即拒，与 BlobMaxInline 同口径：负阈值没有合理语义，
+	// 静默当成 0 = 悄悄把上限改成框架默认，用户以为配的那个值生效了）。
+	VectorsTopK int
+	// EmbeddingProvider 是**文本 → 向量**的宿主槽位（**框架不算 embedding**——那是
+	// provider/模型层的事，换模型就要重算）。**生产 nil = 未接**：此时 `vector_search`
+	// 工具不注册、检索/ingest 端点回 503 说明（零行为变化）；测试/接入方注入 fake 或
+	// 真 embedding 端点实现。接口形状见 host/vectors.go。
+	//
+	// 只有 VectorsEnabled=true 时才被消费（关了连槽位都不看）。
+	EmbeddingProvider EmbeddingProvider
 }
 
 // validate 校验并归一化配置。
@@ -470,6 +492,12 @@ func (c *Config) validate() error {
 	// 在 serve 上拒启动、在 run/resume 上静默关掉外置）。
 	if err := ValidateBlobMaxInline(c.BlobMaxInline); err != nil {
 		return err
+	}
+	// 向量引擎（v4-3-B，G2d）：默认 top-k 负值拒绝（0 = vecmem 默认 10）。
+	// 与 BlobMaxInline 同口径：负阈值没有合理语义，静默当成 0 = 悄悄换成框架默认
+	// （用户以为配的那个值生效了，现场零线索）→ fail-close 启动即拒。
+	if c.VectorsTopK < 0 {
+		return fmt.Errorf("host: Config.VectorsTopK 不能为负（得到 %d；0 = vecmem 默认 %d）", c.VectorsTopK, vecmem.DefaultK)
 	}
 	return nil
 }

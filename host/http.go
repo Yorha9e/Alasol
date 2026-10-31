@@ -55,6 +55,27 @@ var httpLog = slog.Default()
 //	  tool.call.completed 的 result 超阈值被外置后，事件里只留 binary_ref 指向的 id + 摘要 text；
 //	  消费方（UI / 审计 / 回放）拿这个 id 经本端点取回**完整** result JSON。未启用 / id 不存在 → 404。
 //
+// 向量引擎 + RAG 检索（v4-3-B，G2d；默认关 = Config.VectorsEnabled=false）：
+//
+//	GET  /api/vectors/search?q=…&k=…&filter={"kind":"note"}
+//	  → {"query":…,"k":N,"hits":[{id,score,source_ref,payload,truncated}, …]}
+//	  （truncated 在**每条命中**上：被 K 截断时全部置位——诚实信号，见 storage.VectorHit）
+//	  查询是**文本**（q）——宿主经 EmbeddingProvider 转成向量后检索（框架不算 embedding）。
+//	  k 回报**生效上限**（k=0 未指定 → 宿主默认上限；见 VectorSearchView.K）。
+//	  未启用 → **路径都不认得**（404 not_found：路由未注册）；未配 embedding 提供者 → 503
+//	  （写明"由宿主/provider 层接"）；q 空 / k 负 / filter 不是合法 JSON 对象 → 400；
+//	  **重建在途** → 503 vector_rebuilding（Clear+Upsert 窗口：此刻库里是空的/半重建的，
+//	  不拿它当"没有命中"回——重建完成后重试）。
+//	POST /api/vectors
+//	  → {"count":N,"ids":[…]}（手动 ingest / 喂数据面：texts + source_refs 经提供者向量化后 Upsert；
+//	    条目 id 按 (source_ref, 分块文本内容) 哈希确定性派生，重喂同一条覆盖）。
+//	    source_refs 可省/可**短于** texts（按序号对齐，缺的记空串）；比 texts 更长 → 400。
+//	    **单批条数上限 512**（一条文本 = 一次提供者调用，批内串行）→ 超出 400 并点名上限。
+//	    错误口径同 search。
+//
+//	  两个端点都是**可选投影**的读写面：未启用时连路由都不注册（与 blob 同口径 = 404），
+//	  开了才可能出现；Score 跨实现不可比（只可在同一次检索内排序用）。
+//
 // 多 worktree 隔离（v1-S5 D：并行任务各占一个工作区）：
 //
 //	GET    /api/worktrees          → [Worktree, ...]（已登记，按 name 排序）
@@ -162,6 +183,14 @@ func (h *Hub) Handler() http.Handler {
 	// 大 payload 外置 blob 读面（v4-3-A，G2e/D4）：按 Event.binary_ref 的 id 取回全文。
 	// 未启用（Config.BlobDir 空）或 id 不存在 → 404；流式回内容（大对象不整个进内存）。
 	reg("GET", "/api/blobs/{id}", h.serveBlob)
+
+	// 向量引擎 + RAG 检索（v4-3-B，G2d）：**未启用（Config.VectorsEnabled=false）时路由
+	// 根本不注册** → 路径认不得 → 404 not_found（与 blob 读面同口径）；开了才注册。
+	// search 收 query 文本（宿主转 embedding），ingest 是喂数据面（texts + source_refs）。
+	if h.cfg.VectorsEnabled {
+		reg("GET", "/api/vectors/search", h.serveVectorSearch)
+		reg("POST", "/api/vectors", h.serveVectorIngest)
+	}
 
 	// 合并门禁（v3-S3 清 V6/V7 挂账）：review 记录 + 合并前查放行 + 合并后冲突预测。
 	reg("POST", "/api/merge/review", h.serveMergeReview)
@@ -492,6 +521,204 @@ func (h *Hub) serveBlob(w http.ResponseWriter, r *http.Request) {
 		// 响应头已发，无法再改状态码；只留痕（客户端中途断开是常态，不算服务端故障）。
 		httpLog.Warn("host: 流式回 blob 中断", "id", string(id), "err", err.Error())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 向量引擎 + RAG 检索（v4-3-B，G2d）
+// ---------------------------------------------------------------------------
+
+// maxVectorBody 限制 POST /api/vectors 请求体大小（喂数据面：一批文本 + 来源指针，
+// 64KB 够几十段分块；loopback 上也别裸奔）。
+const maxVectorBody = 64 << 10
+
+// VectorHitView 是一条向量检索命中（HTTP/JSON 出口形状）。
+//
+// Score 是**本实现口径**的相似度（vecmem = 余弦）：**跨实现不可比**，只可在同一次检索内
+// 排序用（接口注释）。SourceRef 是来源指针（`e:<seq>` / 路径 / blob 引用 id）——消费端
+// 据此回事件流核验/取原文（概率性检索的可重建锚，F5）。
+type VectorHitView struct {
+	ID        string          `json:"id"`
+	Score     float32         `json:"score"`
+	SourceRef string          `json:"source_ref,omitempty"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
+	Truncated bool            `json:"truncated"`
+}
+
+// VectorSearchView 是 GET /api/vectors/search 的响应形状。
+//
+// K 是**本次生效的 top-k 上限**（不是"请求里写的那个 k"）：
+//   - 请求 k > 0 → 就是它；
+//   - 请求 k = 0（未指定）→ 宿主的默认上限（Config.VectorsTopK；未配 = vecmem.DefaultK=10）。
+//
+// 为什么要报"生效上限"：回显 0 对消费方毫无意义（0 = 没指定），回显实际生效的上限
+// 才可解释（"这次最多取 N 条"）。
+type VectorSearchView struct {
+	Query string          `json:"query"`
+	K     int             `json:"k"`
+	Hits  []VectorHitView `json:"hits"`
+}
+
+// serveVectorSearch 服务 GET /api/vectors/search?q=…&k=…&filter=…（v4-3-B，G2d）。
+//
+//	200 → VectorSearchView（hits 可能是空数组 = 没有命中；**不等于"不存在"**）
+//	400 → q 空 / k 不是非负整数 / filter 不是合法 JSON 对象（键值都按字符串）
+//	404 → 向量引擎未启用（Config.VectorsEnabled=false；路由本就不注册，这里是纵深防御）
+//	503 → 未配置 embedding 提供者（框架不算 embedding：文本转向量由宿主/provider 层接）
+//	      **或** 重建在途（vector_rebuilding：Clear+Upsert 窗口，不拿重建中的库当答案）
+//	500 → 转向量/检索失败
+//
+// filter 是可选查询参数，形态是 JSON 对象：`filter={"kind":"note","lang":"go"}`
+// （AND 语义、字节精确匹配条目 payload 的顶层字符串字段；vecmem 的 Filter 口径）。
+func (h *Hub) serveVectorSearch(w http.ResponseWriter, r *http.Request) {
+	if h.vecs == nil {
+		writeJSONError(w, http.StatusNotFound, "vectors_disabled",
+			"向量引擎未启用（Config.VectorsEnabled=false；/api/vectors/search 不注册）")
+		return
+	}
+	if h.embed == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "embedding_provider_unconfigured",
+			"未配置 embedding 提供者：查询是**文本**，框架不算 embedding——文本转向量由宿主/provider 层接"+
+				"（Config.EmbeddingProvider 注入实现后本端点可用）")
+		return
+	}
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if q == "" {
+		writeJSONError(w, http.StatusBadRequest, "bad_query", "缺少 q 参数（查询文本；框架不算 embedding，宿主负责转向量）")
+		return
+	}
+	k := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("k")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			writeJSONError(w, http.StatusBadRequest, "bad_k",
+				fmt.Sprintf("k 必须是非负整数（0 = 默认上限；得到 %q）", raw))
+			return
+		}
+		k = n
+	}
+	var filter map[string]string
+	if raw := strings.TrimSpace(r.URL.Query().Get("filter")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &filter); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "bad_filter",
+				fmt.Sprintf("filter 必须是 JSON 对象（键值都按字符串），如 {\"kind\":\"note\"}: %v", err))
+			return
+		}
+	}
+	hits, err := h.SearchVectors(r.Context(), q, k, filter)
+	if err != nil {
+		writeVectorHubError(w, err)
+		return
+	}
+	// k 回报**生效上限**（k=0 = 未指定 → 宿主默认上限；见 VectorSearchView.K 的口径）。
+	effK := k
+	if effK <= 0 {
+		effK = h.effectiveVectorTopK()
+	}
+	view := VectorSearchView{Query: q, K: effK, Hits: make([]VectorHitView, 0, len(hits))}
+	for _, hit := range hits {
+		view.Hits = append(view.Hits, VectorHitView{
+			ID:        string(hit.ID),
+			Score:     hit.Score,
+			SourceRef: hit.SourceRef,
+			Payload:   hit.Payload,
+			Truncated: hit.Truncated,
+		})
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// VectorIngestView 是 POST /api/vectors 的响应形状（喂数据面）。
+type VectorIngestView struct {
+	Count int      `json:"count"`
+	IDs   []string `json:"ids"`
+}
+
+// serveVectorIngest 服务 POST /api/vectors（v4-3-B，G2d：手动 ingest / 喂数据面）。
+//
+//	请求体：{"texts":["分块一","分块二"],"source_refs":["e:12","e:13"]}
+//	  （source_refs 可省/可短于 texts——按序号对齐，**缺的来源指针记空串**；长度超过 texts → 400）
+//	200 → {"count":N,"ids":[…]}（条目 id 按 (source_ref, 分块文本内容) 哈希确定性派生；
+//	     同一 (source_ref, 文本) 重喂覆盖同一条）
+//	400 → 体不是合法 JSON / texts 为空 / source_refs 更长 / **texts 超过单批上限 512 条**
+//	      （一条文本 = 一次提供者调用，批内串行；超限 → 请分批喂）
+//	404 → 向量引擎未启用（路由本就不注册；这里是纵深防御）
+//	503 → 未配置 embedding 提供者（ingest 也要向量化：没提供者什么都进不去）
+//	500 → 转向量/写入失败
+func (h *Hub) serveVectorIngest(w http.ResponseWriter, r *http.Request) {
+	if h.vecs == nil {
+		writeJSONError(w, http.StatusNotFound, "vectors_disabled",
+			"向量引擎未启用（Config.VectorsEnabled=false；/api/vectors 不注册）")
+		return
+	}
+	if h.embed == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "embedding_provider_unconfigured",
+			"未配置 embedding 提供者：ingest 要把文本转向量，框架不算 embedding——"+
+				"由宿主/provider 层接（Config.EmbeddingProvider 注入实现后本端点可用）")
+		return
+	}
+	var body struct {
+		Texts      []string `json:"texts"`
+		SourceRefs []string `json:"source_refs"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxVectorBody)).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "bad_body",
+			"请求体不是合法 JSON 对象（应形如 {\"texts\":[\"…\"],\"source_refs\":[\"e:12\"]}）: "+err.Error())
+		return
+	}
+	if len(body.Texts) == 0 {
+		writeJSONError(w, http.StatusBadRequest, "empty_texts", "texts 不能为空（没有要向量化的文本）")
+		return
+	}
+	if len(body.Texts) > maxVectorTexts {
+		writeJSONError(w, http.StatusBadRequest, "too_many_texts",
+			fmt.Sprintf("单批 texts 超过上限 %d 条（得到 %d 条）——一条文本一次提供者调用（批内串行），请分批喂",
+				maxVectorTexts, len(body.Texts)))
+		return
+	}
+	if len(body.SourceRefs) > len(body.Texts) {
+		writeJSONError(w, http.StatusBadRequest, "bad_source_refs",
+			fmt.Sprintf("source_refs（%d 条）比 texts（%d 条）还长（来源对不上就是数据错了）",
+				len(body.SourceRefs), len(body.Texts)))
+		return
+	}
+	ids, err := h.IngestVectors(r.Context(), body.Texts, body.SourceRefs)
+	if err != nil {
+		writeVectorHubError(w, err)
+		return
+	}
+	view := VectorIngestView{Count: len(ids), IDs: make([]string, 0, len(ids))}
+	for _, id := range ids {
+		view.IDs = append(view.IDs, string(id))
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// writeVectorHubError 把向量面（IngestVectors / SearchVectors）的错误映射成 HTTP 状态码。
+//
+// 口径：**按错误种类分**，不一律 500——
+//   - 未启用（errVectorsDisabled）→ 404（路由本就不注册；这里是纵深防御）；
+//   - 未配 embedding 提供者（errNoEmbeddingProvider）→ 503（装配缺一件，不是客户端错）；
+//   - **重建在途**（errVectorRebuilding）→ 503（服务端正忙：重建完成后再来；不是客户端错，
+//     也不能拿重建中的空库当"没有命中"）；
+//   - 查询参数非法（storage.ErrBadQuery：负 K / 空向量 / 维度不符 / 单批超上限）→ 400
+//     （客户端能改）；
+//   - 其余 → 500（真出事了）。
+func writeVectorHubError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errVectorsDisabled):
+		writeJSONError(w, http.StatusNotFound, "vectors_disabled", err.Error())
+		return
+	case errors.Is(err, errNoEmbeddingProvider):
+		writeJSONError(w, http.StatusServiceUnavailable, "embedding_provider_unconfigured", err.Error())
+		return
+	case errors.Is(err, errVectorRebuilding):
+		writeJSONError(w, http.StatusServiceUnavailable, "vector_rebuilding", err.Error())
+		return
+	case errors.Is(err, storage.ErrBadQuery):
+		writeJSONError(w, http.StatusBadRequest, "bad_vector_query", err.Error())
+		return
+	}
+	writeJSONError(w, http.StatusInternalServerError, "vector_failed", err.Error())
 }
 
 // servePeers 服务 GET /api/peers?session_id=<ulid>（K11 水平可见性）。
