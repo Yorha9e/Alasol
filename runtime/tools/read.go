@@ -79,7 +79,9 @@ func (e *ReadExecutor) Execute(ctx context.Context, intent contracts.ToolCallInt
 
 	data, err := e.fs.ReadFile(ctx, args.Path)
 	if err != nil {
-		return contracts.ToolResult{}, fmt.Errorf("%s: %v", toolNameRead, err)
+		// %w：保住错误链——调用方要能 errors.Is(err, remote.ErrUnsupported) 之类
+		// 地判"这个能力面没实现"（remote env 的 Fs 面就是显式 ErrUnsupported）。
+		return contracts.ToolResult{}, fmt.Errorf("%s: %w", toolNameRead, err)
 	}
 	// v0 只有文本内容块：二进制文件宁可报错，也不静默替换成 U+FFFD
 	// （那会把文件内容污染成错的，模型还以为是原文）。

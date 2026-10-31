@@ -69,6 +69,12 @@ type hubFlags struct {
 	sandboxMaxActive     *int
 	sandboxACLMaxObjects *int
 	sandboxStrictGroups  *bool
+
+	// ---- v4-2-A 远端 SSH（K8 第三档 RemoteExecutionEnv）----
+	// remote 与 sandbox **互斥**（host.Config.validate 拒双开）。加并列 flag 而不是把
+	// sandbox 改成 local|sandbox|remote 枚举：改枚举会破坏现有 -sandbox flag 语义（最小侵入）。
+	remote     *bool
+	remoteHost *string
 	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
 	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
 	set map[string]bool
@@ -148,6 +154,17 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 			"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）。"+
 				"开了能堵上 C:\\ProgramData 这类只授予 Users 写权限的目录；"+
 				"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去"),
+
+		// 远端 SSH（v4-2-A，K8 第三档）：执行面经**系统 ssh** 到远端机器。默认关（走 local）。
+		// 与 -sandbox 互斥（host.Config.validate 拒双开）。诚实边界：只有 bash/exec 经 SSH；
+		// read/write/proc/net 预留未支持（remote env 显式 ErrUnsupported）。鉴权交系统 ssh
+		//（密钥/agent/config），不在此收任何凭据（H18）。
+		remote: fs.Bool("remote", false,
+			"启用 RemoteExecutionEnv（v4-2-A，K8 第三档；默认关=走 local）。"+
+				"bash/exec 经系统 ssh 到 -remote-host 指定的远端执行；read/write/proc/net 预留未支持。"+
+				"与 -sandbox 互斥；鉴权交系统 ssh（不收凭据）"),
+		remoteHost: fs.String("remote-host", "",
+			"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填"),
 	}
 }
 
@@ -293,5 +310,10 @@ func printBanner(addr string, opts bannerOptions) {
 		fmt.Printf("  MCP      未启用（配置文件写 [[mcp.servers]] 接入外部 MCP server，v3-S1）\n")
 	}
 	fmt.Printf("  健康     http://%s/api/health\n", addr)
+	if _, port, err := net.SplitHostPort(addr); err == nil {
+		// SSH 端口转发提示（v4-2-A 远程控制面路①）：用户在**别的机器**上把 harness 的
+		// loopback 面映到本地，再浏览器开 http://localhost:<port>。TLS/鉴权由 SSH 隧道负责。
+		fmt.Printf("  SSH 隧道 ssh -L %s:127.0.0.1:%s <user>@<harness-host>（远程控制：把本 loopback 面映到你本地，再开 http://localhost:%s）\n", port, port, port)
+	}
 	fmt.Printf("  只监听 loopback（N5b）；Ctrl-C 退出\n")
 }

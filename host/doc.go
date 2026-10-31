@@ -175,6 +175,58 @@
 //   - **不要**指望跨源 fetch / 直连 ws（浏览器会因 CORS / Origin 校验被拒——403 origin_rejected）。
 //
 // 非浏览器客户端（CLI / 脚本 / curl，无 Origin 头）不受此限，可直连。
+
+// # SSH 远程控制（v4-2-A，来源 07 N4b/N5/K19 拍板 2026-10-31）
+//
+// 远端经 **SSH 连接 harness 机器**进行远程控制。**鉴权交系统/SSH 自管**（密钥/agent/
+// config），我们只做 SSH 适配层、**不做自研鉴权**（N5 的 token scope/降权视图体系不做）。
+// 两条接入路：
+//
+//  1. **SSH 端口转发接 HTTP/WS**（本刀落地）：在**你的本地机器**跑
+//     `ssh -L <port>:127.0.0.1:<port> <user>@<harness-host>`，把 harness 的 loopback 面
+//     （HTTP + /ws）映到本地，再浏览器开 `http://localhost:<port>`。`alasol serve` 的
+//     banner 会打这条提示。TLS 由 SSH 隧道负责（hub 自身仍只监听 loopback，不暴露公网）。
+//  2. **`ssh host alasol acp`**（K19，v4-2-B）：SSH 拉起本机 `alasol acp` 子命令，
+//     以 **ACP agent**（JSON-RPC 2.0 over stdio）形态把 session 暴露成现成协议客户端
+//     可接入的端点——不自己发明分布式协议。ACP 端点本身在 v4-2-B，本刀只预留。
+//
+// # N4b 六条件在 SSH 形态下的口径（逐条对账）
+//
+// N4b 列了启用远程访问的六条件；SSH 形态下它们的落点：
+//
+//   - ① 凭证只走 header/query，绝不走 cookie → **不变**：hub 不设任何 cookie，HTTP 面
+//     本来只收 header/query（见上面"安全边界"一节）；
+//   - ② 校验 Origin → **不变**（且为隧道兼容加了 loopback 互认，见 runtime/transport）：
+//     SSH -L 后浏览器 Origin/Host 都是本地端，同源判定照旧通过；
+//   - ③ token 可撤销/轮换/按设备签发 → **交系统 SSH**：SSH 密钥/agent 就是那套按设备、
+//     可撤销的身份，系统 ssh 自管，我们不建 token（呼应 N5 不做自研鉴权）；
+//   - ④ 降权视图 → **不做**：鉴权交 SSH 后没有 token scope 语义，N5 的"token scope ∩
+//     策略上限 ∩ 降权视图"交集体系本刀不实现（诚实挂账，不是遗漏）；
+//   - ⑤ 全量审计进事件流 → **已有**：事件流就是唯一事实源，SSH 会话里发生的一切照常
+//     进事件库、可回放；
+//   - ⑥ 公网必须 wss://(TLS) → **SSH 隧道即加密通道**：`ssh -L` 是端到端加密隧道，
+//     hub 不必自己上 TLS（也仍不暴露公网）。
+//
+// # 远端执行环境（RemoteExecutionEnv，K8 第三档）
+//
+// 装配侧还有一个 opt-in：`-remote`（与 `-sandbox` 互斥）把**工具执行环境**换成
+// runtime/cap/remote 的 RemoteExecutionEnv——bash/exec 经系统 ssh 到 `-remote-host`
+// 执行；Fs/Proc/Net 三个能力面 v4-2-A 显式 ErrUnsupported（预留位，见该包 doc）。
+// 这与上面的"SSH 端口转发"是**两回事**：前者是"客户端连 hub 的面"，后者是"hub 把工具
+// 命令送到远端机器执行"；鉴权都交系统 ssh，我们都不收凭据（H18）。
+//
+// ⚠ **远端路径不传凭据**（H12/H19）：env **与 args** 的值都会拼进 ssh 的 argv
+// （两端进程表可见），故 remote env 对"凭据形态的 env / 参数"一律**拒绝执行**
+// （ErrCredentialEnv）——声明了 required_env 且值是凭据的工具，在 `-remote` 下会
+// **明确报错**，而不是把值送到远端。这是有意的边界，不是待修的 bug
+// （详见 runtime/cap/remote 的 doc）。
+//
+// ⚠ **产品面本刀只给两个 flag**（v4-2-A 终查 F3，如实写明）：`-remote`（启用
+// RemoteExecutionEnv）与 `-remote-host`（ssh 目标）。**远端 PATH 固定 `/usr/bin:/bin`**
+// （可经**包内** `remote.Config.DefaultRemotePATH` 覆盖，但**产品面没有暴露这个入口**——
+// macOS/homebrew 的机器需覆盖为含 `/opt/homebrew/bin` 的值，否则远端 brew 装的
+// 命令 127）；**ssh 选项走 `~/.ssh/config`**（端口/跳板机/IdentityFile 等写在那里，
+// 本包只负责按目标名调系统 ssh，不读不改那个文件）。这是**已知边界**，不是待修的 bug。
 //
 // # 计数 / 时间 / 分页口径（v3-S4，A1/A3/A5 一次说清）
 //

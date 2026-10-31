@@ -13,6 +13,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/runtime/cap/remote"
 )
 
 // ---- 测试替身 ----
@@ -363,7 +364,38 @@ func TestWriteErrors(t *testing.T) {
 	}
 }
 
+// TestReadWritePreserveErrorChain 钉死 F11：read/write 的错误**保住错误链**
+// （用 %w 包装，不是 %v）——调用方要能 errors.Is 判底层原因：比如 remote env 的
+// Fs 面是显式 ErrUnsupported（"这个能力面没实现"），必须与"文件读不出来"分得开。
+func TestReadWritePreserveErrorChain(t *testing.T) {
+	sentinel := errors.New("底层能力面未实现")
+	fs := newFakeFS()
+	fs.failWith = sentinel
+
+	if _, err := NewRead(fs).Execute(context.Background(), intent(toolNameRead, readArgs{Path: "a.txt"})); !errors.Is(err, sentinel) {
+		t.Errorf("read 的错误应保住错误链（errors.Is 可判）：%v", err)
+	}
+	if _, err := NewWrite(fs).Execute(context.Background(), intent(toolNameWrite, writeArgs{Path: "a.txt", Content: strPtr("x")})); !errors.Is(err, sentinel) {
+		t.Errorf("write 的错误应保住错误链（errors.Is 可判）：%v", err)
+	}
+}
+
 // ---- bash ----
+
+// TestBashPreserveErrorChain 钉死 F5：bash 工具的错误**保住错误链**（用 %w 包装，
+// 不是 %v）——与 read/write 同口径。调用方要能 errors.Is 判底层原因：比如 remote
+// env 的 ssh 传输层失败是显式 ErrSSHTransport（"根本没连上"），必须与"远端命令
+// 跑挂了"分得开。%v 会把链断掉 → errors.Is 判不出来 → 上层看不出差别。
+func TestBashPreserveErrorChain(t *testing.T) {
+	fe := &fakeExec{err: fmt.Errorf("remote: %w", remote.ErrSSHTransport)}
+	_, err := NewBash(fe).Execute(context.Background(), intent(toolNameBash, bashArgs{Command: "ls"}))
+	if err == nil {
+		t.Fatal("底层失败应报错")
+	}
+	if !errors.Is(err, remote.ErrSSHTransport) {
+		t.Errorf("bash 的错误应保住错误链（errors.Is(remote.ErrSSHTransport) 可判）：%v", err)
+	}
+}
 
 func TestBashExecute(t *testing.T) {
 	fe := &fakeExec{res: core.ExecResult{ExitCode: 0, Stdout: []byte("hello\n")}}

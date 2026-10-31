@@ -180,6 +180,24 @@ type Config struct {
 	// 写文件的程序（Go/.NET/Rust/Node）会写不进去。
 	SandboxStrictGroups bool
 
+	// ---- v4-2-A 远端 SSH（K8 第三档 RemoteExecutionEnv）----
+	//
+	// Remote 是否把工具执行环境从 LocalExecutionEnv 换成 RemoteExecutionEnv
+	// （runtime/cap/remote，执行面经**系统 ssh** 到远端机器）。**默认 false = 与 v1
+	// 等价**（走 runtime/cap/local）。形态对齐 Config.Sandbox：一个 opt-in 布尔开关。
+	//
+	// 与 Config.Sandbox **互斥**（validate 拒双开）：两者都是"换执行环境"，同时开
+	// 没有意义且语义冲突。取舍说明：没有把二者并成一个 `env` 枚举，是为**不破坏现有
+	// `-sandbox` flag 语义**（改枚举会让 `-sandbox` 失效/要迁移）——加一个并列 `-remote`
+	// flag 是最小侵入。
+	//
+	// 诚实边界（v4-2-A 只落地 Exec）：remote env 只把 **bash/exec** 经 SSH 送到远端；
+	// Fs/Proc/Net 三个能力面显式 ErrUnsupported（预留位，见 runtime/cap/remote 的 doc）。
+	// 鉴权**交系统 ssh**（密钥/agent/config），本结构**不收任何凭据**（H18）。
+	Remote bool
+	// RemoteHost 是 ssh 目标（user@host 或 ~/.ssh/config 别名）。Remote 启用时必填。
+	RemoteHost string
+
 	// ---- v3-S1 MCP client（N1：client 先）----
 	//
 	// MCP 是否装配外部 server 的工具。**默认零值 = 不装**：不连任何外部进程、
@@ -405,6 +423,14 @@ func (c *Config) validate() error {
 			return fmt.Errorf("host: Config.SandboxWriteDirs 必须是绝对路径（得到 %q）", d)
 		}
 	}
+	// 远端 SSH（v4-2-A）：与沙箱互斥（都是"换执行环境"，双开语义冲突）；
+	// 启用时 RemoteHost 必填（没有 ssh 目标就不知道连哪台机器，fail-close）。
+	if c.Sandbox && c.Remote {
+		return fmt.Errorf("host: Sandbox 与 Remote 互斥（不能同时启用；二选一：本机沙箱 or 远端 SSH）")
+	}
+	if c.Remote && strings.TrimSpace(c.RemoteHost) == "" {
+		return fmt.Errorf("host: Remote 启用时 RemoteHost 必填（ssh 目标 user@host 或 ~/.ssh/config 别名）")
+	}
 	// MCP client（v3-S1）：配置面校验**前移到启动期**（与 tiered 窗口同一纪律）——
 	// 坏配置（server 名重复 / transport 缺 command 或 url / 传输类型不支持）
 	// 在 host.New 就炸，而不是拖到装配期或更糟地静默跳过。
@@ -474,6 +500,10 @@ func checkLoopback(addr string) error {
 
 // isLoopbackHost 判定 host 部分是否 loopback（N5b/O7：v0 只监听本机）。
 //
+// **用途只此一处**：判定 **监听地址**（Config.Addr）能不能 bind 在本机。
+// 所以这里**必须放行整个 127/8**——用户绑 127.0.0.2 也是本机，安全模型与
+// 127.0.0.1 完全一样，没有理由区别对待。
+//
 // **只认 IP 与两个名字特例**：
 //
 //   - IP：net.ParseIP 解析成功 → ip.IsLoopback()（127.0.0.0/8 整段 + ::1）；
@@ -484,6 +514,14 @@ func checkLoopback(addr string) error {
 // "127.0.0.1.evil.example"、"127.0.0.1.nip.io" 这类**域名**放行（它们解析到
 // 127.0.0.1，实测真能绑上监听）——而 v0 的安全模型是"loopback + 无凭据"，
 // 被域名绕过就整体失效。v0 只监听本机，不放开域名。
+//
+// # 与 runtime/transport 那份 isLoopbackHost 的分工（**刻意不合并**）
+//
+// transport 那份判的是"**Origin 互认**"（浏览器的 Origin 头与请求 Host 是不是
+// 同一个源），那里**只认规范写法**（localhost / 127.0.0.1 / ::1），127/8 的其余
+// 成员不放行——因为那是"同机不同地址"的问题（127.0.0.2 与 127.0.0.1 同端口可以
+// 各自 bind）。两份口径**不同是有意的**：合并会把"监听地址"的口径也收窄（回归），
+// 或把"Origin 互认"的口径放松（回归）。各自写清用途，别互相抄。
 func isLoopbackHost(host string) bool {
 	h := strings.TrimSpace(host)
 	// IP 判定（IPv6 字面量的方括号一并剥掉：SplitHostPort 通常已剥，这里兜底）。

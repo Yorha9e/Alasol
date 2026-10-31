@@ -26,6 +26,7 @@ import (
 	"github.com/Yorha9e/alasol/core/workflow"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
+	"github.com/Yorha9e/alasol/runtime/cap/remote"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/graph"
 	"github.com/Yorha9e/alasol/runtime/indexer"
@@ -283,9 +284,11 @@ func New(cfg Config) (*Hub, error) {
 
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
 	// 执行环境（K8：可插拔 ExecutionEnv）。**默认 local**（v1 等价，零沙箱开销）；
-	// Config.Sandbox=true 时换成 sandbox.Env——工具代码、loop、策略链一行不动。
+	// Config.Sandbox=true 时换成 sandbox.Env；Config.Remote=true 时换成 remote.Env
+	// （执行面经系统 ssh）——三者互斥（validate 已拒双开），工具代码、loop、策略链一行不动。
 	fsCap, execCap := core.FSCapability(local.FS{}), core.ExecCapability(local.Exec{})
-	if cfg.Sandbox {
+	switch {
+	case cfg.Sandbox:
 		env, serr := sandbox.New(cfg.sandboxPolicy())
 		if serr != nil {
 			_ = st.Close()
@@ -303,6 +306,19 @@ func New(cfg Config) (*Hub, error) {
 		}
 		hubLog.Info("host: 已启用 SandboxedExecutionEnv",
 			"backend", env.BackendName(), "allowed_roots", env.AllowedRoots())
+	case cfg.Remote:
+		// RemoteExecutionEnv（v4-2-A，K8 第三档）：只有 Exec 经 SSH 落地；Fs/Proc/Net
+		// 显式 ErrUnsupported（预留位）——所以 read/write 也接到 remote env，会诚实报
+		// "未支持"（换 env 不动工具代码；要挂后续在 remote 包里实现即可）。鉴权交系统
+		// ssh，此处不传任何凭据（H18）。
+		env, serr := remote.New(remote.Config{Host: cfg.RemoteHost})
+		if serr != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("host: 装配 RemoteExecutionEnv: %w", serr)
+		}
+		fsCap, execCap = env, env
+		hubLog.Info("host: 已启用 RemoteExecutionEnv（SSH）",
+			"host", env.Host(), "note", "仅 Exec 经 SSH；Fs/Proc/Net 预留 ErrUnsupported")
 	}
 	execs := map[string]core.ToolExecutor{
 		"read":  tools.NewRead(fsCap),

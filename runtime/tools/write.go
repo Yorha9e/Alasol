@@ -91,7 +91,8 @@ func (e *WriteExecutor) Execute(ctx context.Context, intent contracts.ToolCallIn
 	}
 
 	if err := e.fs.WriteFile(ctx, args.Path, []byte(*args.Content)); err != nil {
-		return contracts.ToolResult{}, fmt.Errorf("%s: %v", toolNameWrite, err)
+		// %w：保住错误链（调用方要能 errors.Is 判底层原因，如 remote.ErrUnsupported）。
+		return contracts.ToolResult{}, fmt.Errorf("%s: %w", toolNameWrite, err)
 	}
 	// 回执里只报字节数与路径——**不回声内容**（内容模型刚给过，回显纯浪费 token）。
 	return resultText(fmt.Sprintf("wrote %d bytes to %s", len(*args.Content), args.Path)), nil

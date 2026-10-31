@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -134,9 +135,18 @@ func (s *Server) untrack(c *wsConn) {
 
 // ServeWS 升级 HTTP 连接并按 NDJSON 行式协议服务（挂到 GET /ws 上）。
 //
-// 顺序：Origin 校验（N5b）→ websocket.Accept → 读循环（subscribe/ping）→ 推送循环
-// （kind=event）。Accept 自己也会做一次同源校验（不传 OriginPatterns 时），
-// 这里显式先做一遍是为了给出 JSON 错误体与一条可审计的告警，而不是默认的纯文本 403。
+// 顺序：Origin 校验（N5b + v4-2-A loopback 互认）→ websocket.Accept → 读循环 →
+// 推送循环（kind=event）。
+//
+// # 为什么 checkOrigin 通过后要删掉 Origin 头再 Accept
+//
+// checkOrigin 是**权威** Origin 门（含 loopback 互认，见同文件与 origin_internal_test.go）。
+// 但 coder/websocket 的 Accept 在 OriginPatterns 为 nil 时**会自做一次同源校验**
+// （Origin host 必须与请求 Host 字符串相等）——它**表达不了**"loopback 互认"这条规则，
+// 于是会把我们有意放行的 loopback 拼写差异（Origin=localhost vs Host=127.0.0.1，SSH -L
+// 隧道后的真实割裂）二次拒掉。故 checkOrigin 一通过就删掉 Origin 头，让 Accept 跳过那次
+// 冗余且已不一致的校验。真正的门只在 checkOrigin 一处（同源 **或** loopback 互认），
+// 并由单测 + 集成测双重钉住（TestLoopbackOriginCrossSpellingAccepted / …Rejected）。
 func (s *Server) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if s == nil || s.bus == nil {
 		writeHTTPError(w, http.StatusInternalServerError, CodeServerNotReady, "transport: 服务端未装配事件总线")
@@ -148,6 +158,8 @@ func (s *Server) ServeWS(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusForbidden, CodeOriginRejected, err.Error())
 		return
 	}
+	// checkOrigin 已放行 → 删 Origin 头，绕过 Accept 那次表达不了 loopback 互认的冗余校验。
+	r.Header.Del("Origin")
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{})
 	if err != nil {
@@ -292,6 +304,13 @@ func subscribeAckFrom(f bus.Filter, replaced bool) contracts.SubscribeAck {
 }
 
 // checkOrigin 实现 N5b 的 Origin 判据（见包 doc 的安全边界一节）。
+//
+// v4-2-A SSH 隧道兼容：在"Origin 与请求 Host 字符串相等"之外，新增 **loopback 互认**——
+// **规范写法** localhost / 127.0.0.1 / [::1] 互为同源（都是本机，无跨源风险；
+// 127/8 的其余成员**不放行**，见 isLoopbackHost 的收紧说明）。
+// 修的是 SSH -L 隧道后的一个真实割裂：页面从 http://localhost:<port> 加载
+// （Origin=localhost）而 WS/fetch 用了 127.0.0.1（Host=127.0.0.1）——两者都是
+// loopback、同端口，却因拼写不同被旧判据当跨源拒（403 origin_rejected）。
 func checkOrigin(r *http.Request) error {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -304,10 +323,76 @@ func checkOrigin(r *http.Request) error {
 	if u.Host == "" {
 		return fmt.Errorf("Origin %q 不是带 host 的合法 URL", origin)
 	}
-	if strings.EqualFold(u.Host, r.Host) {
-		return nil // 同源：hub 自己的 Web UI
+	if sameOrigin(u.Host, r.Host) {
+		return nil // 同源（含 loopback 互认）：hub 自己的 Web UI / SSH 隧道后的本地访问
 	}
 	return fmt.Errorf("Origin %q 与请求 Host %q 不同源（N5b：v0 只监听 loopback + 无 cookie，拒绝跨源页面）", u.Host, r.Host)
+}
+
+// sameOrigin 判据：字符串相等（含端口）即同源；否则 **loopback 互认**——
+// 两端都是**规范 loopback 写法**且**端口相同**才互认。
+//
+// 为什么要求同端口：端口不同 = 浏览器视角的不同源。若无条件放行所有 loopback，
+// 就把"本机另一个端口上的恶意页面连 hub"这条重新打开了（那正是 Origin 校验要挡的）。
+// SSH 隧道场景两端本就是同一个转发端口，故同端口要求不影响修复目标。
+func sameOrigin(originHost, requestHost string) bool {
+	if strings.EqualFold(originHost, requestHost) {
+		return true
+	}
+	oHost, oPort := splitHostPort(originHost)
+	rHost, rPort := splitHostPort(requestHost)
+	if oPort != rPort {
+		return false
+	}
+	return isLoopbackHost(oHost) && isLoopbackHost(rHost)
+}
+
+// splitHostPort 拆 host:port（无端口 → port 为空）。IPv6 字面量由 net 处理。
+func splitHostPort(hostport string) (host, port string) {
+	if h, p, err := net.SplitHostPort(hostport); err == nil {
+		return h, p
+	}
+	return hostport, ""
+}
+
+// isLoopbackHost 判定一个主机名是否属于 **loopback 互认的规范集合**：
+// `localhost`（大小写不敏感）、`127.0.0.1`、`::1`（含 `[::1]` 的方括号形态）。
+//
+// # 为什么只认这三个（收紧）
+//
+// 早先的口径是"整个 127.0.0.0/8 + ::1"（net.IP.IsLoopback）——**过宽**：
+// 127.0.0.2 与 127.0.0.1 是**不同的本机地址**，同端口**可以各自 bind**
+// （Linux/macOS 默认都监听 127.0.0.1，但绑 127.0.0.2:port 不会冲突），
+// 于是"本机另一个 loopback 地址上的同端口页面"能借这条互认连上 hub ——
+// 那不是 SSH 隧道要修的场景，却把"同机不同地址"的边界捅开了。
+//
+// 故收紧为**规范写法**三件套：SSH 隧道后浏览器真正会写的拼写就这三个
+// （localhost / 127.0.0.1 / [::1]），其余 127/8 成员一律不放行。
+//
+// ⚠ **诚实边界：这条互认是"隧道便利"，不是"安全边界"**（v4-2-A 复查 F4）。
+// 收紧到三件套**并没有**把"同机不同地址"这条边界建立起来：三件套里的
+// **127.0.0.1 vs ::1 vs localhost 本身就是不同的本机地址**，同端口**可以各自 bind**
+// （Linux/macOS 默认监听 127.0.0.1，但绑 [::1]:port 不与之冲突）——所以
+// **恶意本地页面仍可借这条互认驱动 hub**。要彻底堵，需要把"**实际监听地址**"注入
+// 判据（比对请求的 local addr，而不是只比对 Host 字符串）——**挂账**（另一刀的事）。
+//
+// # 与 host 包那份 isLoopbackHost 的分工（**刻意不合并**）
+//
+// host 包那份判的是"**监听地址**是不是 loopback"（能不能 bind 在本机）——那里
+// **必须**放行整个 127/8（用户绑 127.0.0.2 也是本机，安全模型一样）。
+// 本份判的是"**Origin 互认**"——那里只认规范写法（见上）。两份口径不同是**有意的**，
+// 强行合并会把"监听地址"的口径也收窄（那是回归）。
+func isLoopbackHost(h string) bool {
+	h = strings.TrimSpace(h)
+	h = strings.Trim(h, "[]") // IPv6 字面量的括号（SplitHostPort 通常已去，兜底无端口情形）
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	switch h {
+	case "127.0.0.1", "::1":
+		return true
+	}
+	return false
 }
 
 // isNormalClose 判定是否为正常的连接关闭（客户端主动走人 / 服务端关停）。

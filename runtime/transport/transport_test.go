@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -439,7 +440,54 @@ func TestNoOriginAccepted(t *testing.T) {
 	}
 }
 
-// TestUnknownKindGetsErrorReply：协议违规 → kind=error 且 reply_to 指向原消息。
+// TestLoopbackOriginCrossSpellingAccepted：SSH -L 隧道后的 loopback 拼写差异应放行（v4-2-A）。
+//
+// httptest 服务端的请求 Host 是 127.0.0.1:<port>；用户经 ssh -L 转发后用浏览器开
+// http://localhost:<port>，页面 Origin=http://localhost:<port>——两端同端口、都 loopback，
+// 旧判据（字符串相等）会误拒，v4-2-A 起 loopback 互认放行（101 握手成功）。
+func TestLoopbackOriginCrossSpellingAccepted(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split host: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL(srv), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://localhost:" + port}},
+	})
+	if err != nil {
+		t.Fatalf("loopback 拼写差异应放行: %v（status=%v）", err, resp)
+	}
+	defer conn.CloseNow()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("状态码 = %d，want 101", resp.StatusCode)
+	}
+}
+
+// TestLoopbackDifferentPortRejected：loopback 但**不同端口** = 浏览器视角的不同源，仍 403。
+// 钉死"loopback 互认只同端口"——否则本机另一端口上的恶意页面又能连 hub 了。
+func TestLoopbackDifferentPortRejected(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL(srv), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://localhost:9999"}},
+	})
+	if err == nil {
+		conn.CloseNow()
+		t.Fatal("loopback 不同端口应被拒（浏览器视角的不同源）")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("状态码 = %v，want 403", resp)
+	}
+}
 func TestUnknownKindGetsErrorReply(t *testing.T) {
 	b, closeHub := newHub(t)
 	defer closeHub()

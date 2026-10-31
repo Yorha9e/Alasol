@@ -15,6 +15,7 @@ import (
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
+	"github.com/Yorha9e/alasol/runtime/cap/remote"
 	"github.com/Yorha9e/alasol/runtime/cap/sandbox"
 	"github.com/Yorha9e/alasol/runtime/mcp"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
@@ -50,6 +51,13 @@ type runnerOpts struct {
 	SandboxACLMaxObjects      int
 	// SandboxStrictGroups 是否启用严格组 SID 模式（见 sandbox.Policy.StrictGroupSIDs）。
 	SandboxStrictGroups bool
+
+	// Remote 是否启用 RemoteExecutionEnv（v4-2-A，K8 第三档：执行面经系统 ssh 到远端）。
+	// 默认 false = 走 local。与 Sandbox **互斥**（registerBuiltinTools 拒双开）。
+	// 鉴权交系统 ssh，本结构不收任何凭据（H18）。
+	Remote bool
+	// RemoteHost 是 ssh 目标（user@host 或 ~/.ssh/config 别名）。Remote 启用时必填。
+	RemoteHost string
 
 	// MCP 是 MCP client 配置（v3-S1，N1：client 先）。**只走文件配置面**
 	// （[[mcp.servers]]）——不给 flag：server 列表是结构化数据（命令/参数/env），
@@ -202,15 +210,28 @@ func assembleRunnerMCP(ctx context.Context, cfg mcp.Config, reg *registry.Regist
 // 返回值是装配出来的沙箱 env（未启用沙箱时为 nil）：调用方**必须**在收尾时 Close 它
 // （F8——WER 排除项是持久的用户级注册表写入，没人 Close 就永远留在用户机器上）。
 func registerBuiltinTools(reg *registry.Registry, opts runnerOpts) (*sandbox.Env, error) {
+	// remote 与 sandbox 互斥（v4-2-A）：两者都是"换执行环境"，双开语义冲突 → 拒。
+	if opts.Sandbox && opts.Remote {
+		return nil, fmt.Errorf("remote 与 sandbox 互斥：不能同时启用（二选一：本机沙箱 or 远端 SSH）")
+	}
 	fsImpl, execImpl := core.FSCapability(local.FS{}), core.ExecCapability(local.Exec{})
 	var env *sandbox.Env
-	if opts.Sandbox {
+	switch {
+	case opts.Sandbox:
 		e, err := sandbox.New(opts.sandboxPolicy())
 		if err != nil {
 			return nil, fmt.Errorf("装配 SandboxedExecutionEnv: %w", err)
 		}
 		env = e
 		fsImpl, execImpl = e, e
+	case opts.Remote:
+		// RemoteExecutionEnv（v4-2-A）：只有 Exec 经 SSH 落地；Fs/Proc/Net 显式
+		// ErrUnsupported（预留位）——read/write 接到 remote env 会诚实报"未支持"。
+		renv, err := remote.New(remote.Config{Host: opts.RemoteHost})
+		if err != nil {
+			return nil, fmt.Errorf("装配 RemoteExecutionEnv: %w", err)
+		}
+		fsImpl, execImpl = renv, renv
 	}
 	execs := map[string]core.ToolExecutor{
 		"read":  tools.NewRead(fsImpl),

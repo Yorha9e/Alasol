@@ -93,7 +93,9 @@ func (e *BashExecutor) Execute(ctx context.Context, intent contracts.ToolCallInt
 	})
 	if err != nil {
 		// 起不来 / 被取消 / IO 失败——这些才是 error。
-		return contracts.ToolResult{}, fmt.Errorf("%s: %v", toolNameBash, err)
+		// %w：保住错误链（与 read/write 同口径）——调用方要能 errors.Is(err,
+		// remote.ErrSSHTransport) 之类地判底层原因（%v 会把链断掉，errors.Is 判不出来）。
+		return contracts.ToolResult{}, fmt.Errorf("%s: %w", toolNameBash, err)
 	}
 	// 非零退出码**不是 error**：它是命令的业务结果，连同 stdout/stderr 一起给模型看（M5）。
 	return resultText(capText(formatExecResult(res))), nil

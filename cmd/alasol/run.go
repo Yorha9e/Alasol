@@ -41,6 +41,10 @@ func runMain(args []string) int {
 		"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）。"+
 			"开了能堵上 C:\\ProgramData 这类只授予 Users 写权限的目录；"+
 			"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去")
+	remoteEnabled := fs.Bool("remote", false,
+		"启用 RemoteExecutionEnv（v4-2-A，K8 第三档；默认关=走 local）。bash/exec 经系统 ssh 到 -remote-host 执行；read/write/proc/net 预留未支持。与 -sandbox 互斥；鉴权交系统 ssh")
+	remoteHost := fs.String("remote-host", "",
+		"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填")
 	_ = fs.Parse(args)
 	if *prompt == "" {
 		fmt.Fprintln(os.Stderr, "-prompt 不能为空")
@@ -98,6 +102,8 @@ func runMain(args []string) int {
 		SandboxMaxActiveProcesses: pickInt(*sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
 		SandboxACLMaxObjects:      pickInt(*sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
 		SandboxStrictGroups:       pickBoolFlag(flagSet(fs, "sandbox-strict-groups"), *sandboxStrictGroups, fc.Sandbox.StrictGroups),
+		Remote:                    pickBoolFlag(flagSet(fs, "remote"), *remoteEnabled, false),
+		RemoteHost:                strings.TrimSpace(*remoteHost),
 
 		// MCP client（v3-S1，N1）：只走文件配置面（[[mcp.servers]]）。
 		// 默认关：一条都没有 = 不装 MCP（零外部进程、零工具）。

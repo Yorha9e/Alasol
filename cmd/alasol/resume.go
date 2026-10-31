@@ -65,6 +65,10 @@ func resumeMain(args []string) int {
 	sandboxACLMaxObjects := fs.Int("sandbox-acl-max-objects", 0, "沙箱施加 ACL 前数子树对象的上限（0=默认 20 万）")
 	sandboxStrictGroups := fs.Bool("sandbox-strict-groups", false,
 		"沙箱严格组 SID 模式：把 BUILTIN 的 Users SID 也 deny-only（默认关）")
+	remoteEnabled := fs.Bool("remote", false,
+		"启用 RemoteExecutionEnv（v4-2-A；重放同样经远端 ssh）。默认关=走 local；与 -sandbox 互斥")
+	remoteHost := fs.String("remote-host", "",
+		"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填")
 	configPath := fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15）")
 	_ = fs.Parse(args)
 
@@ -118,6 +122,8 @@ func resumeMain(args []string) int {
 		SandboxMaxActiveProcesses: pickInt(*sandboxMaxActive, fc.Sandbox.MaxActiveProcesses),
 		SandboxACLMaxObjects:      pickInt(*sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
 		SandboxStrictGroups:       pickBoolFlag(flagSet(fs, "sandbox-strict-groups"), *sandboxStrictGroups, fc.Sandbox.StrictGroups),
+		Remote:                    pickBoolFlag(flagSet(fs, "remote"), *remoteEnabled, false),
+		RemoteHost:                strings.TrimSpace(*remoteHost),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配工具注册表:", err)

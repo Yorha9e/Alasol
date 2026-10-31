@@ -9,6 +9,7 @@ package host
 
 import (
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -77,5 +78,34 @@ func TestLoopbackLookalikeDomainsResolveToLoopback(t *testing.T) {
 		if isLoopbackHost(host) {
 			t.Fatalf("域名 %q 解析到 loopback 也不该被放行（字符串匹配会绕过 v0 安全模型）", host)
 		}
+	}
+}
+
+// TestConfigRemoteSandboxMutuallyExclusive 钉死 v4-2-A：Config.Sandbox 与 Config.Remote
+// 互斥（双开 → validate 拒）；Remote 启用但缺 RemoteHost → validate 拒；Remote 单独 + host → 过。
+func TestConfigRemoteSandboxMutuallyExclusive(t *testing.T) {
+	base := func() *Config {
+		return &Config{DBPath: "x.db", Model: "m"} // Addr 空 → 默认 loopback，其余走默认
+	}
+
+	both := base()
+	both.Sandbox = true
+	both.Remote = true
+	both.RemoteHost = "user@harness"
+	if err := both.validate(); err == nil || !strings.Contains(err.Error(), "互斥") {
+		t.Errorf("Sandbox+Remote 双开应被拒（互斥），得到: %v", err)
+	}
+
+	noHost := base()
+	noHost.Remote = true
+	if err := noHost.validate(); err == nil || !strings.Contains(err.Error(), "RemoteHost") {
+		t.Errorf("Remote 启用但缺 RemoteHost 应被拒，得到: %v", err)
+	}
+
+	ok := base()
+	ok.Remote = true
+	ok.RemoteHost = "user@harness"
+	if err := ok.validate(); err != nil {
+		t.Errorf("Remote 单独 + host 应通过 validate: %v", err)
 	}
 }

@@ -168,6 +168,11 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		SandboxACLMaxObjects:      pickInt(*f.sandboxACLMaxObjects, fc.Sandbox.ACLMaxObjects),
 		SandboxStrictGroups:       pickBoolFlag(f.explicitlySet("sandbox-strict-groups"), *f.sandboxStrictGroups, fc.Sandbox.StrictGroups),
 
+		// 远端 SSH（v4-2-A，K8 第三档）：只走 flag 面（不给 TOML——最小侵入；host 是 user@host
+		// 这种单值，flag 足够）。与沙箱互斥由 host.Config.validate 拒双开。
+		Remote:     pickBoolFlag(f.explicitlySet("remote"), *f.remote, false),
+		RemoteHost: strings.TrimSpace(*f.remoteHost),
+
 		// MCP client（v3-S1，N1）：**只走文件配置面**（[[mcp.servers]] 数组表）。
 		// 不给 flag：server 列表是结构化数据（命令/参数/env/headers），
 		// 硬塞进命令行既难写又容易把凭据泄进 shell 历史与 ps 输出（H12/H19）。
