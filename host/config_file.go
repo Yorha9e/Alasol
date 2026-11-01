@@ -93,6 +93,12 @@ type FileConfig struct {
 	// Vectors 向量引擎 + RAG 检索（v4-3-B，G2d）：[vectors] 段。默认关（enabled=false）=
 	// 不建向量库、`vector_search` 工具不注册、/api/vectors* 端点 404——零行为变化（酸测试）。
 	Vectors VectorsFileConfig `toml:"vectors"`
+	// Embedding embeddings 提供者的文件级配置（v4-3-B 装配面）：[embedding] 段。
+	// **model 空 = 不接提供者** = Config.EmbeddingProvider 保持 nil（零行为变化）；
+	// 非空才在 cmd 装配面构造 openai.Embedder 填进槽位。与 [vectors] 分工：本段管
+	// "用哪个端点/模型/密钥名"，[vectors] 管库与工具开关——两者正交（开了库没配
+	// 提供者仍是 503/不注册的零行为变化）。
+	Embedding EmbeddingFileConfig `toml:"embedding"`
 	// Documents 文档族投影（G2 第 5 族）：[documents] 段。默认关（enabled=false）=
 	// 不建 DocStore、/api/docs* 四个端点 404——零行为变化（酸测试）。
 	Documents DocumentsFileConfig `toml:"documents"`
@@ -152,14 +158,61 @@ type BlobFileConfig struct {
 // （一条文本 = 一次 embedding 提供者调用、批内串行）——超出 → 400 并点名上限（见
 // host/vectors.go 的 maxVectorTexts）。
 //
-// 注意：本段**没有 embedding 提供者**——文本转向量是宿主/provider 层的事
-// （框架不算 embedding），配置面放一个"模型端点/密钥"反而像在承诺框架会算 embedding。
-// 生产未接提供者时：库建了但检索/ingest 端点回 503 说明、工具不注册（零行为变化）。
+// embedding 提供者**不在本段**——那是独立的 [embedding] 段（model/base_url/api_key_env）。
+// 框架不算 embedding（文本转向量是 provider 层的事，换模型就要重算）；[embedding] 段提供
+// 模型/端点/密钥**变量名**，由 cmd 装配面构造成 openai.Embedder 填进 Config.EmbeddingProvider
+// （不是框架在算）。生产未接提供者时：库建了但检索/ingest 端点回 503 说明、工具不注册
+// （零行为变化）。
 type VectorsFileConfig struct {
 	// Enabled 是否装配向量引擎（默认 false = 关 = 零行为变化）。
 	Enabled bool `toml:"enabled"`
 	// TopK 检索默认 top-k（0 = vecmem 默认 10；负值非法 = 启动即拒）。
 	TopK int `toml:"top_k"`
+}
+
+// EmbeddingFileConfig 是 embeddings 提供者的文件级配置（v4-3-B 装配面）。
+// 形如：
+//
+//	[embedding]
+//	model = "text-embedding-3-small"   # embedding 模型名（空 = 不接提供者 = 零行为变化）
+//	base_url = "https://api.example/v1" # embeddings 端点（空 = 回退 chat 的 base_url；再空 = openai 缺省官方端点）
+//	api_key_env = "MY_EMBEDDING_KEY"    # 持有 embedding key 的**环境变量名**（空 = 回退 chat 的 api_key_env）
+//
+// 口径（与 cmd 装配面一致；框架不算 embedding——文本转向量由 provider 层的 openai.Embedder 做）：
+//   - **model 空 = 不接 EmbeddingProvider**（Config.EmbeddingProvider 保持 nil =
+//     vector_search 工具不注册、/api/vectors* 回 503 说明——零行为变化）。
+//     **注意 503 的前提**：那个 503 只在 **[vectors].enabled = true** 时成立（库开着、
+//     路由注册了，只是没提供者）；[vectors].enabled = false（默认）时 **/api/vectors* 的
+//     路由压根不注册 → 404**，与有没有 embedding 提供者无关（酸测试面）。
+//   - **model / base_url 也有 env 面**（cmd 装配面）：ALASOL_EMBEDDING_MODEL（模型名）
+//     与 ALASOL_EMBEDDING_BASE_URL（端点 base URL）——优先级同 chat 的
+//     ALASOL_MODEL / ALASOL_BASE_URL：**显式 flag > env > 本文件**。env 名固定这两个，
+//     不另设变量名（端点与模型名不是凭据，不需要"换一台机器就换变量名"的能力）。
+//   - **base_url** 可与 chat 不同端点（embedding 与 chat 分开部署时用）；它是 **base
+//     URL**——端点会自己拼 "/embeddings"（base_url = "https://api.example/v1" →
+//     POST https://api.example/v1/embeddings）。
+//   - **api_key_env 只收变量名**（H15 凭据纪律）：值在 cmd 装配时从那个变量取，
+//     永不进 argv/事件/日志；embedding 与 chat 可以是不同 key。
+//     **口径（F1：不静默跨边界回退）**：
+//     · **显式指定**（本段给了非空变量名，且它 ≠ chat 的 api_key_env）→ 值**只**从那个
+//     变量取；取不到 → **启动即拒**（fail-close，报错点名变量名、绝不含值）。**不**
+//     静默回退到 chat 的凭据——显式"分家"就是要 chat 的 key 不被发到第三方 embedding
+//     端点；
+//     · **未指定**（空）→ **沿用 chat 的凭据**：**变量名与值都沿用 chat**（同一凭据是
+//     意图，不只是名字沿用）。
+//   - 三字段映射进 host.Config.EmbeddingProvider（经 openai.NewEmbedder），不在
+//     host.Config 上再挂 model/base_url/api_key_env 的重复槽位——装配面只认 provider。
+type EmbeddingFileConfig struct {
+	// Model embedding 模型名（空 = 不接提供者 = 零行为变化；env 面 = ALASOL_EMBEDDING_MODEL）。
+	Model string `toml:"model"`
+	// BaseURL embeddings 端点的 **base URL**（端点会拼 "/embeddings"；空 = 回退 chat 的
+	// base_url；再空 = openai 缺省官方端点；env 面 = ALASOL_EMBEDDING_BASE_URL）。
+	BaseURL string `toml:"base_url"`
+	// APIKeyEnv 持有 embedding key 的环境变量名（只传名字，不传值，H15）。
+	//
+	// 口径（F1）：**未指定**（空）→ 沿用 chat 的凭据（变量名与值都沿用）；
+	// **显式指定**（且 ≠ chat 的 api_key_env）→ 值只从该变量取，取不到 → 启动即拒。
+	APIKeyEnv string `toml:"api_key_env"`
 }
 
 // DocumentsFileConfig 是文档族投影的文件级配置（G2 第 5 族）。

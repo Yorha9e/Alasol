@@ -78,6 +78,19 @@ type hubFlags struct {
 	// set 记录被显式设置的 flag 名（fs.Visit 填充）：flag 默认值不应掩盖配置文件，
 	// 只有**显式**设置的 flag 才高于文件（H15：env>文件；显式 flag 更高）。
 	set map[string]bool
+
+	// ---- embedding 提供者（v4-3-B 装配面）----
+	// embeddingModel 空 = 不接 embedding 提供者 = Config.EmbeddingProvider 保持 nil（零行为变化）。
+	embeddingModel *string
+	// embeddingBaseURL 是 embeddings 端点的 base URL（端点会拼 /embeddings）；
+	// 空 = 回退 chat 的 base-url；再空 = openai.Embedder 缺省官方端点。
+	embeddingBaseURL *string
+	// embeddingAPIKeyEnv 持有 embedding key 的**环境变量名**。
+	//
+	// 口径（F1）：**未指定**（空）→ 沿用 chat 的凭据（变量名与值都沿用）；
+	// **显式指定**（且 ≠ chat 的 api-key-env）→ 值只从该变量取，取不到 → 启动即拒
+	// （fail-close，不静默回退到 chat 的凭据）。
+	embeddingAPIKeyEnv *string
 }
 
 // registerHubFlags 把共有 flag 注册到 fs（serve 额外有 -addr，chat 也有但可忽略）。
@@ -165,6 +178,22 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 				"与 -sandbox 互斥；鉴权交系统 ssh（不收凭据）"),
 		remoteHost: fs.String("remote-host", "",
 			"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填"),
+
+		// embedding 提供者（v4-3-B 装配面）：serve/chat/acp/mcp-serve 经 registerHubFlags
+		// 全部获得。model 空 = 不接提供者 = Config.EmbeddingProvider 保持 nil（零行为变化）。
+		embeddingModel: fs.String("embedding-model", "",
+			"embedding 模型名（空=不接 embedding 提供者=零行为变化；配了才在装配面造 openai.Embedder）。"+
+				"该模型名随 **/embeddings** 请求发给端点（base URL 见 -embedding-base-url：端点会拼 /embeddings）"),
+		embeddingBaseURL: fs.String("embedding-base-url", "",
+			"embeddings 端点的 **base URL**（端点会拼 /embeddings：如 https://api.example/v1 → "+
+				"POST https://api.example/v1/embeddings）。空=回退 chat 的 base-url；"+
+				"再空=openai.Embedder 缺省官方端点。可与 chat 不同端点"),
+		embeddingAPIKeyEnv: fs.String("embedding-api-key-env", "",
+			"持有 embedding key 的环境变量名（只传名字不传值，H15）；该凭据只发给 **/embeddings** 端点"+
+				"（base URL 见 -embedding-base-url：端点会拼 /embeddings）。"+
+				"**显式指定**（且与 chat 的 -api-key-env 不同名）时值只从该变量取，"+
+				"该变量未设则**启动即拒**（不静默回退 chat 的凭据）；"+
+				"空=沿用 chat 的凭据（变量名与值都沿用）"),
 	}
 }
 

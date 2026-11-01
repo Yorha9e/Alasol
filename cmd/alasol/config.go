@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/Yorha9e/alasol/host"
+	"github.com/Yorha9e/alasol/runtime/provider/openai"
 )
 
 // buildConfig 把 flag 值 + 进程 env + 用户级 TOML 配置（H15）合并成 host.Config。
@@ -18,6 +19,10 @@ import (
 // 凭据（api_key）：只在这里按 env>文件 收敛一次，填入 host.Config.APIKey；**永不进
 // argv / 事件 / 日志**（H12/H19）。配置文件解析失败 → 直接报错（fail-close：损坏的配置
 // 可能正是用户指望的默认值/凭据来源）。
+//
+// **embedding 凭据另有一条口径（F1，不静默跨边界回退）**：显式指定了变量名 → 值**只**从
+// 那个变量取，取不到**启动即拒**（fail-close）；未显式指定 → 沿用 chat 的凭据（变量名与
+// 值都沿用）。详见下面 embedding 段的注释。
 func (f *hubFlags) buildConfig() (host.Config, error) {
 	fc, err := host.LoadFileConfig(*f.configPath)
 	if err != nil {
@@ -41,6 +46,45 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 	// 凭据：先定 env 变量名（显式 flag > 文件 > 默认 OPENAI_API_KEY），再取值（env > 文件）。
 	apiKeyEnv := host.ResolveAPIKeyEnv(flagIfSet(f, "api-key-env", *f.apiKeyEnv), fc.APIKeyEnv)
 	apiKey := host.ResolveCredential(apiKeyEnv, fc.APIKey) // env 有值则 env 赢
+
+	// embedding 提供者（v4-3-B 装配面）：flag > env(ALASOL_EMBEDDING_MODEL / ALASOL_EMBEDDING_BASE_URL) > 文件。
+	// **model 空 = 不接提供者** = Config.EmbeddingProvider 保持 nil（零行为变化）。
+	//
+	// base_url 空 = 回退 chat 的 base-url；再空 = openai.Embedder 缺省官方端点
+	//（NewEmbedder 的零值口径）。embedding 与 chat 可以是不同端点。
+	embModel, _ := host.Precedence(*f.embeddingModel, os.Getenv("ALASOL_EMBEDDING_MODEL"), fc.Embedding.Model)
+	embBaseURL, _ := host.Precedence(*f.embeddingBaseURL, os.Getenv("ALASOL_EMBEDDING_BASE_URL"), fc.Embedding.BaseURL)
+	if strings.TrimSpace(embBaseURL) == "" {
+		embBaseURL = baseURL // 回退 chat 的 base-url（可能仍空 → openai 缺省官方端点）
+	}
+	// embedding 凭据（F1 钉死的口径：**不静默跨边界回退**）。
+	//
+	//   - **显式指定**（flag 或 [embedding].api_key_env 给了非空的变量名，且它 **≠** chat 的
+	//     api_key_env）→ 值**只**从那个变量取；取不到 → **启动即拒**（fail-close，见下）。
+	//     绝不静默回退到 chat 的凭据：用户显式"分家"就是要让 chat 的 key **不**被发到
+	//     第三方 embedding 端点——静默回退 = 把凭据发给了用户没打算发的那台机器
+	//     （凭据跨边界泄露，且用户完全看不见）。
+	//   - **未显式指定**（空）→ 沿用 chat 的凭据（同一凭据是意图）：**变量名与值都沿用
+	//     chat**（不是只沿用名字、值另找一处）。
+	//
+	// 值永不进 argv/事件/日志（这里只取一次交给 Embedder）。
+	embAPIKeyEnv := firstNonEmptyStr(
+		flagIfSet(f, "embedding-api-key-env", *f.embeddingAPIKeyEnv),
+		fc.Embedding.APIKeyEnv,
+	)
+	embAPIKey := ""
+	// embKeyExplicit = 用户**显式**指了 embedding 凭据的变量名（= "分家"的意思）。
+	embKeyExplicit := false
+	if name := strings.TrimSpace(embAPIKeyEnv); name == "" || name == apiKeyEnv {
+		// 未显式指定（或与 chat 同名 = 同一凭据的意图）→ 沿用 chat 的凭据
+		//（变量名 + 值，env>文件 已收敛的那个值）。
+		embAPIKeyEnv = apiKeyEnv
+		embAPIKey = apiKey
+	} else {
+		// 显式指定：值**只**从该变量取（[embedding] 段没有直填 key 的字段 → 无文件面可查）。
+		embKeyExplicit = true
+		embAPIKey = host.ResolveCredential(name, "")
+	}
 
 	// approval：显式 flag > 文件 > 框架默认 deny-all。
 	approvalVal := *f.approval
@@ -172,10 +216,11 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// 结构化数据 + 默认关）。enabled=false = 不建向量库、`vector_search` 工具不注册、
 		// /api/vectors* 两个端点不注册（404）= 零行为变化（酸测试）。
 		//
-		// **EmbeddingProvider 不在这里接**：文本转向量是宿主/provider 层的事
-		//（框架不算 embedding），配置面放"模型端点/密钥"等于承诺框架会算 embedding。
-		// 生产 = nil（工具不注册、检索/ingest 回 503 说明）；接入方在装配面注入
-		// host.Config.EmbeddingProvider（测试即如此注入 fake）。
+		// **EmbeddingProvider 由 [embedding] / -embedding-* 装配**（见 buildConfig 里
+		// embedding 段的收敛与下方 cfg 后的 NewEmbedder 装配）：文本转向量是 provider 层
+		// 的事（框架不算 embedding）——配置面放 model/端点/密钥**变量名**，cmd 装配面
+		// 构造成 openai.Embedder 填进槽位；model 空 = nil = 工具不注册、检索/ingest
+		// 回 503 说明（零行为变化）。
 		VectorsEnabled: fc.Vectors.Enabled,
 		VectorsTopK:    fc.Vectors.TopK,
 
@@ -222,6 +267,37 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// 安全敏感的暴露名单不进命令行，H12/H19）。默认空 = 零暴露（fail-close）。
 		MCPExposeTools: fc.MCPServer.ExposeToolsCopy(),
 	}
+
+	// embedding 提供者装配：model 非空 → openai.NewEmbedder（真客户端）→ EmbeddingProvider；
+	// 空 → 保持 nil（零行为变化：vector_search 不注册、/api/vectors* 503——除非 vectors
+	// 也关着，那是 404 路由不注册）。
+	//
+	// 启用后 `vector_search` 工具随 VectorsEnabled 注册、/api/vectors* 可用；
+	// **embedding 与 chat 可以是不同端点/不同 key**（embBaseURL / embAPIKey 各自收敛，
+	// 与 chat 的 baseURL/apiKey 独立）。APIKey 值已按 H15 env>文件 收敛，**不进日志**。
+	if strings.TrimSpace(embModel) != "" {
+		// fail-close（F1）：**显式**指定了 embedding 凭据的变量名，但那个变量没设/为空 →
+		// **启动即拒**，不静默回退到 chat 的凭据。
+		//
+		// 为什么在这里才判（而不是收敛变量名时）：**没接提供者**（model 空）时压根不会
+		// 向 embedding 端点发任何请求 → 那时缺凭据不是错（零行为变化）。只有真要构造
+		// Embedder 时，"显式要的凭据拿不到"才是配置错。
+		//
+		// 错误文案**点名变量名**（名不是秘密，好排查）、**绝不含值**（凭据纪律 H12/H19）。
+		if embKeyExplicit && strings.TrimSpace(embAPIKey) == "" {
+			return host.Config{}, fmt.Errorf(
+				"embedding 凭据缺失：显式指定了 embedding 凭据的环境变量 %s，但该变量未设或为空"+
+					"（fail-close：不静默回退到 chat 的凭据——显式分家的凭据不该被发到第三方 embedding 端点；"+
+					"要么设上它，要么去掉 -embedding-api-key-env / [embedding].api_key_env 以沿用 chat 的凭据）",
+				embAPIKeyEnv)
+		}
+		cfg.EmbeddingProvider = openai.NewEmbedder(openai.Options{
+			BaseURL: embBaseURL,
+			APIKey:  embAPIKey, // env>文件 已收敛；永不进 argv/事件/日志
+			Model:   embModel,
+		})
+	}
+
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。
 		cfg.Provider = testProviderOverride

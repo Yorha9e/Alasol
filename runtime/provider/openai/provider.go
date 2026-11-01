@@ -61,7 +61,9 @@ const (
 	KindError = core.KindError
 )
 
-// Options 是 Provider 的装配参数（零值可用：BaseURL 落默认值、无 APIKey、无流式）。
+// Options 是 Provider / Embedder 的装配参数（零值可用：BaseURL 落默认值、无 APIKey、
+// 无 Model、无流式）。各字段对两个装配体的含义见字段注释（Model 只对 Embedder 有意义，
+// Stream 只对 Provider 有意义）。
 type Options struct {
 	// BaseURL 是 OpenAI 兼容端点根路径（默认 DefaultBaseURL）。
 	// 尾部的 "/" 会被去掉，避免拼出 "//chat/completions"。
@@ -71,8 +73,20 @@ type Options struct {
 	// 为空时不下发 Authorization 头（本地网关常不需要）。
 	APIKey string
 
+	// Model 是 **embeddings** 的模型名（仅 Embedder 使用：POST /embeddings 请求体的
+	// model 字段）。chat completions 的模型名走 core.ModelRequest.Model（按请求传），
+	// 与本字段互不相干——Provider.Run 不读它。为空时 Embedder 照发请求，让端点去拒
+	//（与"缺参数后兜底 / 让端点拒绝"的包口径一致）。
+	Model string
+
 	// HTTPClient 可注入（测试用 httptest.Server，或调用方想统一设置超时/代理/传输层）。
-	// 为 nil 时用不带超时的 *http.Client：超时归调用方 ctx 管（见包 doc「超时」）。
+	//
+	// **两个装配体的 nil 语义刻意不同**：
+	//   - Provider（chat）：nil → 用**不带超时**的 *http.Client，超时归调用方 ctx 管
+	//     （见包 doc「超时」）；
+	//   - Embedder（embeddings）：nil → 新建一个带 **30s 超时**的 client（见
+	//     embed.go 的 defaultEmbedTimeout）——embeddings 是单次短调用，而宿主 RAG 面的
+	//     调用方 ctx（HTTP 请求的 ctx）没有 deadline 兜底。
 	HTTPClient *http.Client
 
 	// Stream 是否走 SSE 流式（默认 false=非流式）。两种模式返回的 ModelResult 形状一致。
@@ -172,7 +186,7 @@ func (p *Provider) Run(ctx context.Context, req core.ModelRequest, emit func(cor
 
 	// 可重试的传输层失败在这里小重试（M6/M7）；resp 非 nil = 拿到一个**不再重试**的
 	// 2xx 响应（非 2xx 一律在重试循环**内**成错——见 doWithRetry 的说明）。
-	resp, err := p.doWithRetry(ctx, payload)
+	resp, err := p.doWithRetry(ctx, chatCompletionsPath, payload)
 	if err != nil {
 		return fail(emit, err)
 	}
@@ -256,9 +270,14 @@ var providerRetryPolicy = retry.Policy{
 
 // doWithRetry 经 core/retry 做一次（可能重试的）HTTP 往返。
 //
+// path 是拼在 baseURL 后的相对路径（chat 传 chatCompletionsPath、embeddings 传
+// embeddingsPath）：重试/错误口径两条端点完全同款，只有 URL 不同——参数化后共用
+// 同一套白名单与退避，不必复制一份重试逻辑。
+//
 // fn 的**幂等性自证**（M7）：chat completions 是只读推理请求——同一个 payload 重发一次
 // 得到的仍是同一轮补全（最坏多付一次 token 费），不写任何系统状态。这正是 07 拍板
-// "模型 API 429/5xx 可重试"的那一类面。
+// "模型 API 429/5xx 可重试"的那一类面。embeddings 同理：同一文本重发得到同一向量，
+// 不写任何系统状态（见 embed.go）。
 //
 // **非 2xx 一律在循环内成错**（不是把响应带出去再判）：本次响应体被排空 + 关闭，折成
 // 一个 *StatusError 交给 core/retry 判重试——
@@ -273,12 +292,13 @@ var providerRetryPolicy = retry.Policy{
 // 尝试）——前一次的可重试失败不会被吞掉；而把 4xx 响应带出循环就永远只有最后那个错误。
 //
 // 返回的 resp 只在**成功**时非 nil（2xx）。
-func (p *Provider) doWithRetry(ctx context.Context, payload []byte) (*http.Response, error) {
+func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte) (*http.Response, error) {
 	var resp *http.Response
 	err := retry.Do(ctx, providerRetryPolicy, func(rctx context.Context) error {
 		// 每次尝试都造一个**新**请求（新的 body 读取器）：共用一个 *http.Request 跨尝试
 		// 要靠 GetBody 回退，那是标准库给重定向用的内部机制，不适合在这里依赖。
-		httpReq, err := http.NewRequestWithContext(rctx, http.MethodPost, p.baseURL+chatCompletionsPath, bytes.NewReader(payload))
+		// URL 走 endpointURL 拼接（保 base 的 query——见 list.go 的说明）。
+		httpReq, err := http.NewRequestWithContext(rctx, http.MethodPost, endpointURL(p.baseURL, path), bytes.NewReader(payload))
 		if err != nil {
 			return fmt.Errorf("openai: 构造 HTTP 请求失败：%w", err)
 		}

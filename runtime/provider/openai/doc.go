@@ -7,6 +7,16 @@
 // OpenAI 风格端点都能接——官方 api.openai.com、Azure 兼容端点、本地网关（vLLM /
 // Ollama / one-api 之类）——只改 BaseURL 即可，调用方代码不动。
 //
+// # embeddings（RAG 嵌入端点）
+//
+// Embedder 是同一选型下的 **/embeddings 客户端**（见 embed.go）：宿主 RAG 面
+// （host.EmbeddingProvider）要一个把文本转向量的窄接口，本包在 provider 侧给出
+// OpenAI 兼容实现——POST {BaseURL}/embeddings，与 chat completions **同一套选型理由**：
+// 零新依赖、换端点只改 BaseURL（BaseURL/APIKey/HTTPClient 与 chat 共用 Options）。
+// 它不实现 core.Provider（那是 chat 的事）；错误与重试口径与 chat 同款（*StatusError、
+// ctx 包装、429/5xx/传输错白名单小重试），方法形状在 embed.go 的编译期断言里钉住
+// （runtime 不 import host，按结构形状兼容）。
+//
 // # 身份与黑盒规则（S4 / 陷阱 1 / 陷阱 17）
 //
 // provider 生成的 tool_call_id 是**黑盒**：从响应里原样收进 core.ToolCallReq.ID
@@ -17,7 +27,13 @@
 // # env 与凭据
 //
 // 本包**不自己读环境变量**：APIKey 由装配方（host）从 env 取出后经 Options 传入。
-// 凭据只以 Authorization 头的形式出现在出站请求里，**不进事件、不进日志、不进错误文案**。
+// 凭据只以 Authorization 头的形式出现在**出站请求**里，**不进事件、不进日志**。
+//
+// **错误文案里的凭据（如实声明，不打码）**：本层**不主动**把凭据写进错误文案
+// （Authorization 头不进任何错误文案）。但**端点若在响应体里回显凭据**（有些网关把
+// 收到的 Authorization 头原样回在错误 JSON 里），那段文本会被抄进 *StatusError.Body ——
+// 与 chat completions **同款既有风险**（同一个错误形状，chat 早就有）。本层不做打码
+// （模糊 regex 既会漏又会误伤），边界如实声明：要把错误体回给终端用户的一方自行脱敏。
 //
 // # 流式与非流式
 //
@@ -96,8 +112,13 @@
 //
 // # 超时
 //
-// 本包不设默认超时：请由调用方传带 deadline 的 ctx，或注入带 Timeout 的 http.Client
-// （Options.HTTPClient）。挂死的端点不应由 provider 猜一个超时值。
+// **chat completions 不设默认超时**：请由调用方传带 deadline 的 ctx，或注入带 Timeout 的
+// http.Client（Options.HTTPClient）。挂死的端点不应由 provider 猜一个超时值。
+//
+// **embeddings 刻意不同**（见 embed.go 的 defaultEmbedTimeout）：Options.HTTPClient 为 nil
+// 时新建一个带 **30s 超时**的 client——embeddings 是单次短调用，而宿主 RAG 面的调用方
+// ctx（来自 HTTP 请求）**没有 deadline 兜底**，挂死的端点会把请求永久挂住。30s 到了就
+// 失败（可见、可排查）。要自己的超时/代理/传输层就注入 Options.HTTPClient。
 //
 // # 并发
 //

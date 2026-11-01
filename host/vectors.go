@@ -321,6 +321,10 @@ func renderVectorHits(query string, k int, hits []storage.VectorHit) string {
 // 调用（批内串行），不设上限 = 一个请求串起 N 次外部调用。超出 → error（包
 // storage.ErrBadQuery → HTTP 400，点名上限）；更多请分批喂（分批不影响最终库内容）。
 //
+// **空文本**（F4）：texts 里有**空串**（字节精确 `text == ""`）→ 预校验拦下（**在调用
+// 提供者之前**：不让同批前面的几条白跑外部调用），包 storage.ErrBadQuery → HTTP 400
+// bad_vector_query（客户端数据错，不是"真出事了"）。空白串不算空（宿主不替用户改数据）。
+//
 // 返回落库的条目 id（与入参顺序一致）。
 //
 // 向量库未启用 → errVectorsDisabled；未配 embedding 提供者 → errNoEmbeddingProvider。
@@ -345,6 +349,21 @@ func (h *Hub) IngestVectors(ctx context.Context, texts []string, sourceRefs []st
 	if len(sourceRefs) > len(texts) {
 		return nil, fmt.Errorf("host: source_refs（%d 条）比 texts（%d 条）还长"+
 			"（来源对不上就是数据错了）: %w", len(sourceRefs), len(texts), storage.ErrBadQuery)
+	}
+	// 空文本预校验（F4）：空串没有可嵌入的内容——喂进去只会被提供者拒（一次白付的外部
+	// 调用），而那个错在 HTTP 面上会落成 **500**（"真出事了"），可它其实是**客户端数据
+	// 错** → 包 storage.ErrBadQuery → 400 bad_vector_query（客户端能改）。
+	//
+	// **字节精确**（不做 TrimSpace）：判据就是 `text == ""`。空白串（" "）是一个**待嵌入
+	// 的合法文本**——它该不该被拒由提供者/端点判，宿主不替用户改数据（悄悄 trim 掉用户
+	// 的内容更糟：入库的原文与喂进去的不一致）。
+	//
+	// 预校验放在**调用提供者之前**：一条空文本不该让同批前面的几条白跑一遍外部调用。
+	for i, text := range texts {
+		if text == "" {
+			return nil, fmt.Errorf("host: 第 %d 条文本为空（空文本没有可嵌入的内容）: %w",
+				i, storage.ErrBadQuery)
+		}
 	}
 	idx := h.vecIndex // 写面（与 h.vecs 同一实例；vecmem 两面都实现）
 	out := make([]contracts.Ulid, 0, len(texts))
@@ -380,7 +399,8 @@ func (h *Hub) IngestVectors(ctx context.Context, texts []string, sourceRefs []st
 //
 // k <= 0 = 向量实现默认上限；filter 对条目 payload 顶层字符串字段做字节精确匹配（AND）。
 // 向量库未启用 → errVectorsDisabled；未配 embedding 提供者 → errNoEmbeddingProvider；
-// 查询文本为空 → error（fail-close：空查询只会返回一堆不相关的东西）。
+// 查询文本为空 → error（包 storage.ErrBadQuery → HTTP 400；fail-close：空查询只会返回
+// 一堆不相关的东西，客户端改一下就好——不是 500）。
 //
 // **重建在途** → errVectorRebuilding（复审轮 C3）：此刻库里正处在 Clear 与 Upsert 之间，
 // 检索会看到空库/半重建库——那不是"没有命中"，故如实报"重建中"（HTTP 503）。
@@ -395,7 +415,9 @@ func (h *Hub) SearchVectors(ctx context.Context, query string, k int, filter map
 		return nil, errNoEmbeddingProvider
 	}
 	if strings.TrimSpace(query) == "" {
-		return nil, errors.New("host: 查询文本不能为空（q）")
+		// 空查询 = 客户端数据错 → 包 storage.ErrBadQuery（HTTP 400），不是 500
+		//（F4：空查询只会返回一堆不相关的东西，客户端改一下就好）。
+		return nil, fmt.Errorf("host: 查询文本不能为空（q）: %w", storage.ErrBadQuery)
 	}
 	emb, err := h.embed.Embed(ctx, query)
 	if err != nil {

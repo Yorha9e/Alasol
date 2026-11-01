@@ -596,7 +596,9 @@ type VectorSearchView struct {
 //	404 → 向量引擎未启用（Config.VectorsEnabled=false；路由本就不注册，这里是纵深防御）
 //	503 → 未配置 embedding 提供者（框架不算 embedding：文本转向量由宿主/provider 层接）
 //	      **或** 重建在途（vector_rebuilding：Clear+Upsert 窗口，不拿重建中的库当答案）
-//	500 → 转向量/检索失败
+//	      **或** 上游 embedding 端点暂时不可用（上游 5xx / 429）
+//	502 → 上游 embedding 端点拒绝了请求（上游 4xx，如 key 无效）
+//	500 → 转向量/检索失败（宿主自己的错）
 //
 // filter 是可选查询参数，形态是 JSON 对象：`filter={"kind":"note","lang":"go"}`
 // （AND 语义、字节精确匹配条目 payload 的顶层字符串字段；vecmem 的 Filter 口径）。
@@ -672,9 +674,12 @@ type VectorIngestView struct {
 //	     同一 (source_ref, 文本) 重喂覆盖同一条）
 //	400 → 体不是合法 JSON / texts 为空 / source_refs 更长 / **texts 超过单批上限 512 条**
 //	      （一条文本 = 一次提供者调用，批内串行；超限 → 请分批喂）
+//	      **或 texts 里有空串**（空文本没有可嵌入的内容；宿主侧预校验，不白跑外部调用）
 //	404 → 向量引擎未启用（路由本就不注册；这里是纵深防御）
 //	503 → 未配置 embedding 提供者（ingest 也要向量化：没提供者什么都进不去）
-//	500 → 转向量/写入失败
+//	      **或** 上游 embedding 端点暂时不可用（上游 5xx / 429）
+//	502 → 上游 embedding 端点拒绝了请求（上游 4xx，如 key 无效）
+//	500 → 转向量/写入失败（宿主自己的错）
 func (h *Hub) serveVectorIngest(w http.ResponseWriter, r *http.Request) {
 	if h.vecs == nil {
 		writeJSONError(w, http.StatusNotFound, "vectors_disabled",
@@ -724,6 +729,18 @@ func (h *Hub) serveVectorIngest(w http.ResponseWriter, r *http.Request) {
 	writeJSONBody(w, http.StatusOK, view)
 }
 
+// upstreamStatusCarrier 是"能报出 HTTP 状态码的错误"的**窄结构形状**（core/retry.StatusCarrier
+// 同款思路）。
+//
+// 为什么用窄接口而不是直接 import runtime/provider/openai 的 *StatusError：宿主 HTTP 面
+// 只关心"**上游**回了个什么状态码"，不该与某一个具体 provider 的错误类型绑死——任何
+// 实现了 HTTPStatus() int 的错误都能接上（openai 的 *StatusError 就实现了：它带
+// HTTPStatus() 方法）。core 侧的同款形状见 core/retry.StatusCarrier。
+type upstreamStatusCarrier interface {
+	// HTTPStatus 返回上游的 HTTP 状态码（0 = 不知道/不是 HTTP 错误）。
+	HTTPStatus() int
+}
+
 // writeVectorHubError 把向量面（IngestVectors / SearchVectors）的错误映射成 HTTP 状态码。
 //
 // 口径：**按错误种类分**，不一律 500——
@@ -731,8 +748,12 @@ func (h *Hub) serveVectorIngest(w http.ResponseWriter, r *http.Request) {
 //   - 未配 embedding 提供者（errNoEmbeddingProvider）→ 503（装配缺一件，不是客户端错）；
 //   - **重建在途**（errVectorRebuilding）→ 503（服务端正忙：重建完成后再来；不是客户端错，
 //     也不能拿重建中的空库当"没有命中"）；
-//   - 查询参数非法（storage.ErrBadQuery：负 K / 空向量 / 维度不符 / 单批超上限）→ 400
-//     （客户端能改）；
+//   - 查询参数非法（storage.ErrBadQuery：负 K / 空向量 / 维度不符 / 单批超上限 / 空文本
+//     / 空查询）→ 400（客户端能改）；
+//   - **上游 embedding 端点自己回了非 2xx**（errors.As 取出带状态码的错误，如
+//     openai 的 *StatusError）→ **502**（上游 4xx：它拒了我们的请求）或 **503**
+//     （上游 5xx / 429：它暂时不可用）。这不是宿主炸了，报 500 会把排查方向指错
+//     （"宿主 500"会被当成宿主自己的 bug）；上游的错误体原样带给调用方（诊断要看到它）。
 //   - 其余 → 500（真出事了）。
 func writeVectorHubError(w http.ResponseWriter, err error) {
 	switch {
@@ -747,6 +768,21 @@ func writeVectorHubError(w http.ResponseWriter, err error) {
 		return
 	case errors.Is(err, storage.ErrBadQuery):
 		writeJSONError(w, http.StatusBadRequest, "bad_vector_query", err.Error())
+		return
+	}
+	// 上游非 2xx（带状态码的错误）：4xx = 上游拒了我们的请求（502），5xx/429 = 上游暂时
+	// 不可用（503）。errors.As **穿透包装**（host 侧的 %w 包装与 provider 侧的重试聚合
+	// 都穿透得到底层的那个状态码错误）。
+	var upstream upstreamStatusCarrier
+	if errors.As(err, &upstream) {
+		code := upstream.HTTPStatus()
+		if code == http.StatusTooManyRequests || (code >= 500 && code <= 599) {
+			writeJSONError(w, http.StatusServiceUnavailable, "upstream_embedding_unavailable",
+				fmt.Sprintf("上游 embedding 端点不可用（HTTP %d）: %v", code, err))
+			return
+		}
+		writeJSONError(w, http.StatusBadGateway, "upstream_embedding_rejected",
+			fmt.Sprintf("上游 embedding 端点拒绝了请求（HTTP %d）: %v", code, err))
 		return
 	}
 	writeJSONError(w, http.StatusInternalServerError, "vector_failed", err.Error())

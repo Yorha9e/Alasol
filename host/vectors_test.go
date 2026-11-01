@@ -510,24 +510,39 @@ func vectorIDFormula(t *testing.T, ref, text string) string {
 // 测试里手算公式（见 vectorIDFormula）→ 与 IngestVectors 返回的 id 逐字比对。
 //
 // 覆盖各种边界输入：空 ref / 空文本 / **含 NUL 的 ref 与文本**（旧口径下这两组会撞）。
+//
+// **空文本这一格的口径变了（F4）**：空文本没有可嵌入的内容，宿主在**调用提供者之前**
+// 就预校验拦下（包 storage.ErrBadQuery → HTTP 400 bad_query，客户端数据错，不是 500）。
+// 故该格不再走"入库 → 比对 id"，而是断言**被拒**。id 派生公式对空文本仍有定义
+// （vectorIDFormula），只是不再经 ingest 面。
 func TestVectorEntryIDFormulaReproducible(t *testing.T) {
 	ctx := context.Background()
 	h := vectorsHub(t, 0, &fakeEmbedder{})
 
 	cases := []struct {
-		name string
-		ref  string
-		text string
+		name    string
+		ref     string
+		text    string
+		wantErr bool // 空文本：F4 起宿主预校验拦下（bad_query）
 	}{
-		{"普通", "e:11", "猫在垫子上"},
-		{"无来源指针", "", "没有来源指针的一段"},
-		{"空文本", "e:12", ""},
-		{"ref 含 NUL", "a\x00b", "c"},
-		{"text 含 NUL", "a", "b\x00c"},
-		{"两端都含 NUL", "x\x00y", "p\x00q"},
+		{"普通", "e:11", "猫在垫子上", false},
+		{"无来源指针", "", "没有来源指针的一段", false},
+		{"空文本", "e:12", "", true},
+		{"ref 含 NUL", "a\x00b", "c", false},
+		{"text 含 NUL", "a", "b\x00c", false},
+		{"两端都含 NUL", "x\x00y", "p\x00q", false},
 	}
 	for _, c := range cases {
 		ids, err := h.IngestVectors(ctx, []string{c.text}, []string{c.ref})
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("[%s] 空文本应被宿主预校验拦下（F4：400 bad_query，不是 500）", c.name)
+			}
+			if !errors.Is(err, storage.ErrBadQuery) {
+				t.Fatalf("[%s] 期望 storage.ErrBadQuery，得到 %v", c.name, err)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatalf("[%s] IngestVectors: %v", c.name, err)
 		}
