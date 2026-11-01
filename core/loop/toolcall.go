@@ -57,6 +57,10 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	if err != nil {
 		return "", 0, err // 组装不出合法 intent = 不许执行
 	}
+	// v4-4-B：blob.plan——外置**计划**写在 intent **发布之前**（写点全在三段窗口之外，
+	// critic F1）。此刻结果还不存在 → 体量未知（0）；计划只用于崩溃续跑时对账"这个
+	// tool_call 的结果没落"。
+	l.planExternalize(turn, tc.ID)
 	n, err := l.publish(ctx, intentEv)
 	if err != nil {
 		// 意图没落盘 → 绝不执行（X1：没有意图记录的副作用不可审计、不可恢复）。

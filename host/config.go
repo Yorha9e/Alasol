@@ -304,6 +304,41 @@ type Config struct {
 	//
 	// 只有 VectorsEnabled=true 时才被消费（关了连槽位都不看）。
 	EmbeddingProvider EmbeddingProvider
+
+	// ---- v4-4-B WAL 预写日志（崩溃恢复补充面）----
+	//
+	// WalDir 是 WAL 预写日志的根目录（runtime/store/walfile 落地处；per-session 一个
+	// `<session>.wal` 追加式 NDJSON）。**空 = 关**（默认）：不建目录、不建任何文件、
+	// loop.Config.WalSink 恒 nil → 一个字节都不多写，行为与配置前**逐事件等价**（酸测试）。
+	//
+	// **WAL 不是事实源**（F5 不受影响）：事件流（core.Store）仍是唯一事实源，WAL 记录
+	// "正式写之前"的中间态（turn.begin / turn.delta / turn.end / turn.failed / blob.plan），崩溃后至少
+	// 知道"当时在干什么、吐过什么"。它**可丢弃 / 可截断 / 可 GC**（删掉整个目录不丢任何
+	// 事实），恢复报告是**观察面不是写回面**（delta 可供展示，绝不自动补进事件流）。
+	//
+	// 写失败**不阻断主流程**（尽力而为，一条 Warn 留痕）；fsync 策略 = 逐条不 fsync、
+	// 轮次边界 fsync（见 runtime/store/walfile 包 doc 的取舍说明）。
+	//
+	// **GC / 截断策略挂账**（未做）：什么时候算"这个 session 的 WAL 没用了"是产品决策，
+	// 需与孤儿 blob 清理一起定（两者共用同一批对账键）；walfile 只提供 Truncate/Remove
+	// 两个原语。挂账见 11 施工计划 v4-4 行。
+	WalDir string
+
+	// ---- v4-4-B W15 成本预算（可选闸门；**默认不设上限**）----
+	//
+	// BudgetMaxTokens 是**单 session** 的 token 成本上限（input + output 累计）。
+	// **0 = 不设上限**（默认，W15 拍板：长时程自主是卖点，预算不可控）。
+	//
+	// 非 0 时 host 在**每个 prompt 之前**检查一次：已累计 ≥ 上限 → 拒绝发起本轮
+	//（fail-close：不再烧 token）；跑完再告警一次（越界时留痕）。负值 = 非法配置
+	//（启动即拒：负上限没有合理语义，静默当成 0 = 悄悄关掉用户以为开着的闸门）。
+	//
+	// **诚实边界（别读成别的）**：这是 **per-Run（= 一个 prompt 的全部 turn）粒度**的
+	// 检查点，**不是** turn 内的逐轮刹车——一轮跑到一半越界时，本轮会跑完（下一轮才被拒）。
+	// 逐轮刹车要把成本面接进 loop（loop.Config 加预算 + 每轮读累计），那是另一笔
+	//（挂账见 11 施工计划）。数据源是索引器的 cost_tokens 派生表（J21：usage 只进成本，
+	// 绝不回填 context 快照/预算）。
+	BudgetMaxTokens int64
 }
 
 // validate 校验并归一化配置。
@@ -498,6 +533,17 @@ func (c *Config) validate() error {
 	// （用户以为配的那个值生效了，现场零线索）→ fail-close 启动即拒。
 	if c.VectorsTopK < 0 {
 		return fmt.Errorf("host: Config.VectorsTopK 不能为负（得到 %d；0 = vecmem 默认 %d）", c.VectorsTopK, vecmem.DefaultK)
+	}
+	// WAL 预写日志（v4-4-B）：目录空（trim 后）= 关 = 零行为变化（酸测试）——**不校验、
+	// 不拒**："没配 WAL"是合法状态，为一个用不到的能力拒绝宿主启动没有意义（与
+	// MultiAgent=false 不校验 agent_types 同口径）。目录建不出来在 host.New 才炸
+	//（那是"显式要的能力没起来"，比静默不外置好排查）。
+	c.WalDir = walDirOf(c.WalDir)
+	// 成本预算闸门（W15，v4-4-B）：负值拒绝；0 = 不设上限（默认）。
+	// 与其它阈值同一纪律（BlobMaxInline / VectorsTopK）：负阈值静默当成 0 = 悄悄把用户
+	// 以为开着的闸门关掉，现场零线索 → fail-close 启动即拒。
+	if c.BudgetMaxTokens < 0 {
+		return fmt.Errorf("host: Config.BudgetMaxTokens 不能为负（得到 %d；0 = 不设上限）", c.BudgetMaxTokens)
 	}
 	return nil
 }

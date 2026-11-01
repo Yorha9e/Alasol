@@ -169,13 +169,19 @@ type BtwPromoteFunc func(BtwResult)
 // 主 session 的事件流**零新增**：旁支全部事件归属独立的 fork session_id。
 //
 // 错误语义：
+//
 //   - question 为空 / 回放主 session 失败 / 落 btw.forked 失败 → 返回 error（fork 没跑起来，
 //     钩子不触发——fail-close：不跑一个没有归属标记的旁支）；
+//
 //   - 主 session id 非法（空 / 非 26 字符 ULID）/ 该 session **没有任何事件** → 返回 error
 //     （**可区分**：id 非法说"不是合法 ULID"，无事件说"还没有任何事件"；fail-close：
 //     不产一条 source_session_id 非法的 btw.forked，也不静默跑一个没有上下文的旁支）；
+//
 //   - fork 运行期错误（模型失败 / intent 落盘失败 / ctx 取消）→ BtwResult.Err 带上、钩子仍
 //     触发（埋点要能观测失败），并原样返回该 error 供调用方展示。
+//
+//   - 成本预算超限（W15，v4-4-B）→ 返回 error（**不**跑旁支）：闸门与 RunPrompt 同口径，
+//     旁支是一次真实开销，不该从闸门里溜过去（默认不设上限 = 零行为变化）。
 func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question string) (BtwResult, error) {
 	if h == nil {
 		return BtwResult{}, errors.New("host: Hub 为 nil")
@@ -191,6 +197,15 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	}
 	if err := ctx.Err(); err != nil {
 		return BtwResult{}, err
+	}
+
+	// W15 成本预算闸门（v4-4-B）：**跑之前**检查主 session 的累计 token 成本——超限就拒绝
+	// 发起这次旁支（与 RunPrompt 同口径：闸门管的是"用户明确发起的对话"，旁支也是一次
+	// 真实开销，不该从闸门里溜过去）。
+	//
+	// 默认不设上限（BudgetMaxTokens<=0）→ checkBudget 直接返回 nil（零行为变化）。
+	if berr := h.checkBudget(ctx, mainSessionID); berr != nil {
+		return BtwResult{}, berr
 	}
 
 	// ① 上下文来源：主 session 的对话历史（事件流 → fold，与 resume 续跑同源）。
@@ -247,6 +262,10 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	//    见 loopFor）——旁支的工具大输出同样不该进事件流。不挂 = "大输出不进事件流"这条规则
 	//    只在主 session 上成立（fork session 的事件流里留着几十 MB 的 result，与文档口径不符）。
 	//    关（未启用 blob / 阈值<=0）= 零行为变化（completed 载荷逐字节等价）。
+	//
+	//    v4-4-B WAL 预写日志：旁支的 loop **同样挂 WAL**（与 loopFor 同口径）——旁支崩了
+	//    也要能查"崩在第几轮、吐过什么"。挂的是**旁支自己 session** 的 WAL（per-session
+	//    文件：<forkSID>.wal）；未启用 WAL（WalDir 空）→ sink 为 nil = 零行为变化。
 	fl, err := loop.New(loop.Config{
 		Provider:        h.provider,
 		Bus:             h.bus,
@@ -262,6 +281,7 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 		ContextBudget:   h.contextBudgetFor(h.cfg.ContextStrategy),
 		BlobSink:        h.blob,
 		BlobMaxInline:   h.cfg.BlobMaxInline,
+		WalSink:         h.walFor(forkSID),
 	})
 	if err != nil {
 		btw := BtwResult{

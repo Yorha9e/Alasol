@@ -123,6 +123,10 @@ func runMain(args []string) int {
 		// dir 空 = 关 = 零行为变化（completed 载荷逐字节等价）；阈值 0 = 不外置。
 		BlobDir:       strings.TrimSpace(fc.Blob.Dir),
 		BlobMaxInline: fc.Blob.MaxInline,
+
+		// WAL 预写日志（v4-4-B）：只走文件配置面（TOML `[wal]`）。dir 空 = 关 = 一个文件
+		// 都不建 = 零行为变化（酸测试）。崩溃恢复报告用 `alasol wal -session <id>` 看。
+		WalDir: strings.TrimSpace(fc.Wal.Dir),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

@@ -90,6 +90,12 @@ type FileConfig struct {
 	// Vectors 向量引擎 + RAG 检索（v4-3-B，G2d）：[vectors] 段。默认关（enabled=false）=
 	// 不建向量库、`vector_search` 工具不注册、/api/vectors* 端点 404——零行为变化（酸测试）。
 	Vectors VectorsFileConfig `toml:"vectors"`
+	// Wal WAL 预写日志（v4-4-B）：[wal] 段。默认关（dir 空）= 一个文件都不建、一次追加
+	// 都不做、行为与现状**逐事件等价**（酸测试）。
+	Wal WalFileConfig `toml:"wal"`
+	// Budget 成本预算闸门（W15，v4-4-B）：[budget] 段。**默认不设上限**（max_tokens 0）
+	// ——W15 拍板"长时程自主是卖点，预算不可控"；配了才启用 per-Run 粒度的检查点。
+	Budget BudgetFileConfig `toml:"budget"`
 }
 
 // BlobFileConfig 是大 payload 外置 blob 的文件级配置（v4-3-A，G2e/D4）。
@@ -118,7 +124,6 @@ type BlobFileConfig struct {
 }
 
 // VectorsFileConfig 是向量引擎 + RAG 检索的文件级配置（v4-3-B，G2d）。
-//
 // 形如：
 //
 //	[vectors]
@@ -146,6 +151,49 @@ type VectorsFileConfig struct {
 	Enabled bool `toml:"enabled"`
 	// TopK 检索默认 top-k（0 = vecmem 默认 10；负值非法 = 启动即拒）。
 	TopK int `toml:"top_k"`
+}
+
+// WalFileConfig 是 WAL 预写日志的文件级配置（v4-4-B）。
+//
+// 形如：
+//
+//	[wal]
+//	dir = "C:\\Users\\me\\alasol\\wal"    # WAL 根目录（空 = 关 = 零行为变化，酸测试）
+//
+// 口径（与 host.Config.WalDir 一致）：
+//   - **dir 空 = 关**（默认）：不建目录、不建任何文件、loop.Config.WalSink 恒 nil →
+//     一个字节都不多写，行为与现状**逐事件等价**（酸测试）；
+//   - **WAL 不是事实源**（F5 不受影响）：事件流（core.Store）仍是唯一事实源，WAL 记录
+//     "正式写之前"的中间态（turn.begin / turn.delta / turn.end / turn.failed / blob.plan），崩溃后至少
+//     知道"当时在干什么、吐过什么"；
+//   - **可丢弃 / 可截断 / 可 GC**：删掉整个目录不丢任何事实；恢复报告是**观察面不是写回面**
+//     （WAL 里的 delta 可供展示，绝不自动补进事件流）；
+//   - **写失败不阻断主流程**（尽力而为，一条 Warn 留痕）；
+//   - **没有别的开关**：fsync 策略（逐条不 fsync、轮次边界 fsync）与 GC 策略都是实现/
+//     产品决策，不给配置面开洞——GC/截断**挂账**未做（见 host.Config.WalDir 注释）。
+type WalFileConfig struct {
+	// Dir WAL 根目录（runtime/store/walfile 落地处；per-session 一个 `<session>.wal`）。
+	// 空 = 关 = 零行为变化。
+	Dir string `toml:"dir"`
+}
+
+// BudgetFileConfig 是成本预算闸门的文件级配置（W15，v4-4-B）。
+//
+// 形如：
+//
+//	[budget]
+//	max_tokens = 1000000     # 单 session 的 token 成本上限（0 = 不设上限 = 默认）
+//
+// 口径（与 host.Config.BudgetMaxTokens 一致）：
+//   - **默认不设上限**（max_tokens=0）：W15 拍板"长时程自主是卖点，预算不可控"；
+//   - 非 0 时 host 在**每个 prompt 之前**检查该 session 的累计 token 成本（input+output，
+//     数据源 = 索引器 cost_tokens，J21）：≥ 上限 → 拒绝发起新一轮；跑完越界 → 告警；
+//   - **per-Run 粒度**（一个 prompt = 一次 Run = 若干 turn）：一轮跑到一半越界时本轮跑完，
+//     下一轮才被拒——turn 内逐轮刹车是另一笔（挂账见 11 施工计划）；
+//   - **负值非法**（启动即拒，与 [blob].max_inline 同口径）。
+type BudgetFileConfig struct {
+	// MaxTokens 单 session 的 token 成本上限（0 = 不设上限；负值非法 = 启动即拒）。
+	MaxTokens int64 `toml:"max_tokens"`
 }
 
 // AgentTypeFileConfig 是一个**用户自定义** agent 类型的文件级声明（[[agent_types]] 的元素，

@@ -570,3 +570,41 @@ func mustJSONString(v any) string {
 	}
 	return string(b)
 }
+
+// TestLoadFileConfigWALAndBudgetSections（v4-4-B）：[wal] 与 [budget] 两段正常解析
+// （未知键 fail-close 不许误伤合法配置——反射派生的合法键清单自动含新段）。
+func TestLoadFileConfigWALAndBudgetSections(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[wal]
+dir = "C:/Users/me/alasol/wal"
+
+[budget]
+max_tokens = 123456
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if fc.Wal.Dir != "C:/Users/me/alasol/wal" {
+		t.Errorf("[wal].dir 解析错: %q", fc.Wal.Dir)
+	}
+	if fc.Budget.MaxTokens != 123456 {
+		t.Errorf("[budget].max_tokens 解析错: %d", fc.Budget.MaxTokens)
+	}
+}
+
+// TestLoadFileConfigWALAndBudgetDefaults（v4-4-B）：不写这两段 = 默认关/不设上限
+// （零行为变化的配置面口径）。
+func TestLoadFileConfigWALAndBudgetDefaults(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `model = "m"`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if fc.Wal.Dir != "" {
+		t.Errorf("[wal].dir 缺省应为空（关），got %q", fc.Wal.Dir)
+	}
+	if fc.Budget.MaxTokens != 0 {
+		t.Errorf("[budget].max_tokens 缺省应为 0（不设上限），got %d", fc.Budget.MaxTokens)
+	}
+}

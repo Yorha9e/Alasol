@@ -57,6 +57,11 @@ func (l *Loop) Replay(ctx context.Context, op durable.Op) (durable.ReplayResult,
 			CodeExecutorMissing)
 	}
 
+	// v4-4-B：blob.plan——外置**计划**。重放路径的 intent 是**历史事件**（上一进程落的，
+	// 没法"排在它前面"），故计划写在**重放动手前**（本路径最早的写点）：崩溃续跑据此
+	// 对账"这个 tool_call 的结果没落"。turn=0：重放没有"第几轮"的概念，如实记 0。
+	l.planExternalize(0, intent.ToolCallID)
+
 	// 执行 env：重放不注入新凭据（H21：session/单次注入是发起时刻的事）；用进程 env 经 ctx。
 	execCtx := core.WithEnv(ctx, l.sessionEnv)
 	res, execErr := executeSafely(execCtx, exec, intent)
@@ -82,6 +87,7 @@ func (l *Loop) Replay(ctx context.Context, op durable.Op) (durable.ReplayResult,
 		ToolCallID: intent.ToolCallID,
 		Result:     res,
 	}
+	// turn=0：重放没有“第几轮”的概念（Replay 不在 Run 的轮次循环里），如实记 0。
 	binaryRef := l.externalizeResult(ctx, &payload)
 	doneEv, err := l.newReplayEvent(op, KindToolCallCompleted, causation, payload)
 	if err != nil {

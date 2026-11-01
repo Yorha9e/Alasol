@@ -190,6 +190,10 @@ func (l *Loop) runSpawn(ctx context.Context, turn int, tc core.ToolCallReq, st *
 	if err != nil {
 		return "", 0, nil, err
 	}
+	// v4-4-B：blob.plan——外置**计划**写在 intent **发布之前**（写点全在三段窗口之外，
+	// critic F1；与 toolcall.go 同口径）。spawn 的 summary 会被外置（finishSpawn），
+	// 故这里也要先记计划。
+	l.planExternalize(turn, tc.ID)
 	n, err := l.publish(ctx, intentEv)
 	if err != nil {
 		n += l.publishLoopError(ctx, turn, "publish.intent", err)
@@ -539,6 +543,14 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// → 子 loop 的 externalizeResult 直接返回 nil（酸测试逐字节等价）。
 		BlobSink:      l.blob,
 		BlobMaxInline: l.blobMaxInline,
+		// **WAL 不透传给子 agent**（有意为之，与 blob 不同）：WAL 是 **per-session 一个文件**，
+		// 而子 agent 与父**同 session**（K25 单流多 agent）、且**轮次号各自从 1 起**——父的
+		// 第 1 轮与子的第 1 轮会撞号。（对账已改成**按记录流分段**：父子各是一段，不会被
+		// 混成一轮——runtime/store/walfile 的 F1 修复。但同一份 WAL 里于是躺着**两套轮次**，
+		// "这一段是谁的"只能靠模型名去猜，诊断价值打折。）
+		// 与 blob 不同（WAL 不参与任何判定、只是观察面），这里宁可"子 agent 的轮次不进 WAL"
+		// 也不要一份**归属说不清**的 WAL。/btw 旁支不受此限：它有**自己的 session**
+		// （独立 fork session id + 独立 per-session WAL 文件），故旁支照常挂 WAL。
 	}
 	return New(cfg)
 }

@@ -23,6 +23,11 @@
 //	alasol serve [-addr 127.0.0.1:8720] [-db alasol.db] [-model ...] [-allow ...]
 //	          → 起 hub：GET / 是 Web UI、GET /ws 是 NDJSON 事件流、GET /api/* 是在线表/上下文
 //
+//	alasol wal -session <id> [-db alasol.db] [-wal-dir <dir>]
+//	          → 崩溃恢复报告（v4-4-B）：扫该 session 的 WAL 与事件流对账，打印"上次崩在
+//	            第几轮、跑的什么模型、吐过几段 delta、哪些 tool_call 的 blob 是孤儿候选"。
+//	            单行 JSON 到 stdout；未配置 WAL（[wal].dir 空）→ wal_exists=false（不报错）。
+//
 //	alasol chat [-db alasol.db] [-model ...] [-approval ...] [-allow ...]
 //	          → 终端 REPL：对话 / /table 在线表 / /ctx 上下文构成 / /quit
 //
@@ -59,6 +64,8 @@ func main() {
 		code = tuiMain(os.Args[2:])
 	case "models":
 		code = modelsMain(os.Args[2:])
+	case "wal":
+		code = walMain(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		code = 0
@@ -86,6 +93,10 @@ func usage() {
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx / /cost
   alasol tui    [flags]                 三面 TUI（对话/审批/在线表，bubbletea，O6/B2）
   alasol models [flags]                 列出端点支持的模型（发现模型名）
+  alasol wal -session <id> [flags]      崩溃恢复报告：扫该 session 的 WAL 与事件流对账
+                                        （上次崩在第几轮/跑的什么模型/吐过几段 delta/
+                                        哪些 tool_call 的 blob 是孤儿候选）。**观察面，
+                                        不写回事件流**；未配 [wal].dir = wal_exists=false
 
 模型名无默认值（模型名是端点相关的）：用 -model 指定或设 ALASOL_MODEL；
 不知道叫什么就先跑 `+"`alasol models`"+`。

@@ -22,6 +22,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
+	"github.com/Yorha9e/alasol/runtime/store/walfile"
 	"github.com/Yorha9e/alasol/runtime/tools"
 )
 
@@ -74,6 +75,11 @@ type runnerOpts struct {
 	// BlobMaxInline 是 result 内联阈值（字节；<=0 = 不外置，即使配了 BlobDir）。
 	BlobMaxInline int64
 
+	// WalDir 是 WAL 预写日志的根目录（v4-4-B；**空 = 关** = 零行为变化酸测试）。
+	// 只走文件配置面（TOML `[wal]`，与 [blob] 同款：一个目录路径 + 默认关）。
+	// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面。
+	WalDir string
+
 	// provider 覆盖（测试注入脚本 provider；nil = openai）
 	provider core.Provider
 	// approver 覆盖（测试注入；nil = 按 Approval 选）
@@ -94,6 +100,9 @@ type runner struct {
 	// Close 时收尸——stdio server 是本进程拉起的，杀树归本进程（陷阱 5：
 	// 谁拉起谁收尸）。工具在装配期就进了 reg，loop 眼里它们与 read/write/bash 无异。
 	mcp *mcp.Manager
+	// wal 是 WAL 预写日志的目录管理器（v4-4-B；nil = 未启用 = 零行为变化）。
+	// runner **持有**它是为了 Close 时收口（每个 session 一个 fd，不收就泄漏）。
+	wal *walfile.Store
 }
 
 // newRunner 装配：store → bus → policy → registry（注册 read/write/bash）→ provider → approver → loop。
@@ -188,14 +197,36 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		blobStore = bs
 	}
 
+	// WAL 预写日志（v4-4-B）：**dir 非空才建**（默认关 = 一个文件都不建 = 零行为变化，
+	// 酸测试）。与 host.New / blobfs 同口径：目录建不出来 = "显式要的能力没起来" → 装配
+	// 失败（exit 1），不静默不外记。
+	var walStore *walfile.Store
+	if dir := strings.TrimSpace(opts.WalDir); dir != "" {
+		ws, werr := walfile.New(dir)
+		if werr != nil {
+			st.Close()
+			if sbEnv != nil {
+				_ = sbEnv.Close()
+			}
+			if mcpMgr != nil {
+				_ = mcpMgr.Close()
+			}
+			return nil, fmt.Errorf("建 WAL 预写日志目录 %q: %w", dir, werr)
+		}
+		walStore = ws
+	}
+
+	// run 的 session/agent id：装配时新造（CLI 单次回路，不续跑）。先取出来是因为
+	// WAL 的 per-session 文件要用它（下面 cfg 字面量里引用）。
+	sessionID, agentID := core.NewUlid(), core.NewUlid()
 	cfg := loop.Config{
 		Provider:        prov,
 		Bus:             b,
 		Registry:        reg,
 		Policy:          eng,
 		Approver:        ap,
-		SessionID:       core.NewUlid(),
-		AgentID:         core.NewUlid(),
+		SessionID:       sessionID,
+		AgentID:         agentID,
 		Model:           opts.Model,
 		System:          opts.System,
 		SessionEnv:      opts.SessionEnv,
@@ -207,6 +238,8 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		// host 的 GET /api/blobs/{id}（CLI 这条路径没有 HTTP 面，全文仍在 blob 里）。
 		BlobSink:      blobStore,
 		BlobMaxInline: opts.BlobMaxInline,
+		// WAL 预写日志（v4-4-B）——nil = 关 = 零行为变化（一个文件都不建）。
+		WalSink: runnerWalSink(walStore, sessionID),
 	}
 	lp, err := loop.New(cfg)
 	if err != nil {
@@ -217,9 +250,28 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		if mcpMgr != nil {
 			_ = mcpMgr.Close()
 		}
+		if walStore != nil {
+			_ = walStore.Close()
+		}
 		return nil, fmt.Errorf("构造 loop: %w", err)
 	}
-	return &runner{loop: lp, store: st, sandbox: sbEnv, mcp: mcpMgr}, nil
+	return &runner{loop: lp, store: st, sandbox: sbEnv, mcp: mcpMgr, wal: walStore}, nil
+}
+
+// runnerWalSink 取某 session 的 WAL 写面（nil store / 开失败 → nil = 关 = 零行为变化）。
+//
+// 开失败只告警不拒绝装配：WAL 是尽力而为的补充面，为它拒绝一次真机回路是把观测的重要性
+// 置于事实之上（与 host.walFor 同口径）。
+func runnerWalSink(store *walfile.Store, sessionID contracts.Ulid) core.WalSink {
+	if store == nil {
+		return nil
+	}
+	w, err := store.Writer(sessionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[alasol] 开 session 的 WAL 失败（本轮无 WAL，事件流照常完整）: %v\n", err)
+		return nil
+	}
+	return w
 }
 
 // assembleRunnerMCP 连接 opts.MCP 声明的 server 并把工具注册进 reg
@@ -297,7 +349,7 @@ func (r *runner) Run(ctx context.Context, prompt string) (loop.Result, error) {
 }
 
 // Close 释放存储、沙箱与 MCP 连接（沙箱的 WER 排除项必须撤掉——F8；
-// MCP 的 server 进程树必须收尸——陷阱 5）。
+// MCP 的 server 进程树必须收尸——陷阱 5；WAL 的 per-session fd 必须收口——v4-4-B）。
 func (r *runner) Close() {
 	if r.store != nil {
 		r.store.Close()
@@ -307,6 +359,9 @@ func (r *runner) Close() {
 	}
 	if r.mcp != nil {
 		_ = r.mcp.Close()
+	}
+	if r.wal != nil {
+		_ = r.wal.Close()
 	}
 }
 

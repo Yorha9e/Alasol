@@ -246,6 +246,20 @@
 //     （事件窗口，无游标，要更多得自己抬 from）；**/api/events**（G3 回放面）给 **from/to/limit +
 //     truncated**（按 seq 翻页，追到 watermark 即追平事实流）。消费端按面读各自的信号。
 //
+// # WAL 预写日志（v4-4-B）：崩溃恢复的**补充面**，不是事实源（F5 不受影响）
+//
+// 配了 `[wal].dir` 才启用：per-session 一个 `<session>.wal` 追加式 NDJSON，记五个点——
+// turn.begin（provider.Run 前）/ turn.delta（流式片段逐条）/ turn.end（model.turn 落盘后）/
+// turn.failed（provider 返错时）/ blob.plan（tool.call.intent **发布前**）。**事件流
+// （core.Store）仍是唯一事实源**；WAL 可丢弃/可截断/可 GC
+// （删掉整个目录不丢任何事实），恢复报告是**观察面不是写回面**（`alasol wal -session <id>`
+// 或 resume 的一行摘要：上次崩在第几轮、跑的什么模型、吐过几段 delta、哪些 tool_call 的 blob
+// 是孤儿候选；delta 可供展示，**绝不自动补进事件流**）。五个写点全在 X1 三段写路径**之外**
+// （intent→completed/failed 落盘序一字不动）；写失败不阻断主流程（一条 Warn）。
+//
+// **未配置（默认）= 零行为变化**：一个文件都不建、一次追加都不做、行为逐事件等价（酸测试）。
+// fsync 策略与 GC 挂账见 runtime/store/walfile 的包 doc 与 host/wal.go。
+//
 // # G10：派活 handoff 的端点清单与代码有出入（笔误）——**以 host/http.go 的注册面为准**。
 // （handoff 曾把 GET /api/merge/check 写成 GET，实为 POST；且漏了 /api/graph/impact、
 // /api/graph/rebuild、/api/merge/review|predict。代码是唯一事实源，本文不再复抄清单。）

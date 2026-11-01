@@ -179,6 +179,15 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		VectorsEnabled: fc.Vectors.Enabled,
 		VectorsTopK:    fc.Vectors.TopK,
 
+		// WAL 预写日志（v4-4-B）：**只走文件配置面**（TOML `[wal]`，与 [blob] / [vectors]
+		// 同款：一个目录路径 + 默认关）。dir 空 = 关 = 一个文件都不建 = 零行为变化（酸测试）。
+		// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面。
+		WalDir: strings.TrimSpace(fc.Wal.Dir),
+
+		// 成本预算闸门（W15，v4-4-B）：只走文件配置面（TOML `[budget].max_tokens`）。
+		// **默认不设上限**（0）——W15 拍板口径；非 0 才在 Run 前/后设检查点。
+		BudgetMaxTokens: fc.Budget.MaxTokens,
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),

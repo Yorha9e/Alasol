@@ -21,6 +21,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
 	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
+	"github.com/Yorha9e/alasol/runtime/store/walfile"
 	"github.com/Yorha9e/alasol/runtime/verify"
 )
 
@@ -210,6 +211,23 @@ func resumeMain(args []string) int {
 		blobStore = bs
 	}
 
+	// WAL 预写日志（v4-4-B）：只走文件配置面（TOML `[wal]`）。dir 空 = 关 = 零行为变化。
+	//
+	// 两件事：① **resume 时自动打印一行 WAL 摘要**（崩溃后跑 resume 就看见"上次崩在哪儿"，
+	// 不必另开命令）；② 续跑那一轮（-continue）的 loop 也挂 WAL（与 run/serve 同口径）。
+	walDir := strings.TrimSpace(fc.Wal.Dir)
+	var walStore *walfile.Store
+	if walDir != "" {
+		ws, werr := walfile.New(walDir)
+		if werr != nil {
+			fmt.Fprintln(os.Stderr, "建 WAL 预写日志目录:", werr)
+			return 1
+		}
+		walStore = ws
+		// per-session fd 必须收口（不收就泄漏句柄；与 blobfs/沙箱同纪律）。
+		defer func() { _ = walStore.Close() }()
+	}
+
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	//
 	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
@@ -227,6 +245,9 @@ func resumeMain(args []string) int {
 		// completed 同口径外置（否则"大 payload 不进事件流"在 resume 路径上失效）。
 		BlobSink:      blobStore,
 		BlobMaxInline: fc.Blob.MaxInline,
+		// WAL 预写日志（v4-4-B）——nil = 关 = 零行为变化。续跑那一轮的 loop 与 run/serve
+		// 同口径记 WAL（turn.begin/delta/end/failed + blob.plan）。
+		WalSink: runnerWalSink(walStore, sid),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "构造 resume loop:", err)
@@ -250,11 +271,23 @@ func resumeMain(args []string) int {
 		// 重放/落盘断裂：报告已处理的部分仍打印到 stderr 供诊断，退出码 1。
 		dumpReport(os.Stderr, rep)
 		dumpSummary(os.Stderr, rep)
+		// v4-4-B：**失败分支也要打 WAL 摘要**（critic F9）——"上次崩在哪儿"恰恰是恢复失败
+		// 时最该看见的那句话（resume 失败常常就是上次崩在半路的延续）。先打摘要再 return 1。
+		if s := walResumeSummary(ctx, st, walDir, sid); s != "" {
+			fmt.Fprintln(os.Stderr, s)
+		}
 		fmt.Fprintln(os.Stderr, "resume 失败:", err)
 		return 1
 	}
 	dumpReport(os.Stdout, rep)
 	dumpSummary(os.Stderr, rep)
+
+	// v4-4-B：WAL 崩溃恢复摘要（一行，stderr）。**观察面不是写回面**：只报告"上次崩在
+	// 第几轮/吐过多少 delta/哪些 blob 是孤儿候选"，不补事件流、不改任何状态。
+	// 未配置 WAL / 无异常 → 空串（不打印：没话说的时候不说话）。
+	if s := walResumeSummary(ctx, st, walDir, sid); s != "" {
+		fmt.Fprintln(os.Stderr, s)
+	}
 
 	// 续跑：把事件流 fold 出的对话历史灌回 loop（v1-S1：对话入事件流 → 可回放 → 可续跑）。
 	if strings.TrimSpace(*continuePrompt) == "" {

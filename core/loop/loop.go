@@ -164,6 +164,18 @@ type Config struct {
 	// blobEffectiveThreshold）——保证"外置 = 瘦身"是结构性事实（摘要不会比原文还大）。
 	// 本值配得比摘要预算还小时，(本值, 摘要预算] 区间的 result 不再外置（如实写明的代价）。
 	BlobMaxInline int64
+	// WalSink 是 WAL 预写日志的写面（v4-4-B；core.WalSink）。**nil = 关**（默认，
+	// 零行为变化酸测试）：一个文件都不建、一次追加都不做、行为与配置前逐事件等价。
+	//
+	// 非 nil 时 loop 在五个点写 WAL（都在 X1 三段写路径**之外**，落盘序一字不动）：
+	// turn.begin（provider.Run 前）/ turn.delta（流式片段逐条）/ turn.end（model.turn
+	// 落盘后）/ turn.failed（provider 返错时）/ blob.plan（tool.call.intent **发布前**）。
+	// **WAL 不是事实源**（F5 不受影响）：事件流仍是唯一事实源，WAL 是可丢弃/可截断/可 GC
+	// 的崩溃恢复补充面，恢复报告是观察面不是写回面（见 core/loop/wal.go 与 core/wal.go 的
+	// 定位说明）。
+	//
+	// **写失败不阻断 Run**（尽力而为）：只留一条 Warn（一次），不为一条观测中止模型调用。
+	WalSink core.WalSink
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -214,6 +226,10 @@ type Loop struct {
 	// 零行为变化）。见 Config.BlobSink / Config.BlobMaxInline 与 blob.go 的挂接口径。
 	blob          storage.Blob
 	blobMaxInline int64
+	// wal 支撑 WAL 预写日志（v4-4-B；nil = 关 = 零行为变化）。见 Config.WalSink 与
+	// wal.go 的五个写点。walWriter 只多一个 atomic 告警去重标记，不破坏"Loop 无可变状态
+	// → 可并发 Run"这条不变式（每轮历史/污点/spawn 缓存仍是 Run 的局部变量）。
+	wal *walWriter
 }
 
 // Result 是一次 Run 的产出。
@@ -319,7 +335,16 @@ func New(cfg Config) (*Loop, error) {
 		goalLedger:      cfg.GoalLedger,
 		blob:            cfg.BlobSink,
 		blobMaxInline:   cfg.BlobMaxInline,
+		wal:             newWalWriter(cfg.WalSink),
 	}, nil
+}
+
+// newWalWriter 把 Config.WalSink 包成 loop 内部的 walWriter（nil sink → nil = 关）。
+func newWalWriter(sink core.WalSink) *walWriter {
+	if sink == nil {
+		return nil // 未配置 WAL：零行为变化（酸测试）
+	}
+	return &walWriter{sink: sink}
 }
 
 // validateUlid 校验归属 id（S1/S9：不合则拒绝，不修复）。
@@ -457,6 +482,11 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
 		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts)
 
+		// v4-4-B：turn.begin——provider.Run **之前**写 WAL（"第 N 轮在跑 X 模型"的现场）。
+		// WAL 是崩溃恢复补充面、不是事实源（F5 不受影响）；写在 X1 三段路径之外，失败
+		// 不阻断主流程（一次 Warn，见 wal.go）。
+		l.walTurnBegin(turn, req)
+
 		// v4-4-A（07 M6/M7）**决策：这里不包 core/retry**。
 		//
 		// 两层重试会放大：provider 内部已对 429/5xx 与网络瞬断小重试（3 次指数退避），
@@ -471,10 +501,16 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// 取消导致的失败按取消处理（不要把"被取消"包装成模型错误）。
+				// v4-4-B：turn.failed——这一轮没跑完（取消），但**不是崩溃**：不写的话
+				// WAL 里留下悬空的 turn.begin，对账会误报"疑似崩溃残留"。
+				l.walTurnFailed(turn, ctxErr)
 				res.Text = lastText
 				return res, ctxErr
 			}
 			res.Events += l.publishLoopError(ctx, turn, "provider", err)
+			// v4-4-B：turn.failed——模型调用失败是**普通失败**，不是崩溃：写一条失败收口，
+			// 对账据此把它与"崩溃残留"区分开（begin 后跟 failed = 正常失败，不算在飞）。
+			l.walTurnFailed(turn, err)
 			res.Text = lastText
 			return res, fmt.Errorf("loop: 第 %d 轮模型调用失败: %w", turn, err)
 		}
@@ -484,6 +520,11 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。在判定本轮是否
 		// 收敛**之前**落，故收敛轮（最终答复）与工具调用轮都各有一条。
 		l.publishModelTurn(ctx, turn, mr)
+
+		// v4-4-B：turn.end——model.turn **durable 落盘之后**写 WAL（"这轮的事实已进事件流"）。
+		// 顺序是有意的：反过来写会让"两者之间崩溃"被报告成干净收场（假阴性比漏报更坏），
+		// 详见 wal.go 的 walTurnEnd 说明。
+		l.walTurnEnd(turn, mr)
 
 		// 模型不再发起工具调用 → 收敛，返回最终文本。
 		if len(mr.ToolCalls) == 0 {
@@ -817,6 +858,10 @@ func (l *Loop) emitFunc(ctx context.Context, turn int) func(core.ProviderEvent) 
 	return func(ev core.ProviderEvent) {
 		switch ev.Kind {
 		case core.KindTextDelta, core.KindReasoningDelta:
+			// v4-4-B：turn.delta——流式片段**逐条**写 WAL（model.delta 是 durable=false 的
+			// 流事件：不入库、不回放，崩溃后本轮输出整轮蒸发；WAL 至少多保存一些）。
+			// 预写口径：WAL 先、流事件后（WAL 是"正式写之前"的中间态）。
+			l.walTurnDelta(turn, ev)
 			l.publishModelDelta(ctx, turn, ev)
 		}
 		// 其它 kind（toolcall.start/delta、done、error）：v0 不转发。工具调用的

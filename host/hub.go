@@ -36,6 +36,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/store/blobfs"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/store/vecmem"
+	"github.com/Yorha9e/alasol/runtime/store/walfile"
 	"github.com/Yorha9e/alasol/runtime/tools"
 	"github.com/Yorha9e/alasol/runtime/transport"
 	"github.com/Yorha9e/alasol/runtime/worktree"
@@ -97,6 +98,12 @@ type Hub struct {
 	// 不丢事实 F5；所有 session 共享一个库）。
 	vecs     storage.Retriever
 	vecIndex storage.VectorIndex
+	// wal 是 v4-4-B WAL 预写日志的目录管理器（runtime/store/walfile；nil = 未启用 =
+	// 零行为变化酸测试）。开了才建（Config.WalDir 非空）——per-session Writer 由它懒建，
+	// loop 经 walFor 拿到 sink（turn.begin / turn.delta / turn.end / turn.failed / blob.plan 五个写点）。
+	// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面
+	//（见 host/wal.go）。
+	wal *walfile.Store
 	// embed 是**文本 → 向量**的宿主槽位（框架不算 embedding；生产 nil = 未接）。
 	// nil 时：vector_search 工具不注册、检索/ingest 端点回 503 说明（见 host/vectors.go）。
 	embed EmbeddingProvider
@@ -495,6 +502,27 @@ func New(cfg Config) (*Hub, error) {
 	// 重建闸（复审轮 C3）：重建（Clear+Upsert）跨一把写锁，重建在途时检索回"重建中"。
 	// 恒建（极廉价：一把 mutex + 一个计数器）——向量面没开时没人用它。
 	vecGate := &vectorGate{}
+
+	// WAL 预写日志（v4-4-B）：**默认不启用**（Config.WalDir 空 = 不建目录、不建任何文件、
+	// loop.Config.WalSink 恒 nil = 一个字节都不多写 = 零行为变化，酸测试）。配了目录才建
+	// 目录管理器；per-session Writer 由它懒建（loopFor → walFor），Close 时统一收口。
+	//
+	// **WAL 不是事实源**（F5 不受影响）：事件流才是唯一事实源，WAL 记录"正式写之前"的
+	// 中间态（崩溃后至少知道"当时在干什么、吐过什么"），可丢弃/可截断/可 GC，恢复报告是
+	// 观察面不是写回面（见 host/wal.go 与 runtime/store/walfile 的包 doc）。
+	//
+	// 建失败（目录建不出来/是文件）→ 拒绝启动：那是"显式要的能力没起来"，比静默不外记
+	// 好排查（与 blobfs 同口径）。
+	var walStore *walfile.Store
+	if dir := walDirOf(cfg.WalDir); dir != "" {
+		ws, werr := walfile.New(dir)
+		if werr != nil {
+			return nil, fmt.Errorf("host: 建 WAL 预写日志目录 %q: %w", dir, werr)
+		}
+		walStore = ws
+		hubLog.Info("host: 已启用 WAL 预写日志（崩溃恢复补充面，非事实源）", "dir", dir)
+	}
+
 	// vector_search 工具（RAG 检索）：**只有"向量开着 + 配了 embedding 提供者"才注册**。
 	//
 	// 为什么没配提供者就不注册（而不是注册一个必然报错的工具）：模型给的是 query **文本**，
@@ -549,6 +577,7 @@ func New(cfg Config) (*Hub, error) {
 		vecIndex:          vecWriter,
 		embed:             cfg.EmbeddingProvider,
 		vecGate:           vecGate,
+		wal:               walStore,
 	}
 
 	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持
@@ -668,6 +697,12 @@ func (h *Hub) Close() error {
 	// ② 等它们真正退出（**有界**：不让 Close 被一个不认 ctx 的工具/模型拖死）。
 	//    等过了再关库 → 那几轮不会碰到已关闭的库。
 	h.waitPrompts(promptCloseGrace)
+	// WAL 收口（v4-4-B）：等在跑的 prompt **之后**——那一轮可能还在写 WAL，关早了就是
+	// 往已关的 fd 上写（噪声 + 丢尾部记录）。放在停索引器/关库之前：WAL 与事件库无关，
+	// 但它收得越早越好（磁盘句柄不泄漏）。
+	if err := h.closeWAL(); err != nil {
+		errs = append(errs, err)
+	}
 	if h.ixCancel != nil {
 		h.ixCancel()
 	}
@@ -736,11 +771,19 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 	if strings.TrimSpace(prompt) == "" {
 		return loop.Result{}, errors.New("host: prompt 不能为空")
 	}
+	// W15 成本预算闸门（v4-4-B；**默认不设上限** = BudgetMaxTokens<=0 时 checkBudget 直接
+	// 返回 nil = 零行为变化）。**Run 前**检查：已累计 ≥ 上限 → 拒绝发起本轮（不再烧 token）。
+	if berr := h.checkBudget(ctx, sessionID); berr != nil {
+		return loop.Result{}, berr
+	}
 	lp, err := h.loopFor(ctx, sessionID)
 	if err != nil {
 		return loop.Result{}, err
 	}
 	res, err := lp.Run(ctx, prompt)
+	// W15：**Run 后**再查一次——本轮把累计推过了上限就告警（越界留痕；下一轮才被拒，
+	// 见 checkBudget 的诚实边界：这是 per-Run 粒度，不是 turn 内逐轮刹车）。
+	h.warnIfOverBudget(ctx, sessionID)
 	// 跑完立刻把新事件并进投影 + 发现表：/api/context 与 /api/peers 不必等下一次请求的
 	// 增量扫描。
 	if _, cerr := h.proj.catchUp(ctx); cerr != nil {
@@ -899,6 +942,10 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		// h.blob 开了才非 nil（Config.BlobDir 非空）；阈值 cfg.BlobMaxInline>0 才真正外置。
 		BlobSink:      h.blob,
 		BlobMaxInline: h.cfg.BlobMaxInline,
+		// WAL 预写日志（v4-4-B；nil = 关 = 零行为变化）。h.wal 开了才非 nil
+		//（Config.WalDir 非空）；walFor 懒建 per-session Writer，开失败只告警不拒绝本轮
+		//（WAL 是尽力而为的补充面）。五个写点都在 X1 三段路径**之外**（见 core/loop/wal.go）。
+		WalSink: h.walFor(sessionID),
 	})
 	if err != nil {
 		h.mu.Unlock()

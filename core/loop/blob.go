@@ -213,6 +213,22 @@ func blobSummaryRestPlaceholder(blobID contracts.Ulid, n int) string {
 // blobLog 是 D4 外置失败（fail-open）时的告警出口。用 slog（结构化、可被宿主接管）。
 var blobLog = slog.Default()
 
+// planExternalize（v4-4-B）：在 **tool.call.intent 发布之前**记一条外置计划（blob.plan）。
+//
+// 为什么单独一个写点、且在 intent 之前：写点插在 intent→completed 之间 = 在 X1 关键路径
+// 上多一次落盘，还让"所有写点都在三段路径外"这句话不成立（critic F1）。计划先行、intent
+// 随后 → 窗口内一个写点都不加（X1 落盘序一字不动）。
+//
+// 关（blob 未启用 / 阈值<=0）→ **不记**：没开外置就没有"计划"可写（零行为变化）。
+//
+// turn=0 = 重放路径（重放没有"第几轮"的概念，如实记 0）。
+func (l *Loop) planExternalize(turn int, toolCallID contracts.ProviderId) {
+	if l.blob == nil || l.blobMaxInline <= 0 {
+		return // 关：零行为变化
+	}
+	l.walBlobPlan(turn, string(toolCallID), blobEffectiveThreshold(l.blobMaxInline))
+}
+
 // externalizeResult（D4）：result 超阈值时整体外置 blob，返回 envelope 的 BinaryRef
 // （nil = 不外置）。可能**就地**把 payload.Result 换成摘要形态。
 //
@@ -222,6 +238,9 @@ var blobLog = slog.Default()
 //
 // **有效阈值**（F4）= max(配置阈值, 摘要预算)：保证"外置 = 瘦身"是结构性事实（见
 // blobEffectiveThreshold）；摘要预算随阈值收缩（见 blobSummaryBudget）。
+//
+// **WAL 计划不在这里写**（v4-4-B）：计划写在 intent **之前**（见 planExternalize），
+// 本函数只管"写内容 + 换引用"——窗口内一个写点都不加。
 func (l *Loop) externalizeResult(ctx context.Context, payload *contracts.ToolCallCompletedPayload) *contracts.Ulid {
 	if l.blob == nil || l.blobMaxInline <= 0 {
 		return nil // 关：零行为变化
@@ -233,7 +252,8 @@ func (l *Loop) externalizeResult(ctx context.Context, payload *contracts.ToolCal
 		blobLog.Warn("loop: D4 外置跳过——result 序列化失败（原样内联）", "err", err.Error())
 		return nil
 	}
-	if int64(len(raw)) <= blobEffectiveThreshold(l.blobMaxInline) {
+	threshold := blobEffectiveThreshold(l.blobMaxInline)
+	if int64(len(raw)) <= threshold {
 		return nil // 不大：原样内联（酸测试等价）
 	}
 	// 写 blob（fresh id：实现发号，永不撞已落库的引用 → 不走 ErrConflict 路径）。
