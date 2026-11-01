@@ -668,6 +668,178 @@ func TestEnableRejectsInstanceReplacedDuringAdjudication(t *testing.T) {
 	}
 }
 
+// ---- 12b. 缺口 3 p2-1：在途 Enable 不得吞掉后来的 Disable（lost update）----
+
+// P2-1：裁决**期间**扩展被 Disable（状态被改动）→ Enable 必须拒绝（ErrStale），
+// 且**状态保持 disabled**——后来的 Disable 说了算，在途的 Enable 无权把它覆盖回 enabled
+// （否则"刚停用的扩展又被启用了"，且没人知道）。
+//
+// 复现时序与 P2-5 同款（blockingAdjudicator 在锁外裁决时制造窗口），只是这次窗口里
+// 动的不是"实例身份"（seq）而是"状态"。
+func TestEnableRejectsStateChangedDuringAdjudication(t *testing.T) {
+	adj := &blockingAdjudicator{entered: make(chan string, 4), release: make(chan struct{})}
+	r := New(adj)
+	mustRegister(t, r, meta("ext", "tool", "fs:read"), nil)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Enable(context.Background(), "ext") }()
+
+	<-adj.entered // 裁决已开始（在锁外）
+
+	// 裁决期间：停用（若 Enable 无条件写回 enabled，这次 Disable 就被吞掉了）。
+	if err := r.Disable("ext"); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+
+	close(adj.release) // 放行裁决
+	err := <-done
+	if err == nil {
+		t.Fatalf("Enable 必须拒绝（裁决期间状态被改动 → 无条件写回会吞掉后来的 Disable）")
+	}
+	if !errors.Is(err, ErrStale) {
+		t.Errorf("error %v, 需是 ErrStale", err)
+	}
+	// 错误文案点名"裁决期间状态被改动"（不是"实例被替换"——那会把运维停用误读成换实例）。
+	if !strings.Contains(err.Error(), "裁决期间状态被改动") {
+		t.Errorf("错误文案应点名裁决期间状态被改动: %v", err)
+	}
+	// 关键断言：状态保持 disabled（在途 Enable 不得吞掉后来的 Disable）。
+	if got := stateOf(t, r, "ext"); got != StateDisabled {
+		t.Fatalf("State=%s, want disabled（在途 Enable 不得吞掉后来的 Disable）", got)
+	}
+
+	// 重新 Enable（新裁决，针对当前状态）→ 成功（停用后仍可再启用）。
+	if err := r.Enable(context.Background(), "ext"); err != nil {
+		t.Fatalf("重新 Enable: %v", err)
+	}
+	if got := stateOf(t, r, "ext"); got != StateEnabled {
+		t.Fatalf("State=%s, want enabled", got)
+	}
+}
+
+// P2-1 的另一半：状态**没被**改动时，Enable 照常写回（CAS 不得误伤正常路径）。
+// 这里的"没被改动"= 裁决期间没人动它 → registered → enabled。
+func TestEnableWritesBackWhenStateUnchanged(t *testing.T) {
+	adj := &blockingAdjudicator{entered: make(chan string, 4), release: make(chan struct{})}
+	r := New(adj)
+	mustRegister(t, r, meta("ext", "tool", "fs:read"), nil)
+
+	done := make(chan error, 1)
+	go func() { done <- r.Enable(context.Background(), "ext") }()
+	<-adj.entered
+	close(adj.release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Enable（状态未被改动）应成功: %v", err)
+	}
+	if got := stateOf(t, r, "ext"); got != StateEnabled {
+		t.Fatalf("State=%s, want enabled", got)
+	}
+}
+
+// ---- 12c. 缺口 3 F1：同值 Disable 也必须被看见（比版本，不比状态值）----
+
+// F1：条目**本已是 disabled** 时，裁决窗口内到来的 Disable 是**同值空操作**——
+// 状态**值**没变，但"期间有人动过它"这件事是真的。
+//
+// 比状态值的 CAS 看不见它 → 在途 Enable 照样写回 enabled → **后来的停用被吞**
+// （探针：Disable→Enable(在途)→Disable→最终 enabled = 旋钮失灵）。
+//
+// 比**状态版本号**才看得见：任何状态写（含同值空操作）都抬版本 → 写回前版本对不上
+// → ErrStale，且最终状态保持 disabled。
+func TestEnableRejectsSameValueDisableDuringAdjudication(t *testing.T) {
+	adj := &blockingAdjudicator{entered: make(chan string, 4), release: make(chan struct{})}
+	r := New(adj)
+	mustRegister(t, r, meta("ext", "tool", "fs:read"), nil)
+
+	// 先停用：条目**本已是 disabled**（后面的 Disable 是同值空操作）。
+	if err := r.Disable("ext"); err != nil {
+		t.Fatalf("Disable: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- r.Enable(context.Background(), "ext") }()
+	<-adj.entered // 裁决已开始（在锁外）
+
+	// 裁决期间：**同值** Disable（disabled → disabled，状态值不变）。
+	if err := r.Disable("ext"); err != nil {
+		t.Fatalf("Disable（同值）: %v", err)
+	}
+
+	close(adj.release) // 放行裁决
+	err := <-done
+	if err == nil {
+		t.Fatalf("Enable 必须拒绝（同值 Disable 也是一次状态写 → 否则后来的停用被吞）")
+	}
+	if !errors.Is(err, ErrStale) {
+		t.Errorf("error %v, 需是 ErrStale", err)
+	}
+	if !strings.Contains(err.Error(), "裁决期间状态被改动") {
+		t.Errorf("错误文案应点名裁决期间状态被改动: %v", err)
+	}
+	// 关键断言：最终仍是 disabled（后来的停用没被在途 Enable 吞掉）。
+	if got := stateOf(t, r, "ext"); got != StateDisabled {
+		t.Fatalf("State=%s, want disabled（同值 Disable 不得被在途 Enable 吞掉）", got)
+	}
+
+	// 重新 Enable（新裁决，针对当前版本）→ 成功（停用后仍可再启用）。
+	if err := r.Enable(context.Background(), "ext"); err != nil {
+		t.Fatalf("重新 Enable: %v", err)
+	}
+	if got := stateOf(t, r, "ext"); got != StateEnabled {
+		t.Fatalf("State=%s, want enabled", got)
+	}
+}
+
+// ---- 12d. F1 残留（探针 P5）：deny 路径的空操作撤销也必须留痕 ----
+
+// firstAllowThenDeny：第一次裁决阻塞后 allow，其余一律 deny（模拟"规则中途收紧"）。
+type firstAllowThenDeny struct {
+	entered chan string
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (a *firstAllowThenDeny) Adjudicate(_ context.Context, capability string) contracts.Decision {
+	if a.calls.Add(1) == 1 {
+		a.entered <- capability
+		<-a.release
+		return contracts.Decision{Verdict: contracts.EffectAllow, Reason: sp("allow")}
+	}
+	return contracts.Decision{Verdict: contracts.EffectDeny, Reason: sp("deny")}
+}
+
+// P5：更晚一次 Enable 被拒（deny → revokeEnabled）时，条目**尚未 enabled**——
+// 撤销在状态值上是空操作，但它仍是一次状态写意图，必须抬版本留痕。
+// 不留痕（旧口径只在 state==enabled 时抬版本）→ 在途的 allow 写回 enabled → **拒绝被吞**。
+func TestEnableDenyDuringAdjudicationLeavesTrace(t *testing.T) {
+	adj := &firstAllowThenDeny{entered: make(chan string, 4), release: make(chan struct{})}
+	r := New(adj)
+	mustRegister(t, r, meta("ext", "tool", "fs:read"), nil) // registered（从未 enabled）
+
+	done := make(chan error, 1)
+	go func() { done <- r.Enable(context.Background(), "ext") }() // A：在途，裁决将 allow
+	<-adj.entered                                                 // A 裁决已开始（在锁外）
+
+	// B：更晚的 Enable，裁决被拒（deny）→ revokeEnabled 对未 enabled 条目是状态值空操作。
+	if err := r.Enable(context.Background(), "ext"); !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("B 应 ErrNotAllowed，得到 %v", err)
+	}
+
+	close(adj.release) // 放行 A 的裁决
+	err := <-done
+	if err == nil {
+		t.Fatalf("A 必须拒绝（deny 已在裁决期间发生 → 空操作撤销也是一次状态写，A 的结论已过期）")
+	}
+	if !errors.Is(err, ErrStale) {
+		t.Errorf("error %v, 需是 ErrStale", err)
+	}
+	// 关键断言：拒绝没被吞（条目不得被写回 enabled）。
+	if got := stateOf(t, r, "ext"); got == StateEnabled {
+		t.Fatalf("State=enabled，deny 被在途 allow 吞掉了（P5 回归）")
+	}
+}
+
 // ---- 13. P2-6①：sentinel 错误（errors.Is 可判定）----
 
 func TestSentinelErrors(t *testing.T) {

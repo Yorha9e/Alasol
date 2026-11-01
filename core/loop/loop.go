@@ -70,6 +70,9 @@ const (
 	CodeBadArguments = "bad_arguments"
 	// CodePermDenied 工具所需的权限维度超出本 agent 的**生效权限**（H11/H22 收窄）。
 	CodePermDenied = "permission_denied"
+	// CodeToolDisabled 工具已在注册表停用（registry State=disabled）→ 执行前复查拒绝
+	// （缺口 3：可见集过滤之外的第二层门控，与 runtime/mcpserver 的 checkUsable 同语义）。
+	CodeToolDisabled = "tool_disabled"
 	// CodeLoopError loop 自身出错（模型调用失败 / intent 落盘失败）。
 	CodeLoopError = "loop_error"
 )
@@ -774,6 +777,12 @@ func (l *Loop) collectStrategyTools(a compaction.Assembler) (map[string]compacti
 // 过滤口径（H4 字面）：**deny = 移出模型可见集**（裸工具名 deny）；
 // ask 保持可见——审批回路要靠模型发起调用才走得通，人审发生在调用时刻。
 //
+// **注册表 State 门控（缺口 3，第一层）**：条目 State=disabled（Disable / 能力裁决失败后的
+// revokeEnabled）→ 不进模型可见集——与 runtime/mcpserver 的"停用不暴露"（F1）同口径。
+// 这是双层口径的**第一层**（模型看不到就不会调）；"list 之后才被停用"的运行期窗口由
+// 执行前复查兜底（第二层，见 runToolCall 里 resolveTool 之后的 State 复查）。已注销条目
+// 本来就不在 List 结果里。策略框架工具（strategyTools）不经注册表、没有 State，不受影响。
+//
 // 多 agent（阶段 5）在此叠加两层：
 //   - **type.Tools 过滤**（R5：不暴露即不存在）：若本 agent 在树中且有类型，则只有该类型
 //     Tools 列内的注册工具可见（子 loop 的 tools=type.Tools）；
@@ -810,6 +819,11 @@ func (l *Loop) visibleTools(strategyTools map[string]compaction.FrameworkTool) [
 	for _, e := range entries {
 		if e.Tool == nil {
 			continue // 非工具扩展（kind 不匹配时已被 List 过滤；Tool 为 nil 是装配残缺）
+		}
+		if e.State == registry.StateDisabled {
+			// 缺口 3 第一层（F1 同口径）：停用的条目不进模型可见集（停用不暴露）。
+			// 执行侧另有第二层复查（runToolCall），防"可见集刷新前的运行期停用窗口"。
+			continue
 		}
 		if typeFilter != nil && !typeFilter[e.Tool.Name] {
 			continue // R5：类型未列出的工具不暴露

@@ -11,6 +11,7 @@ import (
 	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/policy"
+	"github.com/Yorha9e/alasol/core/registry"
 )
 
 // runToolCall 执行一次工具调用的三段写路径（X1）。
@@ -26,18 +27,36 @@ import (
 //	tool.call.intent → （不执行）tool.call.failed      ← deny / 工具缺失 / 执行失败
 //	tool.call.intent → 执行 → tool.call.completed      ← 执行成功
 func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, st *runState) (string, int, error) {
-	// a. policy 先判（fail-close）：判定只约束发起时刻（M9/陷阱 15），快照进 intent。
-	dec := policy.Decide(ctx, l.policy, l.approver, policy.Query{
-		Tool:      tc.Name,
-		Args:      tc.Args,
-		SessionID: &l.sessionID,
-		AgentID:   &l.agentID,
-	})
-
 	// 工具解析（v2-S1）：策略框架工具（recall / stage）优先，其次注册表；二者都走同一 X1 路径。
+	//
+	// 解析**前置**到策略判定之前（缺口 3 p3-1）：State 门控要在策略链**之前**短路。
 	rt := l.resolveTool(tc.Name, st.strategyTools)
 	desc := rt.desc
 	known := rt.known
+
+	// State 门控（第二层，缺口 3）：注册表条目 State=disabled → 本次调用直接走 disabled
+	// 失败路径，**不调 policy.Decide**。
+	//
+	// 为什么排在策略链**之前**（p3-1）：
+	//   - **不产生 ask 人审**：停用的工具压根不可执行——让人审"要不要执行"是白问
+	//     （人审台前不该出现不可用的东西）；
+	//   - **不误归因 policy_deny**：停用是**注册表事实**，不是策略判定结果——归到
+	//     policy_deny 会让审计把"运维停用"误读成"策略拒绝"。
+	//
+	// 框架工具（strategyTools 命中）不经注册表、没有 State → 不走此判定（维持现状）。
+	disabled := rt.fromRegistry && rt.state == registry.StateDisabled
+
+	// a. policy 判定（fail-close）：判定只约束发起时刻（M9/陷阱 15），快照进 intent。
+	//    停用工具**短路策略链**（不问人、不误归因）→ dec 保持零值（policy 未判定）。
+	var dec contracts.Decision
+	if !disabled {
+		dec = policy.Decide(ctx, l.policy, l.approver, policy.Query{
+			Tool:      tc.Name,
+			Args:      tc.Args,
+			SessionID: &l.sessionID,
+			AgentID:   &l.agentID,
+		})
+	}
 
 	// 参数形状校验（契约边界）：arguments 必须是合法 JSON **对象**。
 	// 不满足时 arguments 置 {}（intent 仍要落盘，但不能落一个违反契约的载荷），
@@ -46,12 +65,15 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 
 	// b. ① intent durable 落盘（先于任何执行；落盘失败就不执行，X1）。
 	intent := contracts.ToolCallIntentPayload{
-		ToolCallID:     tc.ID, // provider 黑盒 id 原样（S4/S5）
-		ToolName:       tc.Name,
-		Arguments:      args,
-		Idempotent:     desc != nil && desc.Idempotent, // 缺省 false（M7：不声明不自动重试）
-		Replay:         replayOf(desc),                 // 缺省 unsafe（X2：未知结果不盲目重放）
-		PolicySnapshot: policySnapshot(dec),            // M9/陷阱 15
+		ToolCallID: tc.ID, // provider 黑盒 id 原样（S4/S5）
+		ToolName:   tc.Name,
+		Arguments:  args,
+		Idempotent: desc != nil && desc.Idempotent, // 缺省 false（M7：不声明不自动重试）
+		Replay:     replayOf(desc),                 // 缺省 unsafe（X2：未知结果不盲目重放）
+		// M9/陷阱 15：判定时刻的策略快照。
+		// 停用工具**短路策略链**（不问人、不误归因）→ policy 未判定 → dec 是零值 →
+		// 快照按 policySnapshot(零值) 的既有输出填（verdict 空串；**不伪造** allow/deny）。
+		PolicySnapshot: policySnapshot(dec),
 	}
 	intentEv, err := l.newEvent(KindToolCallIntent, nil, intent)
 	if err != nil {
@@ -70,14 +92,26 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	events := n
 	intentID := intentEv.ID
 
-	// c'. 参数不合契约 → 普通失败（M1/M8：失败是普通事件，不是特殊通道）：
+	// c'. 停用工具短路失败路径（缺口 3 第二层，p3-1）：State=disabled → 直接落 failed，
+	// code=tool_disabled（**不是** policy_deny、也不是 tool_not_found）。
+	//
+	// X1 三段形状一字不动：intent 已落盘 → 补一条 failed → completed 不落 → 执行器零调用。
+	//
+	// 排在参数校验 / 权限 / 策略判定**之前**：停用的工具压根不可用——先告诉模型"它被停用了"
+	//（改参数也救不回来），别让它去修参数；更不让人审（ask）与误归因（policy_deny）。
+	if disabled {
+		msg := fmt.Sprintf("fail-close: 工具 %q 已停用（registry State=disabled）→ 不执行；请改用可见工具列表里的工具，或等待重新启用后再调用", tc.Name)
+		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeToolDisabled, nil, events)
+	}
+
+	// c''. 参数不合契约 → 普通失败（M1/M8：失败是普通事件，不是特殊通道）：
 	// intent 已落盘（arguments={}），补一条 failed，模型可读地说明怎么改，loop 继续。
 	if argsProblem != "" {
 		msg := fmt.Sprintf("参数不是合法 JSON 对象：%s；请重新给出 JSON 对象（形如 {\"key\":\"value\"}）", argsProblem)
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeBadArguments, badArgsDetails(tc.Args), events)
 	}
 
-	// c''. 生效权限收窄（H11/H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予）：
+	// c'''. 生效权限收窄（H11/H22：实际 = 请求 ∩ 策略上限 ∩ 父级授予）：
 	// 声明的权限是**上限**，超出即 deny，**不可被全局 allow 规则放宽**。
 	//
 	// side 从**解析结果**的描述取（框架工具的副作用档位也算数——p3 修：此前只看注册表，
@@ -116,6 +150,9 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 
 	// allow 之后的装配检查：未知工具 / 无工具描述 / 执行器不是 ToolExecutor
 	// → 落 failed，不进执行（fail-close：宁可拒绝也不猜）。
+	//
+	// 注：State=disabled 的检查**不在这里**——它排在策略链之前（见上面的 c'.），
+	// 停用工具压根走不到这里（不进策略链、不产生 ask、不误归因 policy_deny）。
 	if !known {
 		msg := fmt.Sprintf("fail-close: 工具 %q 未在注册表注册（模型给出的工具名查无此扩展）→ 不执行；请只使用可见工具列表里的工具", tc.Name)
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeToolNotFound, nil, events)
@@ -131,6 +168,28 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeExecutorMissing, nil, events)
 	}
 	exec := rt.exec
+
+	// ②″ 执行前**再查一次** State（第二层门控的真正时点，与 runtime/mcpserver 的
+	// checkUsable 对齐——"list/判定之后、执行之前"被停用的窗口）：
+	//
+	// 为什么必须**再读一次**（而不是沿用 resolveTool 时读到的快照）：那份快照是**判定
+	// 时刻**的事实，而"ask 规则 → 人审等待"这段窗口可能有几十秒——期间运维完全可能
+	// 停用该工具。快照停在判定时刻 → 审批放行后工具照常执行 → **停用不生效**
+	// （探针：ask 规则 + 审批期间 Disable → 执行器被调 1 次）。
+	//
+	// 处置：读到 disabled → 走既有失败路径（CodeToolDisabled；intent 已落、failed 落、
+	// completed 不落——X1 三段形状一字不动），文案点名"执行前复查发现已停用"。
+	//
+	// 框架工具（strategyTools 命中）不经注册表 → 不查（维持现状；也不能拿同名注册表
+	// 条目的状态去卡框架工具）。
+	//
+	// 注：这里**不**再查"条目是否还在"（未注册的处置口径本刀不扩——见报告）。
+	if rt.fromRegistry {
+		if cur, ok := l.registry.Get(tc.Name); ok && cur.State == registry.StateDisabled {
+			msg := fmt.Sprintf("fail-close: 工具 %q 执行前复查发现已停用（registry State=disabled）→ 不执行；该工具在本次调用期间被停用，请改用可见工具列表里的工具，或等待重新启用后再调用", tc.Name)
+			return l.failToolCall(ctx, &intentID, tc.ID, msg, CodeToolDisabled, nil, events)
+		}
+	}
 
 	// ②′ 执行前护栏（fail-close）：Run ctx 已取消/超时 → **绝不执行**。
 	//
@@ -207,8 +266,12 @@ type resolvedTool struct {
 	desc     *contracts.Tool // 工具描述（框架工具必有；注册表工具可能为 nil）
 	exec     core.ToolExecutor
 	known    bool
-	metaKind string // 注册表 kind（错误信息用；框架工具 = "tool"）
-	impl     any    // 原始注册实现（错误信息用；框架工具 = 其 Exec）
+	metaKind string         // 注册表 kind（错误信息用；框架工具 = "tool"）
+	impl     any            // 原始注册实现（错误信息用；框架工具 = 其 Exec）
+	state    registry.State // 注册表 State（执行前复查用；框架工具 = 零值 ""，不经注册表恒非 disabled）
+	// fromRegistry 标记"这次解析走的是注册表分支"（框架工具 = false）。
+	// State 门控只对注册表条目生效——框架工具不经注册表、没有 State 可言（缺口 3 p3-1）。
+	fromRegistry bool
 }
 
 // resolveTool 解析一个工具：**策略框架工具（recall / stage）优先**，其次注册表。
@@ -220,6 +283,10 @@ type resolvedTool struct {
 // **优先级与可见集一致**（F12）：可见集（visibleTools）里同名工具只出现一次，执行侧
 // 也只解析到一个实现。同名在装配期就已 fail-close 拒绝（collectStrategyTools），
 // 所以这里的"框架工具优先"只是**兜底顺序**，不是静默遮蔽。
+//
+// state 是注册表条目的 State（缺口 3 执行前复查的输入）：框架工具不经注册表，零值
+// （""）恒不等于 StateDisabled——State 门控只作用于注册表条目，与可见集第一层同口径。
+// fromRegistry 把这条口径写成**显式判据**（不靠"零值恰好不等于 disabled"）。
 func (l *Loop) resolveTool(name string, strategyTools map[string]compaction.FrameworkTool) resolvedTool {
 	if ft, ok := strategyTools[name]; ok {
 		d := ft.Desc
@@ -230,7 +297,15 @@ func (l *Loop) resolveTool(name string, strategyTools map[string]compaction.Fram
 	if e, ok := entry.Impl.(core.ToolExecutor); ok {
 		exec = e
 	}
-	return resolvedTool{desc: entry.Tool, exec: exec, known: known, metaKind: entry.Meta.Kind, impl: entry.Impl}
+	return resolvedTool{
+		desc:         entry.Tool,
+		exec:         exec,
+		known:        known,
+		metaKind:     entry.Meta.Kind,
+		impl:         entry.Impl,
+		state:        entry.State,
+		fromRegistry: true,
+	}
 }
 
 // 生效权限 = 请求 ∩ ceiling ∩ 父级授予（树里节点的 perm；闸门③保证子 ⊆ 父）。

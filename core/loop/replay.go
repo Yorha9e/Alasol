@@ -8,6 +8,7 @@ import (
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/durable"
+	"github.com/Yorha9e/alasol/core/registry"
 )
 
 // 编译期证明：*Loop 实现 durable.Replayer（X2 第一类 safe / verify 不通过 的重放执行侧）。
@@ -22,6 +23,8 @@ var _ durable.Replayer = (*Loop)(nil)
 // 与 runToolCall 的区别（刻意）：
 //   - **不重跑策略链**：该操作在 T0 已判定放行（policy_snapshot 记在 intent 里，M9「判定只约束
 //     发起时刻」）——resume 重放的是**同一个已授权操作**的未知结果，不是发起新调用；
+//   - **但查注册表 State**：State 是**装配事实**不是策略判定——工具在两次进程之间被停用
+//     了就不该再执行（缺口 3 p3-6；否则"停用"在崩溃续跑路径上失效）；
 //   - **不走模型**：直接按 op.Intent 执行工具，不发起 provider.Run；
 //   - 归属用 op.SessionID / op.AgentID（可能是子 agent 的调用，未必是 l.agentID）。
 //
@@ -44,11 +47,24 @@ func (l *Loop) Replay(ctx context.Context, op durable.Op) (durable.ReplayResult,
 	entry, known := l.registry.Get(intent.ToolName)
 	desc := entry.Tool
 
-	// 装配检查（fail-close：工具没了/实现不是执行器 → 落 failed，不进执行）。
+	// 装配检查（fail-close：工具没了/已停用/实现不是执行器 → 落 failed，不进执行）。
 	if !known || desc == nil {
 		return l.replayFailed(ctx, op, causation,
 			fmt.Sprintf("fail-close: 工具 %q 未在注册表注册或无工具描述 → 重放时无法执行", intent.ToolName),
 			CodeToolNotFound)
+	}
+	// State 复查（缺口 3 p3-6）：重放路径**也**要查注册表 State。
+	//
+	// 为什么：重放**不重跑策略链**（该操作在 T0 已判定放行，见本函数头注释），但
+	// "注册表 State=disabled"是**装配事实**、不是策略判定——工具在两次进程之间被运维停用
+	// 了，重放就**不该**再执行它（否则"停用"在崩溃续跑路径上失效 = 又一个假旋钮）。
+	//
+	// 处置与 runToolCall 同款：走既有失败形态（replayFailed：落一条 tool.call.failed、
+	// 返回 OK=false + 失败码），失败码复用 tool_disabled（与执行路径同一码）。
+	if entry.State == registry.StateDisabled {
+		return l.replayFailed(ctx, op, causation,
+			fmt.Sprintf("fail-close: 工具 %q 已停用（registry State=disabled）→ 重放时不执行", intent.ToolName),
+			CodeToolDisabled)
 	}
 	exec, ok := entry.Impl.(core.ToolExecutor)
 	if !ok {

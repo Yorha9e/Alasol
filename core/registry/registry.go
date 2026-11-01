@@ -23,7 +23,9 @@ var (
 	ErrAlreadyRegistered = errors.New("registry: 扩展已注册")
 	// ErrNotAllowed：能力裁决未获准（deny / ask / 无命中）→ 拒绝启用（fail-close，H8）。
 	ErrNotAllowed = errors.New("registry: 能力未获准")
-	// ErrStale：裁决期间同名扩展被注销并重新注册 → 裁决背书的是另一个实例（P2-5）。
+	// ErrStale：裁决期间同名扩展被注销并重新注册 → 裁决背书的是另一个实例（P2-5）；
+	// 也用于"裁决期间扩展的**状态**被改动"（如 Disable）→ 写回会吞掉后来的状态
+	// （缺口 3 p2-1：lost update）→ 拒绝启用，需重新 Enable。
 	ErrStale = errors.New("registry: 扩展实例已在能力裁决期间被替换")
 )
 
@@ -66,6 +68,15 @@ type record struct {
 	tool  *contracts.Tool
 	state State
 	seq   uint64 // 注册序号（实例身份：同名重注册会换号）
+	// stateVer 是**状态版本号**（单调递增）：**任何**状态写操作都抬版本——
+	// Enable 写回 / Disable / **同值 Disable**（幂等停用也是一次写）/ revokeEnabled。
+	//
+	// 为什么不能只比状态**值**（缺口 3 F1）：条目本已是 disabled 时，裁决窗口内到来的
+	// Disable 是**同值空操作**——状态值没变，但"有人在这期间动过它"这件事是真的。
+	// 比值看不见它 → 在途的 Enable 照样写回 enabled → **后来的停用被吞**
+	// （探针：Disable→Enable(在途)→Disable→最终 enabled）。
+	// 比版本则任何状态写都看得见（包括同值空操作）→ 写回一律 ErrStale。
+	stateVer uint64
 }
 
 // New 构造注册表。
@@ -140,7 +151,9 @@ func (r *Registry) register(meta contracts.ExtensionMeta, impl any, tool *contra
 //     再返回 ErrNotAllowed；
 //   - 全部获准（或无能力声明）→ State=enabled；
 //   - 幂等：已 enabled 时重新裁决（规则可能已变），全部获准则保持 enabled；
-//   - 裁决期间同名扩展被注销/重注册 → 拒绝启用（ErrStale），必须重新 Enable。
+//   - 裁决期间同名扩展被注销/重注册 → 拒绝启用（ErrStale），必须重新 Enable；
+//   - 裁决期间扩展的**状态被写过**（Disable / 同值 Disable / revokeEnabled）→ 拒绝启用
+//     （ErrStale），必须重新 Enable（判据是**状态版本号**，见下）；
 //
 // 裁决在锁外进行（E5：隔离外部代码；避免持锁调用回调导致死锁），
 // 裁决期间被 Unregister 的扩展不会被启用。
@@ -148,10 +161,12 @@ func (r *Registry) Enable(ctx context.Context, name string) error {
 	if r == nil {
 		return errors.New("registry: 注册表为 nil")
 	}
-	rec, seq, ok := r.snapshot(name)
+	rec, seq, ver, ok := r.snapshot(name)
 	if !ok {
 		return fmt.Errorf("%w: 扩展 %q 未注册", ErrNotFound, name)
 	}
+	// CAS 的**期望值**：裁决开始时的状态与**状态版本号**（写回时核对"期间有没有人动过它"）。
+	wantState := rec.State
 
 	adj := r.Adjudicator()
 	for _, cap := range rec.Meta.Capabilities {
@@ -174,17 +189,46 @@ func (r *Registry) Enable(ctx context.Context, name string) error {
 	if cur.seq != seq {
 		// P2-5（TOCTOU）：裁决期间同名扩展被注销并重新注册 → 刚才的裁决背书的是
 		// **另一个实例**（能力可能完全不同）→ 拒绝启用，要求调用方重新 Enable。
+		//
+		// 这一条**先于**下面的状态版本判定：换实例连 seq 都变了（新实例的版本号从 0 起），
+		// 版本比对没有意义 → 两条判定不打架：seq 先拦。
 		return fmt.Errorf("%w: 扩展 %q 在能力裁决期间被注销并重新注册（裁决针对的是另一个实例，能力可能已变）→ 拒绝启用，请重新 Enable",
 			ErrStale, name)
 	}
+	// CAS（缺口 3 p2-1 + F1，lost update）：裁决期间**状态被写过** → 这次裁决的结论已经过期，
+	// 无条件写回 enabled 会把后来的状态**吞掉**（典型：在途 Enable 吞掉后来的 Disable
+	// ——运维刚停用的扩展又被"启用"了，且没人知道）。
+	//
+	// 判据是**状态版本号**（不是状态值！）：条目本已是 disabled 时，裁决窗口内到来的
+	// Disable 是**同值空操作**——状态值没变，但"期间有人动过它"是真的。比对状态值
+	// 看不见同值空操作 → 停用照样被吞（探针：Disable→Enable(在途)→Disable→最终 enabled）。
+	// 版本号被**任何**状态写抬起来（同值 Disable 也抬）→ 这里看得见。
+	//
+	// 处置：写回前在锁内核对版本；版本变了 → 拒绝启用（ErrStale，复用既有哨兵），
+	// **保持当前状态不变**（后来的 Disable 说了算），调用方需重新 Enable。
+	//
+	// 唯一例外：版本变了但当前状态**已是 enabled**。那只可能是**另一个 Enable** 写回的结果
+	// （Disable / revokeEnabled 只会写 disabled → "当前是 enabled" ⟺ 最后一次状态写是 Enable），
+	// 本次写回 enabled 是**空操作**、不吞掉别人的状态 → 放行（并发 Enable 幂等，见
+	// TestConcurrentEnableSameExtension：并发 Enable 必须**都**成功，不能自相残杀）。
+	if cur.stateVer != ver && cur.state != StateEnabled {
+		return fmt.Errorf("%w: 扩展 %q 在能力裁决期间状态被改动（裁决时=%s，当前=%s，状态版本 %d→%d）→ 拒绝启用，请重新 Enable",
+			ErrStale, name, wantState, cur.state, ver, cur.stateVer)
+	}
 	cur.state = StateEnabled
+	cur.stateVer++ // 任何状态写都抬版本（下一轮 Enable 的 CAS 期望值随之更新）
 	return nil
 }
 
 // revokeEnabled 把已启用的扩展置为 disabled（fail-close）。
 //
-// 只动 enabled 的条目：从未启用的（registered）保持 registered —— 两者都不是
+// 只动 enabled 的条目的状态：从未启用的（registered）保持 registered —— 两者都不是
 // "已启用"，但 registered 更能表达"还没启用过"。
+//
+// **任何情况都抬状态版本号**（含"状态没变"的空操作）：撤销是一次真实的状态写意图
+// （"有人在这期间动过它"）。deny 路径的撤销若在条目未 enabled 时不抬版本，
+// 在途的 allow 写回会把那次拒绝**吞掉**（缺口 3 F1 同款洞：探针 P5——
+// 更晚的 deny 被拒后版本没动，早先的 allow 照样写回 enabled）。
 func (r *Registry) revokeEnabled(name string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -195,9 +239,13 @@ func (r *Registry) revokeEnabled(name string) {
 	if rec.state == StateEnabled {
 		rec.state = StateDisabled
 	}
+	rec.stateVer++
 }
 
 // Disable 停用扩展（幂等：任何状态都可 Disable，disabled 再 Disable 是空操作）。
+//
+// **同值 Disable 也抬状态版本号**：它是一次真实的状态写（"有人在这期间动过它"），
+// 只是结果值相同——比状态值看不见它，比版本看得见（缺口 3 F1）。
 func (r *Registry) Disable(name string) error {
 	if r == nil {
 		return errors.New("registry: 注册表为 nil")
@@ -209,6 +257,7 @@ func (r *Registry) Disable(name string) error {
 		return fmt.Errorf("%w: 扩展 %q 未注册", ErrNotFound, name)
 	}
 	rec.state = StateDisabled
+	rec.stateVer++
 	return nil
 }
 
@@ -283,18 +332,21 @@ func (r *Registry) SetHealth(name string, h contracts.ExtensionHealth) error {
 	return nil
 }
 
-// snapshot 在锁内取一条记录的深拷贝与注册序号（供锁外使用）。
+// snapshot 在锁内取一条记录的深拷贝、注册序号与状态版本号（供锁外使用）。
 //
 // 注册序号是**实例身份**：同名扩展被注销后重新注册会换号 → Enable 能识别
 // "裁决期间换了实例"（P2-5）。
-func (r *Registry) snapshot(name string) (Entry, uint64, bool) {
+//
+// 状态版本号是**状态写次数**：任何状态写都抬它 → Enable 能识别"裁决期间状态被动过"
+// （缺口 3 p2-1 + F1；比状态值更严：同值空操作也抬版本）。
+func (r *Registry) snapshot(name string) (Entry, uint64, uint64, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	rec, ok := r.entries[name]
 	if !ok {
-		return Entry{}, 0, false
+		return Entry{}, 0, 0, false
 	}
-	return entryOf(rec), rec.seq, true
+	return entryOf(rec), rec.seq, rec.stateVer, true
 }
 
 // entryOf 把内部记录转成对外条目（Meta 与 Tool 已深拷贝）。

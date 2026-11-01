@@ -35,6 +35,8 @@ var httpLog = slog.Default()
 //	GET /api/git                 → gitView（G17 git 观测面：hub 工作目录 branch/dirty/last_commit；
 //	                               拉式现采、HTTP-only **不进事件流**；?path= 覆盖采样目录；非仓库 → repo=false 如实报）
 //	GET /api/extensions          → [ExtensionView, ...]（扩展注册表全 kind 快照 + Health，只读；v4-5）
+//	POST /api/extensions/{name}/enable  → {"ok":true}（E3 能力裁决：200 / 403 缺能力 / 404 未注册 / 409 ErrStale）
+//	POST /api/extensions/{name}/disable → {"ok":true}（软停用幂等：200 / 404 未注册；停用即被 loop+MCP 两层门控拒）
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12）
 //	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
 //	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
@@ -179,8 +181,11 @@ func (h *Hub) Handler() http.Handler {
 	// 只做 HTTP 面（拉式现采）、**不进事件流**——git.state 事件走 F7 全链成本高，且
 	// git 状态是进程本地派生观测（非事实流事实）。详见 host/git.go。
 	reg("GET", "/api/git", h.serveGit)
-	// 扩展注册表管理/观测面（v4-5 extension runtime 收口）：全 kind 快照 + Health（只读）。
+	// 扩展注册表管理/观测面（v4-5 extension runtime 收口 + 缺口 3 启停端点）：
+	// 全 kind 快照 + Health（只读）；enable 走 E3 能力裁决、disable 是软停用（可再 enable）。
 	reg("GET", "/api/extensions", h.serveExtensions)
+	reg("POST", "/api/extensions/{name}/enable", h.serveExtensionEnable)
+	reg("POST", "/api/extensions/{name}/disable", h.serveExtensionDisable)
 	reg("GET", "/api/sessions", h.serveSessions)
 	// 开新会话的 REST 入口（v3-S5 ①）：与 GET /api/sessions 同路径、不同方法
 	// （reg 的 probe/tbl 会把两种方法都记进 405 口径）。
