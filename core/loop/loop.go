@@ -419,6 +419,10 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 
 	// 每次 Run 的局部可变状态（不进 Loop 字段 → Loop 保持无可变状态以支持并发 Run）。
 	st := &runState{}
+	// G13 run 归组（2026-11-01 v4-7）：本次 Run 的判别位——Run 起始生成 ULID，随
+	// emitFunc 闭包带进每条 model.delta 的 run_id。**Run 局部变量**（不进 Loop 字段，
+	// 并发 Run 各持各的）：订阅端按 (run_id, turn) 归组，同 session 并发 Run 不再撞号。
+	runID := core.NewUlid()
 	// 无论从哪条路径返回，都把本次累积的污点级写进 Result（Q7；空归一为 clean）。
 	defer func() { res.Taint = normalizeTaint(st.acc.level) }()
 
@@ -526,7 +530,7 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 因此重试口径收敛在 provider 一处（runtime/provider/openai 的 providerRetryPolicy），
 		// 工具调用侧的重试另走 X1 三段写路径 + 契约 Idempotent/Replay 声明（M7），
 		// 不由本方法代劳。
-		mr, err := l.provider.Run(ctx, req, l.emitFunc(ctx, turn))
+		mr, err := l.provider.Run(ctx, req, l.emitFunc(ctx, turn, runID))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// 取消导致的失败按取消处理（不要把"被取消"包装成模型错误）。
@@ -884,10 +888,11 @@ func (l *Loop) toolVisible(name string) bool {
 // 其余 kind（toolcall.* / done / error）v0 仍不转发：零行为变化（X1 三段写路径与
 // user.prompt/model.turn 旁路的形状一字不动，delta 是**新旁路**）。
 //
-// 为什么是工厂而不是 Loop 方法：delta 载荷要带**本轮次号**（ModelDeltaPayload.turn），
-// 发布还要受 Run 的 ctx 约束——两者都是 Run 的局部量，闭包捕获即可，Loop 本身保持
-// 无可变状态（并发 Run 安全，与 harness 的 mockProvider 也照旧工作）。
-func (l *Loop) emitFunc(ctx context.Context, turn int) func(core.ProviderEvent) {
+// 为什么是工厂而不是 Loop 方法：delta 载荷要带**本轮次号**（ModelDeltaPayload.turn）与
+// **本次 Run 的判别位**（ModelDeltaPayload.run_id，G13 归组），发布还要受 Run 的 ctx
+// 约束——三者都是 Run 的局部量，闭包捕获即可，Loop 本身保持无可变状态（并发 Run 安全，
+// 与 harness 的 mockProvider 也照旧工作）。
+func (l *Loop) emitFunc(ctx context.Context, turn int, runID contracts.Ulid) func(core.ProviderEvent) {
 	return func(ev core.ProviderEvent) {
 		switch ev.Kind {
 		case core.KindTextDelta, core.KindReasoningDelta:
@@ -895,7 +900,7 @@ func (l *Loop) emitFunc(ctx context.Context, turn int) func(core.ProviderEvent) 
 			// 流事件：不入库、不回放，崩溃后本轮输出整轮蒸发；WAL 至少多保存一些）。
 			// 预写口径：WAL 先、流事件后（WAL 是"正式写之前"的中间态）。
 			l.walTurnDelta(turn, ev)
-			l.publishModelDelta(ctx, turn, ev)
+			l.publishModelDelta(ctx, turn, runID, ev)
 		}
 		// 其它 kind（toolcall.start/delta、done、error）：v0 不转发。工具调用的
 		// 事实已由 X1 三段写路径完整记录（intent/completed/failed），流式副本是冗余。

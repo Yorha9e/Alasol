@@ -31,6 +31,48 @@ import (
 // toolNameGitStatus 是 git_status 工具名（注册表 key / 模型调用名 / 事件里三处一致）。
 const toolNameGitStatus = "git_status"
 
+// GitStatus 是一次 git 状态探测的结构化结果。
+//
+// 共享口径（G17 git 观测，v4-7 后半）：git_status 工具与 host 的 GET /api/git
+// 观测面用**同一套探测逻辑**（probeGitStatus）——两面看到的 branch/dirty/last_commit
+// 恒同源，不会一边说 dirty 一边说 clean。
+type GitStatus struct {
+	// Repo = 目录在 git 仓库里且能读到分支（false 时其余字段缺省，Error 点名原因）。
+	Repo bool `json:"repo"`
+	// Branch 当前分支名（Repo=true 时非空）。
+	Branch string `json:"branch,omitempty"`
+	// Dirty 工作区是否有未提交改动（Repo=true 时才有意义；指针区分"没探测到"与 false）。
+	Dirty *bool `json:"dirty,omitempty"`
+	// LastCommit 最近一次提交摘要（空仓库无提交 = "（无提交）"）。
+	LastCommit string `json:"last_commit,omitempty"`
+	// Error 探测失败的原因（Repo=false 时非空；文案与工具错误同源，M5）。
+	Error string `json:"error,omitempty"`
+}
+
+// SnapshotGitStatus 用真实 os/exec 探测 dir 的 git 状态（dir 空 = 进程 cwd）。
+//
+// **只读**：只跑 rev-parse / status --porcelain / log -1 三条只读子命令，不经 shell
+// （无注入面，陷阱 8 的反面）。非仓库 / git 不可用 → Repo=false + Error（不是 panic、
+// 不是空结构——观测面要能如实说"这里不是仓库"）。
+//
+// 与 git_status 工具共享 probeGitStatus：同一逻辑、两处出口（工具给模型、HTTP 面给 GUI）。
+func SnapshotGitStatus(ctx context.Context, dir string) GitStatus {
+	e := &GitStatusExecutor{}
+	p, err := e.probeGitStatus(ctx, dir)
+	if err != nil {
+		return GitStatus{Repo: false, Error: err.Error()}
+	}
+	dirty := p.dirty
+	return GitStatus{Repo: true, Branch: p.branch, Dirty: &dirty, LastCommit: p.last}
+}
+
+// gitProbe 是探测中间结果（分支 / 是否 dirty / 最近提交摘要）。
+type gitProbe struct {
+	branch string
+	dirty  bool
+	last   string
+}
+
 // GitStatusDescriptor 是 git_status 工具的跨边界描述（给模型 + 给策略链）。
 func GitStatusDescriptor() contracts.Tool {
 	return contracts.Tool{
@@ -101,13 +143,34 @@ func (e *GitStatusExecutor) Execute(ctx context.Context, intent contracts.ToolCa
 	}
 	dir := strings.TrimSpace(args.Path)
 
+	p, err := e.probeGitStatus(ctx, dir)
+	if err != nil {
+		return contracts.ToolResult{}, err
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "branch: %s\n", p.branch)
+	if p.dirty {
+		b.WriteString("dirty: true\n")
+	} else {
+		b.WriteString("dirty: false\n")
+	}
+	fmt.Fprintf(&b, "last_commit: %s\n", p.last)
+	return resultText(b.String()), nil
+}
+
+// probeGitStatus 探测一次 git 状态（工具 Execute 与 SnapshotGitStatus 共享的核心逻辑）。
+//
+// lookPath / run 走 e 的注入点（nil = 真实 os/exec）；错误文案是**模型可自我修正**的
+// 形态（M5）——点名 git / PATH / git 仓库，而不是透底层 exec 报错。
+func (e *GitStatusExecutor) probeGitStatus(ctx context.Context, dir string) (gitProbe, error) {
 	// git 可用性检查（git 不可用 → 明确、可自我修正的错误，M5）。
 	look := e.lookPath
 	if look == nil {
 		look = exec.LookPath
 	}
 	if _, err := look("git"); err != nil {
-		return contracts.ToolResult{}, fmt.Errorf(
+		return gitProbe{}, fmt.Errorf(
 			"%s: 系统找不到 git 可执行文件（%v）；请先安装 git，或确认它在 PATH 里", toolNameGitStatus, err)
 	}
 
@@ -118,13 +181,13 @@ func (e *GitStatusExecutor) Execute(ctx context.Context, intent contracts.ToolCa
 
 	branch, err := gitTrim(ctx, run, dir, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
-		return contracts.ToolResult{}, fmt.Errorf(
+		return gitProbe{}, fmt.Errorf(
 			"%s: 读取当前分支失败（目录 %q 不是 git 仓库或 git 报错：%v）；请确认 path 指向一个 git 仓库根目录",
 			toolNameGitStatus, dirOrCWD(dir), err)
 	}
 	status, err := gitTrim(ctx, run, dir, "status", "--porcelain")
 	if err != nil {
-		return contracts.ToolResult{}, fmt.Errorf(
+		return gitProbe{}, fmt.Errorf(
 			"%s: 读取工作区状态失败（%v）；请确认 path 指向一个 git 仓库根目录", toolNameGitStatus, err)
 	}
 	last, err := gitTrim(ctx, run, dir, "log", "-1", "--pretty=format:%h %s (%cr, %an)")
@@ -132,16 +195,7 @@ func (e *GitStatusExecutor) Execute(ctx context.Context, intent contracts.ToolCa
 		// 空仓库（无提交）时 git log 会失败：这不是“路径错”，给出可读收场。
 		last = "（无提交）"
 	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "branch: %s\n", branch)
-	if status != "" {
-		b.WriteString("dirty: true\n")
-	} else {
-		b.WriteString("dirty: false\n")
-	}
-	fmt.Fprintf(&b, "last_commit: %s\n", last)
-	return resultText(b.String()), nil
+	return gitProbe{branch: branch, dirty: status != "", last: last}, nil
 }
 
 // gitTrim 执行一次 git 子命令并去掉首尾空白（git 输出常带换行）。

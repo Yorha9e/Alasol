@@ -102,12 +102,13 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 		// **没人来得及答**（审批失败 / 无人应答 / ctx 取消或超时）是两种事实，文案必须
 		// 可区分（审计靠它分辨"被拒"与"没人答"）。
 		//
-		// 判据取**判定里记下的成因**（dec.Reason），**不取事后读到的 ctx.Err() 快照**——
-		// 两者是不同瞬间：人明确拒绝后 ctx 可能恰好到期（判据竞态），按快照加"超时"前缀
-		// 会把"被拒绝"误记成"没人来得及答"，审计归因就错了。
+		// 判据取**判定里记下的成因**（优先 contracts.Decision.Code 结构化成因码，
+		// code 缺省才退回 Reason 文案匹配），**不取事后读到的 ctx.Err() 快照**——
+		// ctx 快照是**另一个瞬间**的事实：人明确拒绝后 ctx 可能恰好到期（判据竞态），
+		// 按快照加"超时"前缀会把"被拒绝"误记成"没人来得及答"，审计归因就错了。
 		// 注意：此处无论哪种收场都**不执行**（deny 路径本来就不走执行）。
 		msg := denyMessage(tc.Name, dec, known)
-		if isNoAnswerDeny(dec.Reason) {
+		if isNoAnswerDeny(dec) {
 			msg = denyTimeoutPrefix + msg
 		}
 		return l.failToolCall(ctx, &intentID, tc.ID, msg, code, policySnapshot(dec), events)
@@ -484,23 +485,46 @@ const denyTimeoutPrefix = "审批未放行（超时/无人应答/审批失败，
 
 // isNoAnswerDeny 判定 deny 的成因是不是"**没人应答**"这一类（非人审明确拒绝）。
 //
-// 判据是**判定里记下的原因**（contracts.Decision.Reason）——成因标记与 core/policy、
-// host 协议审批、runtime 终端审批的 fail-close 文案同源：
+// 判据优先取**结构化成因码**（contracts.Decision.Code，v4-7 后半 F7 只增）：
 //
+//   - approval_failed / approval_context_ended → 没人来得及答（审批人报错/超时、
+//     审批前上下文已取消）；
+//   - approval_denied → "人审未放行"——但**协议面/终端面的"无人应答"也走 deny 响应**
+//     （Approver 返回 deny 而非 error，note 里写"无人应答"），故此码仍要**文案兜底**：
+//     note 含无人应答标记 → 归"没人答"；不含 → 人明确拒；
+//   - 其余码（rule_matched / policy_default / rule_rejected / capability_denied /
+//     approver_absent / approval_context_incomplete / approval_allowed）→ 与"审批没人答"
+//     无关，直接 false。
+//
+// code 缺省（旧判定 / 外部构造的 Decision）→ 退回文案匹配（同源标记，见下）：
 //   - "审批失败"：审批人报错/超时（policy.Decide 的审批错误出口）；
 //   - "无人应答"：没有人应答（协议面/终端面审批人的无人应答出口）；
 //   - "上下文已结束" / "ctx 超时" / "ctx 取消" / ctx 错误原文：审批前、或读到答复后
 //     Run 上下文已取消/超时（policy 与各审批人的文案都把这几种写法混着用）。
 //
-// "人审未放行"（人明确拒答）**不算**：那是"被拒绝"，不是"没人答"。
-//
 // 为什么不用 ctx.Err() 快照当判据：人明确拒绝后 ctx 可能恰好到期（判据竞态）——
 // 快照是**另一个瞬间**的事实，按它归因会把"被拒绝"误记成"没人来得及答"。
 //
-// 已知边角：判据是**文案匹配**（成因目前只以自由文本存在），人写的备注若恰好含
-// "审批失败/无人应答"这类词会被误判——比"漏判"少见的误判方向，代价可接受。
-// 长期修法是让 policy.Decide 直接给出**结构化成因码**（别再靠文案匹配）。
-func isNoAnswerDeny(reason *string) bool {
+// 已知边角（仅 code 缺省与 approval_denied 的 note 兜底时存在）：文案匹配可能被含标记词
+// 的人写备注误判——比"漏判"少见的误判方向，代价可接受；其余码在场时该边角消失。
+func isNoAnswerDeny(dec contracts.Decision) bool {
+	if dec.Code != nil {
+		switch *dec.Code {
+		case contracts.DecisionCodeApprovalFailed, contracts.DecisionCodeApprovalContextEnded:
+			return true
+		case contracts.DecisionCodeApprovalDenied:
+			// 人明确拒 vs 协议面无人应答：同码，靠 note 文案区分（见上）。
+			return reasonHasNoAnswerMarker(dec.Reason)
+		default:
+			return false
+		}
+	}
+	return reasonHasNoAnswerMarker(dec.Reason)
+}
+
+// reasonHasNoAnswerMarker 做"没人应答"的文案兜底匹配（与 core/policy、host 协议审批、
+// runtime 终端审批的 fail-close 文案同源）。
+func reasonHasNoAnswerMarker(reason *string) bool {
 	if reason == nil {
 		return false
 	}

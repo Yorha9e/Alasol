@@ -355,6 +355,7 @@ func taintDecision(tool string, t taintInfo) contracts.Decision {
 	id := t.id
 	return contracts.Decision{
 		Verdict: contracts.EffectDeny,
+		Code:    codePtr(contracts.DecisionCodeRuleRejected),
 		RuleID:  &id,
 		Reason: strPtr(fmt.Sprintf(
 			"deny: 工具 %s 被非法规则污染（tainted by rejected rule %s，effect=%s，source=%s，rule.tool=%s，trusted=%t）→ 一律拒绝（fail-close）",
@@ -388,16 +389,19 @@ func Decide(ctx context.Context, e *Engine, a core.Approver, q Query) contracts.
 
 	// fail-close：没有审批人 = 拒绝，绝不挂起（H8/D14）。
 	if a == nil {
-		return denyNow(fmt.Sprintf("fail-close: 工具 %s 需要人审（规则 %s）但没有配置 Approver", q.Tool, ruleID))
+		return denyNow(contracts.DecisionCodeApproverAbsent, fmt.Sprintf(
+			"fail-close: 工具 %s 需要人审（规则 %s）但没有配置 Approver", q.Tool, ruleID))
 	}
 	// fail-close：上下文已取消/超时 = 无人应答 = 拒绝。
 	if err := ctx.Err(); err != nil {
-		return denyNow(fmt.Sprintf("fail-close: 审批前上下文已结束（%v），工具 %s（规则 %s）按拒绝处理", err, q.Tool, ruleID))
+		return denyNow(contracts.DecisionCodeApprovalContextEnded, fmt.Sprintf(
+			"fail-close: 审批前上下文已结束（%v），工具 %s（规则 %s）按拒绝处理", err, q.Tool, ruleID))
 	}
 	// fail-close：缺少 session/agent 上下文 → 无法构造合法的审批请求 → 直接拒绝，
 	// **不构造 ApprovalRequest、不调用 Approver**。
 	if missing := missingContext(q); missing != "" {
-		return denyNow(fmt.Sprintf("fail-close: missing session/agent context（缺少 %s）→ 无法构造合法的审批请求，工具 %s（规则 %s）按拒绝处理",
+		return denyNow(contracts.DecisionCodeApprovalContextIncomplete, fmt.Sprintf(
+			"fail-close: missing session/agent context（缺少 %s）→ 无法构造合法的审批请求，工具 %s（规则 %s）按拒绝处理",
 			missing, q.Tool, ruleID))
 	}
 
@@ -415,14 +419,16 @@ func Decide(ctx context.Context, e *Engine, a core.Approver, q Query) contracts.
 	resp, err := approveSafely(ctx, a, req)
 	if err != nil {
 		// fail-close：审批服务出错/超时 = 拒绝（不是批准）。
-		return denyNow(fmt.Sprintf("fail-close: 审批失败（%v），工具 %s（规则 %s）按拒绝处理", err, q.Tool, ruleID))
+		return denyNow(contracts.DecisionCodeApprovalFailed, fmt.Sprintf(
+			"fail-close: 审批失败（%v），工具 %s（规则 %s）按拒绝处理", err, q.Tool, ruleID))
 	}
 	if resp.Decision != contracts.ApprovalDecisionAllow {
 		note := "无备注"
 		if resp.Note != nil && *resp.Note != "" {
 			note = *resp.Note
 		}
-		return denyNow(fmt.Sprintf("fail-close: 人审未放行（%s），工具 %s（规则 %s）按拒绝处理", note, q.Tool, ruleID))
+		return denyNow(contracts.DecisionCodeApprovalDenied, fmt.Sprintf(
+			"fail-close: 人审未放行（%s），工具 %s（规则 %s）按拒绝处理", note, q.Tool, ruleID))
 	}
 
 	by := "approver"
@@ -431,6 +437,7 @@ func Decide(ctx context.Context, e *Engine, a core.Approver, q Query) contracts.
 	}
 	return contracts.Decision{
 		Verdict: contracts.EffectAllow,
+		Code:    codePtr(contracts.DecisionCodeApprovalAllowed),
 		RuleID:  d.RuleID,
 		Reason:  strPtr(fmt.Sprintf("allow: 人审放行（%s）工具 %s（策略 ask 规则 %s）", by, q.Tool, ruleID)),
 	}
@@ -468,25 +475,34 @@ func suggestAllowRule(ask *compiledRule) contracts.PolicyRule {
 	}
 }
 
-// newDecision 组装一条判定（RuleID/Reason 必填，便于审计）。
+// newDecision 组装一条判定（RuleID/Reason/Code 必填，便于审计；code = rule_matched——
+// deny/ask/allow 三种 verdict 都是"命中规则"的产物，区分见 verdict 字段）。
 func newDecision(v contracts.Effect, r *compiledRule, reason string) contracts.Decision {
 	id := r.id
 	return contracts.Decision{
 		Verdict: v,
+		Code:    codePtr(contracts.DecisionCodeRuleMatched),
 		RuleID:  &id,
 		Reason:  strPtr(reason),
 	}
 }
 
-// denyNow 是一条带理由的 deny 判定（fail-close 的统一出口）。
-func denyNow(reason string) contracts.Decision {
-	return contracts.Decision{Verdict: contracts.EffectDeny, Reason: strPtr(reason)}
+// denyNow 是一条带理由与成因码的 deny 判定（fail-close 系出口的统一组装）。
+func denyNow(code contracts.DecisionCode, reason string) contracts.Decision {
+	return contracts.Decision{Verdict: contracts.EffectDeny, Code: codePtr(code), Reason: strPtr(reason)}
 }
 
-// failClosed 是无命中时的 fail-close 判定（H8：缺席默认 deny）。
+// failClosed 是无命中时的 fail-close 判定（H8：缺席默认 deny；含 nil 引擎/空工具名）。
 func failClosed() contracts.Decision {
-	return contracts.Decision{Verdict: contracts.EffectDeny, Reason: strPtr("fail-close: no matching rule")}
+	return contracts.Decision{
+		Verdict: contracts.EffectDeny,
+		Code:    codePtr(contracts.DecisionCodePolicyDefault),
+		Reason:  strPtr("fail-close: no matching rule"),
+	}
 }
+
+// codePtr 取成因码地址（契约可选字段一律指针 + omitempty，D2）。
+func codePtr(c contracts.DecisionCode) *contracts.DecisionCode { return &c }
 
 // jsonStrings 递归收集 JSON 里的所有**字符串型参数值**（对象值/数组元素/顶层字符串）。
 // map 遍历顺序随机，但调用方只做布尔 OR → 判定结果与顺序无关（确定性不受影响）。

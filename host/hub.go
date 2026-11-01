@@ -136,6 +136,12 @@ type Hub struct {
 	// cwd 是 hub 级默认工作目录（Config.CWD，缺省进程 cwd）：自动 gate repo:<repo_id>
 	// 的输入。per-session 覆盖见 specs。
 	cwd string
+	// hubID 是本 hub 的**进程标识**（G25 跨进程托管注册，2026-11-01 v4-7）：New 时生成的
+	// ULID。session 创建/接管（loopFor 建成 loop）时经 discovery.Table.Claim 登记到发现表
+	// ——"这个 session 的事件只由宿主进程 append"从部署层约束变成**可查的登记**；
+	// 其他 hub / 诊断面经 Table.HostOf 查"该 session 谁托管"，冲突 fail-close（拒绝接管）。
+	// 进程本地（发现表 live 态同款）：重启后失活，新进程重新 Claim。
+	hubID string
 
 	// ixCtx 是后台索引器的生命周期（Close 时取消）。
 	ixCtx    context.Context
@@ -586,6 +592,7 @@ func New(cfg Config) (*Hub, error) {
 		disc:              disc,
 		discFeed:          discFeed,
 		cwd:               cwd,
+		hubID:             string(core.NewUlid()),
 		ws:                transport.NewServer(b),
 		loops:             make(map[contracts.Ulid]*loop.Loop),
 		specs:             make(map[contracts.Ulid]SessionSpec),
@@ -856,15 +863,19 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 // 一个 session 一个 Loop：System/Model/AgentID 固定，历史由每次 Run 的局部变量带
 // （loop 无可变状态 → 同一 Loop 可并发 Run，见 loop 包 doc）。
 //
-// 建成时顺做两件 K10/K12 的事：① 发现表 Activate（本进程持有该 session——活状态，
-// 无租约无心跳，G17b）；② 加入自动 gate（repo:/workflow:）。② 只在**首次**建成时做，
-// 且失败不记账（下次 Run 重试）——加不上 gate 只会让该 session 暂不可见（fail-close：
-// 失败让可见性变小，不是变大），不该因此拒绝跑这一轮。
+// 建成时顺做两件 K10/K12 的事：① 发现表 Claim（G25 跨进程托管注册：本进程持有该
+// session 并登记宿主 hub 标识——活状态无租约无心跳，G17b；冲突 fail-close 拒绝接管）；
+// ② 加入自动 gate（repo:/workflow:）。② 只在**首次**建成时做，且失败不记账（下次 Run
+// 重试）——加不上 gate 只会让该 session 暂不可见（fail-close：失败让可见性变小，不是
+// 变大），不该因此拒绝跑这一轮。
 func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop, error) {
 	if sessionID == "" {
 		return nil, errors.New("host: sessionID 必填（空 = 用 NewSession()/CreateSession() 先取一个）")
 	}
 	h.mu.Lock()
+	if h.hubID == "" {
+		h.hubID = string(core.NewUlid()) // 字面量构造的 Hub（内部测试）兜底：Claim 需要非空宿主标识
+	}
 	if lp, ok := h.loops[sessionID]; ok {
 		h.mu.Unlock()
 		return lp, nil
@@ -995,9 +1006,19 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	h.loops[sessionID] = lp
 	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
 	autoDone := h.autoGates[sessionID]
+	hubID := h.hubID
 	h.mu.Unlock()
 
-	h.disc.Activate(sessionID)
+	// G25 跨进程托管注册（2026-11-01 v4-7）：session 创建/接管即在发现表登记宿主 hub
+	// 标识（进程标识）。**冲突 fail-close**：该 session 已登记给另一个 hub → 拒绝接管
+	// （回滚刚建的 loop；双宿主会各自 append 同一 session 的事件，破坏 session 亲和写）。
+	// 同 hub 重复 Claim 幂等（loop 重建 / 续跑都走这里）。
+	if cerr := h.disc.Claim(sessionID, hubID); cerr != nil {
+		h.mu.Lock()
+		delete(h.loops, sessionID)
+		h.mu.Unlock()
+		return nil, fmt.Errorf("host: 托管登记失败（G25：拒绝接管，提示用户该 session 归属别的 hub）: %w", cerr)
+	}
 	if !autoDone {
 		if jerr := h.joinAutoGates(ctx, sessionID, agentID, spec); jerr != nil {
 			hubLog.Warn("host: 自动 gate 加入失败（该 session 暂不可见，下次 Run 重试）",
@@ -1075,6 +1096,15 @@ func (h *Hub) Addr() string {
 	return h.cfg.Addr
 }
 
+// ID 返回本 hub 的**进程标识**（G25 跨进程托管注册；Hub.New 生成的 ULID，恒非空）。
+// 发现表 Claim 用它登记 session 归属；/api/sessions 行的 host_hub 也是它。
+func (h *Hub) ID() string {
+	if h == nil {
+		return ""
+	}
+	return h.hubID
+}
+
 // Registry 返回 hub 的扩展注册表的**只读视图**（v4-5 B 类 MCP server 面用：
 // `alasol mcp-serve` 经 runtime/mcpserver 读工具条目 + 执行器，把它们暴露成 MCP tools）。
 //
@@ -1150,14 +1180,22 @@ func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
 	// 不可发；GUI 按这列灰掉不可发行，而不是点下去吃 404 unknown_session。
 	// 一次 h.mu 取 loops 快照再逐行标（对齐 fork_internal_test 的快照写法）——不逐行
 	// hostsSession 反复抢锁。
+	//
+	// host_hub（G25 跨进程托管注册，2026-11-01 v4-7）：本进程托管的行带本 hub 的
+	// 进程标识（h.hubID）；别的进程托管/失管 = 空（登记是发现表进程本地状态，跨进程
+	// 读不到别家的，如实留空——前端按 hostable+host_hub 组合显示归属）。
 	h.mu.Lock()
 	hosted := make(map[contracts.Ulid]bool, len(h.loops))
 	for sid := range h.loops {
 		hosted[sid] = true
 	}
+	hubID := h.hubID
 	h.mu.Unlock()
 	for i := range rows {
-		rows[i].Hostable = hosted[contracts.Ulid(rows[i].SessionID)]
+		if hosted[contracts.Ulid(rows[i].SessionID)] {
+			rows[i].Hostable = true
+			rows[i].HostHub = hubID
+		}
 	}
 	return rows, nil
 }

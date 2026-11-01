@@ -260,13 +260,18 @@ func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResu
 // text / reasoning 都空的片段不发（没有可显示的内容；provider 侧本就不该发，
 // 这里是纵深防御）。
 //
-// **归组口径（已知边界，别当精确口径用）**：payload 的 turn 是**每次 Run 内**的轮次号，
-// 而 model.delta **没有 run 判别位**（run_id / started_at 都没加——加它要走全链：
-// schema + 生成物 + 样本 + 消费端）→ **同 session 并发跑两轮时，两轮的 turn 会撞号，
-// 订阅端无法可靠归组**。归组只对"单 session 串行跑"成立（宿主默认口径：一个 session
-// 同时只跑一轮）。契约侧的同一说明见 contracts/schema/event.json 的 ModelDeltaPayload。
-func (l *Loop) publishModelDelta(ctx context.Context, turn int, ev core.ProviderEvent) {
+// **归组口径**：payload 的 (run_id, turn) 是全局判别——run_id 是本次 Run 起始生成的
+// ULID（Run 局部变量，经 emitFunc 闭包带进来），turn 是 Run 内轮次号；同 session 并发
+// 跑两轮时两轮 run_id 不同 → 订阅端按 (run_id, turn) 可把片段可靠归组（G13 根治，
+// 2026-11-01 v4-7）。run_id 是可选字段（F7 只增）：缺省（旧发布端）时退回"单 session
+// 串行跑"口径（turn 在串行下唯一）。契约侧的同一说明见 contracts/schema/event.json
+// 的 ModelDeltaPayload。
+func (l *Loop) publishModelDelta(ctx context.Context, turn int, runID contracts.Ulid, ev core.ProviderEvent) {
 	payload := contracts.ModelDeltaPayload{Turn: int64(turn)}
+	if runID != "" {
+		rid := string(runID)
+		payload.RunID = &rid
+	}
 	if ev.Text != "" {
 		text := ev.Text
 		payload.Text = &text
@@ -303,23 +308,35 @@ func (l *Loop) publishModelDelta(ctx context.Context, turn int, ev core.Provider
 // （M9/陷阱 15：策略在 T0 判定、副作用持续到 Tn，「判定只约束发起时刻」是已知边界，
 // 快照供事后审计）。
 //
-// 只记结论（verdict / rule_id / reason），不记参数、不记 env（H19）。
+// 只记结论（verdict / code / rule_id / reason），不记参数、不记 env（H19）。
+// code 是结构化成因码（v4-7 后半，F7 只增）：HTTP/WS 面经 tool.call.intent 透出，
+// 消费端按 code 分选归因，不再解析 reason 自由文本。
 func policySnapshot(dec contracts.Decision) json.RawMessage {
 	type snapshot struct {
 		Verdict string `json:"verdict"`
+		Code    string `json:"code,omitempty"`
 		RuleID  string `json:"rule_id,omitempty"`
 		Reason  string `json:"reason,omitempty"`
 	}
 	raw, err := json.Marshal(snapshot{
 		Verdict: string(dec.Verdict),
+		Code:    derefCode(dec.Code),
 		RuleID:  deref(dec.RuleID),
 		Reason:  deref(dec.Reason),
 	})
 	if err != nil {
 		// 不可达（纯字符串结构体）；真失败时按最严结论记账，绝不写成 allow。
-		return json.RawMessage(`{"verdict":"deny","reason":"policy snapshot marshal failed"}`)
+		return json.RawMessage(`{"verdict":"deny","code":"policy_default","reason":"policy snapshot marshal failed"}`)
 	}
 	return raw
+}
+
+// derefCode 取可选成因码的值（nil → 空串）。
+func derefCode(c *contracts.DecisionCode) string {
+	if c == nil {
+		return ""
+	}
+	return string(*c)
 }
 
 // deref 取可选字符串的值（nil → 空串）。

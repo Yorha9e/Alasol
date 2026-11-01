@@ -794,3 +794,118 @@ func TestWSReceivesEventsFromRealRun(t *testing.T) {
 		t.Fatalf("快照 turn = %d，want 2", snap.Turn)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// G25 跨进程托管注册（2026-11-01 v4-7）
+// ---------------------------------------------------------------------------
+
+// TestSessionsHostHubField：GET /api/sessions 行的 host_hub = 托管该 session 的 hub
+// 进程标识。本进程托管 = 本 hub 的 id（Hub.ID()，恒非空 ULID）；别的进程托管 / 重启
+// 失管 = 空（托管登记是发现表进程本地状态，跨进程读不到别家的——如实留空不猜）。
+// 变异自证：本进程托管行 host_hub 恒空 → 第一步必红。
+func TestSessionsHostHubField(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "hosthub.db")
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("hosthub"), 0o600); err != nil {
+		t.Fatalf("写目标文件: %v", err)
+	}
+	cfg := func() host.Config {
+		return host.Config{
+			DBPath: db, Model: "scripted", System: "hosthub", MaxTurns: 4,
+			Allow:    []string{"read"},
+			Provider: &scriptedProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`},
+			CWD:      tempRepoOrDir(t),
+		}
+	}
+	rowFor := func(t *testing.T, h *host.Hub, sid contracts.Ulid) host.SessionRow {
+		t.Helper()
+		rows, err := h.Sessions(context.Background())
+		if err != nil {
+			t.Fatalf("Sessions: %v", err)
+		}
+		for _, r := range rows {
+			if r.SessionID == string(sid) {
+				return r
+			}
+		}
+		t.Fatalf("在线表里找不到 session %s", sid)
+		return host.SessionRow{}
+	}
+
+	h1, err := host.New(cfg())
+	if err != nil {
+		t.Fatalf("host.New #1: %v", err)
+	}
+	defer h1.Close()
+	if h1.ID() == "" {
+		t.Fatal("Hub.ID() 恒非空（New 生成的进程标识）")
+	}
+	if !core.ValidUlid(contracts.Ulid(h1.ID())) {
+		t.Fatalf("Hub.ID() 应是 ULID：%q", h1.ID())
+	}
+	sid := runOneRound(t, h1, "在吗")
+	got := rowFor(t, h1, sid)
+	if !got.Hostable || got.HostHub != h1.ID() {
+		t.Fatalf("本进程托管的行应 hostable=true 且 host_hub=本 hub id %q，得到 %+v", h1.ID(), got)
+	}
+
+	// 发现表侧同口径：Claim 登记的宿主 == Hub.ID()（loopFor 建成时经 Claim 写入）。
+	hostID, ok := h1.Discovery().HostOf(sid)
+	if !ok || hostID != h1.ID() {
+		t.Fatalf("Discovery().HostOf = (%q, %v)，want (%q, true)", hostID, ok, h1.ID())
+	}
+
+	// 别的 hub（同库另一个进程的模拟）：行可见但 hostable=false、host_hub 空。
+	h2, err := host.New(cfg())
+	if err != nil {
+		t.Fatalf("host.New #2: %v", err)
+	}
+	defer h2.Close()
+	if got := rowFor(t, h2, sid); got.Hostable || got.HostHub != "" {
+		t.Fatalf("别的 hub 建的 session 对本进程应 hostable=false 且 host_hub 空，得到 %+v", got)
+	}
+}
+
+// TestLoopForClaimConflictFailClose：发现表已把 session 登记给**另一个** hub 时，
+// 本 hub 接管（loopFor → Claim）必须 fail-close 拒绝（G25：一个 session 的事件只由
+// 其宿主进程 append——双宿主 = 两进程各自 append，seq 变成混排提交序）。
+// 变异自证：Claim 冲突不拒（吞掉错误继续）→ 本钉红。
+func TestLoopForClaimConflictFailClose(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "claimconflict.db")
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("claim"), 0o600); err != nil {
+		t.Fatalf("写目标文件: %v", err)
+	}
+	h, err := host.New(host.Config{
+		DBPath: db, Model: "scripted", System: "claim", MaxTurns: 4,
+		Allow:    []string{"read"},
+		Provider: &scriptedProvider{args: `{"path":"` + filepath.ToSlash(target) + `"}`},
+		CWD:      tempRepoOrDir(t),
+	})
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	defer h.Close()
+
+	// 模拟"这个 session 已被另一个 hub 进程托管"：直接在发现表上以异 hub id 登记。
+	sid := host.NewSession()
+	if err := h.Discovery().Claim(sid, "hub-from-another-process"); err != nil {
+		t.Fatalf("预登记异 hub: %v", err)
+	}
+	// 接管 → 拒绝，且给出可读提示（不静默双写）。
+	_, err = h.RunPrompt(context.Background(), sid, "接管试试")
+	if err == nil {
+		t.Fatal("异 hub 托管的 session 被本 hub 接管应 fail-close 报错")
+	}
+	if !strings.Contains(err.Error(), "托管登记失败") {
+		t.Fatalf("错误应点名托管登记失败，得到: %v", err)
+	}
+	// 宿主登记未被改动（fail-close：拒绝接管不改现状）。
+	if hostID, _ := h.Discovery().HostOf(sid); hostID != "hub-from-another-process" {
+		t.Fatalf("冲突后宿主登记不该被改动，得到 %q", hostID)
+	}
+	// 本 hub 自己的新 session 不受影响（正常跑通）。
+	if _, err := h.RunPrompt(context.Background(), host.NewSession(), "新会话"); err != nil {
+		t.Fatalf("本 hub 新 session 不该被波及: %v", err)
+	}
+}

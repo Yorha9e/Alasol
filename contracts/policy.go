@@ -42,9 +42,27 @@ const (
 type Decision struct {
 	// 判定结果：allow / deny / ask（D13）。审批缺席必须 deny，不得挂起（D14/H8）。
 	Verdict Effect `json:"verdict"`
+	// 结构化成因码（v4-7 后半；F7 只增）：判定为什么得出这个 verdict 的机器可读归因。reason 是给人看的自由文本，code 是给程序分选用的枚举——审计/归因（如 isNoAnswerDeny 的"没人应答"判定）按 code 走，不再靠文案匹配。
+	Code *DecisionCode `json:"code,omitempty"`
 	// 命中的规则 id。
 	RuleID *string `json:"rule_id,omitempty"`
 	Reason *string `json:"reason,omitempty"`
 	// verdict=ask 时携带的建议规则（D13）。
 	SuggestedRules []PolicyRule `json:"suggested_rules,omitempty"`
 }
+
+// 判定成因码（按 core/policy 与 core/registry 的判定出口定枚举）：rule_matched=命中规则（deny/ask/allow 皆是）；policy_default=无命中 fail-close 默认 deny（H8，含空引擎/空工具名）；rule_rejected=被非法规则污染的工具一律 deny（fail-close）；capability_denied=能力裁决出口 deny（无裁决器/裁决 panic/无策略引擎/空能力名）；approver_absent=ask 但没有配置 Approver；approval_context_ended=审批前上下文已取消/超时；approval_context_incomplete=缺 session/agent 上下文无法构造审批请求；approval_failed=审批人报错/panic；approval_denied=审批未放行（人审拒绝，或协议面无人应答——note 里有细节）；approval_allowed=人审显式放行。
+type DecisionCode string
+
+const (
+	DecisionCodeRuleMatched               DecisionCode = "rule_matched"
+	DecisionCodePolicyDefault             DecisionCode = "policy_default"
+	DecisionCodeRuleRejected              DecisionCode = "rule_rejected"
+	DecisionCodeCapabilityDenied          DecisionCode = "capability_denied"
+	DecisionCodeApproverAbsent            DecisionCode = "approver_absent"
+	DecisionCodeApprovalContextEnded      DecisionCode = "approval_context_ended"
+	DecisionCodeApprovalContextIncomplete DecisionCode = "approval_context_incomplete"
+	DecisionCodeApprovalFailed            DecisionCode = "approval_failed"
+	DecisionCodeApprovalDenied            DecisionCode = "approval_denied"
+	DecisionCodeApprovalAllowed           DecisionCode = "approval_allowed"
+)

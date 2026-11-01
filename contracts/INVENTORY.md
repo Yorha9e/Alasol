@@ -16,7 +16,7 @@
 | 4 | **Extension 元数据** | `schema/extension.json` | `kind` / `schema` / `capabilities` / `priority` / `reloadable` / `health`（D17） | — |
 | 5 | **Tool.schema** | `schema/tool.json` | 工具描述：`schema` / `side_effect`（none/read/write/destructive）/ `cancelable` / `approvable` / `idempotent` / `replay`（D12/D22） | `schema` 字段**值本身是 JSON Schema**（元嵌套）→ codegen 当原始 JSON 处理 |
 | 6 | **Tool 返回值** | `schema/tool-result.json` | 工具返回值：`graph_edges: [{src,dst,kind}]` / `taint` / 可重放标记（D22/G22/Q7） | 跨边界：MCP 与进程级扩展都要传 |
-| 7 | **Policy 规则** | `schema/policy.json` | 规则表达式（配置文件形态）+ 判定结果 `Decision`：`allow`/`deny`/`ask`，ask 携带 `suggested_rules`（D13/H5） | workflow 侧规则**只可收窄**（H5/H24） |
+| 7 | **Policy 规则** | `schema/policy.json` | 规则表达式（配置文件形态）+ 判定结果 `Decision`：`allow`/`deny`/`ask`，ask 携带 `suggested_rules`（D13/H5）；可选 `code` 结构化成因码（`DecisionCode` 枚举：rule_matched/policy_default/rule_rejected/capability_denied/approver_absent/approval_*，v4-7 后半 F7 只增——审计归因按 code，不再靠 reason 文案匹配；经 intent 的 `policy_snapshot` 透出 HTTP/WS 面） | workflow 侧规则**只可收窄**（H5/H24） |
 | 8 | **Store 持久化格式** | `schema/store.json` | 事件日志持久化/导出格式（NDJSON 事件记录）（G 系） | 大 payload 走 `binary_ref` 外置（D4） |
 | 9 | **Workflow** | `schema/workflow.json` | 工作流定义（纯数据）：`philosophy` / `agent_types[]` / `context_strategy` / `gates[]` / `grants[]`（`06` §4.1）。AgentType 亦可带 `context_strategy`/`share_project_assets`（W6-A，2026-10-31：子 agent 策略显式声明、不继承主 agent；项目资产显式共享） | `permission_request`/`grants` 是请求，实际 = 请求 ∩ 策略上限 ∩ 父级授予（H11/H22）；追加段合并（Compose）时同 id **base 整条胜出**（extra 同 id 类型**整条**丢弃：prompt/can_spawn/context_strategy/share_project_assets 全丢） |
 | 10 | **ContextSnapshot** | `schema/context-snapshot.json` | 上下文构成清单：`parts[]`（source/kind/entries/tokens/state/origins/summary_ref）、`state ∈ verbatim/compacted/dropped/deferred`（`06` §4.2） | 每轮一条 durable 事件 `context.assembled` |
@@ -30,7 +30,7 @@ kind 是开放字符串（D6），core 定义核心子集。**kind→payload 已
 |---|---|---|
 | `user.prompt` | true | **对话入流**（F1，v1-S1）：用户提示原文；Run 开始落（旁路观测，不计 Result.Events） |
 | `model.turn` | true | **对话入流**（F1，v1-S1）：模型回复 + `ModelTurnUsage`（usage **只进成本统计**，J21——不回填快照）+ 可选 `reasoning`（思维链整段，G14；provider 解析不到则缺省） |
-| `model.delta` | **false** | **流式增量片段**（`ModelDeltaPayload`，G13 打字机效果）：`turn`（本轮次号）+ `text`/`reasoning` 至少一个增量片段。**durable=false**（F8/陷阱 11）：总线直发订阅者、**不入库、不占 seq、不回放**（转发性投递不幂等，丢了就是丢了）；WS 订阅默认收得到，`durable_only=true` 收不到。样本里有一条（`sample-events.ndjson`，非 durable 样本同样过 TS 校验）。**同 session 并发 Run 的 delta 不可归组（已知边界）**：`turn` 是**每次 Run 内**的轮次号（并发 Run 会撞号），payload **没有 run 判别位**（run_id / started_at 未加——加它要走全链：schema + 生成物 + 样本 + 消费端）→ 归组只对**单 session 串行跑**成立（宿主默认口径：一个 session 同时只跑一轮）；并发时只能拿 envelope 的 ts / 到达序近似切分，**不得当精确口径** |
+| `model.delta` | **false** | **流式增量片段**（`ModelDeltaPayload`，G13 打字机效果）：`turn`（本轮次号）+ 可选 `run_id`（本次 Run 的判别位，宿主 Run 起始生成的 ULID——F7 只增，2026-11-01 v4-7）+ `text`/`reasoning` 至少一个增量片段。**durable=false**（F8/陷阱 11）：总线直发订阅者、**不入库、不占 seq、不回放**（转发性投递不幂等，丢了就是丢了）；WS 订阅默认收得到，`durable_only=true` 收不到。样本里有一条（`sample-events.ndjson`，非 durable 样本同样过 TS 校验）。**归组口径**：按 `(run_id, turn)` 归组——同 session 并发 Run 的 delta 可分（G13 根治，2026-11-01 v4-7）；`run_id` 缺省（旧发布端）时退回"单 session 串行跑"口径（turn 在串行下唯一），并发时只能拿 envelope 的 ts / 到达序近似切分，**不得当精确口径** |
 | `tool.call.intent` | true | **三段事件之①**（X1）：tool_call_id / 参数 / idempotent / replay 标记 / 外部可核验锚点（如 commit sha） |
 | `tool.call.completed` | true | **三段事件之③a**（X1）：结果（Tool 返回值契约） |
 | `tool.call.failed` | true | **三段事件之③b**（X1）：失败（错误为普通事件，M1/M8） |

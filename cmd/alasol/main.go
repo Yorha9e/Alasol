@@ -28,6 +28,12 @@
 //	            第几轮、跑的什么模型、吐过几段 delta、哪些 tool_call 的 blob 是孤儿候选"。
 //	            单行 JSON 到 stdout；未配置 WAL（[wal].dir 空）→ wal_exists=false（不报错）。
 //
+//	alasol eval -session <id> [-db alasol.db]
+//	          → 最小评测面（L4/L5，v4-7 后半）：**事件流即数据集**——回放该 session 的
+//	            durable 事件，折叠逐 turn 指标（轮数/工具调用数/成本 tokens/时长），
+//	            单行 JSON 到 stdout。**观察面，不建独立评测框架**（L5 口径：没有 runner/
+//	            case 库/打分器——想要别的指标就写另一个折叠函数读同一个事件流）。
+//
 //	alasol chat [-db alasol.db] [-model ...] [-approval ...] [-allow ...]
 //	          → 终端 REPL：对话 / /table 在线表 / /ctx 上下文构成 / /quit
 //
@@ -68,6 +74,8 @@ func main() {
 		code = modelsMain(os.Args[2:])
 	case "wal":
 		code = walMain(os.Args[2:])
+	case "eval":
+		code = evalMain(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		code = 0
@@ -103,6 +111,10 @@ func usage() {
                                         （上次崩在第几轮/跑的什么模型/吐过几段 delta/
                                         哪些 tool_call 的 blob 是孤儿候选）。**观察面，
                                         不写回事件流**；未配 [wal].dir = wal_exists=false
+  alasol eval -session <id> [flags]     最小评测面（L4/L5）：事件流即数据集——回放该
+                                        session 的 durable 事件，折叠逐 turn 指标
+                                        （轮数/工具调用数/成本 tokens/时长），单行 JSON
+                                        到 stdout。**观察面，不建独立评测框架**
 
 模型名无默认值（模型名是端点相关的）：用 -model 指定或设 ALASOL_MODEL；
 不知道叫什么就先跑 `+"`alasol models`"+`。

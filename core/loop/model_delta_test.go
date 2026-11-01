@@ -242,3 +242,117 @@ func TestReasoningEffortPassthrough(t *testing.T) {
 		t.Errorf("未设 ReasoningEffort 时 ModelRequest 应为 nil，得到 %q", *prov2.lastReq.ReasoningEffort)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// G13 run_id 归组（2026-11-01 v4-7）
+// ---------------------------------------------------------------------------
+
+// concurrentDeltaProvider 是并发安全的流式假 provider：每次 Run 发一条可辨识的
+// delta（片段文本带 prompt 标签），供"同 session 并发 Run 归组"钉子区分来源。
+type concurrentDeltaProvider struct{}
+
+func (concurrentDeltaProvider) Run(_ context.Context, req core.ModelRequest, emit func(core.ProviderEvent)) (core.ModelResult, error) {
+	// 取最后一条用户消息做标签（两次 Run 用不同 prompt）。
+	tag := "?"
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			tag = req.Messages[i].Content
+			break
+		}
+	}
+	emit(core.ProviderEvent{Kind: "text.delta", Text: tag + "-1 "})
+	return core.ModelResult{Text: tag + "-1 "}, nil
+}
+
+// TestModelDeltaRunIDPresent：单次 Run 的全部 delta 携带同一个非空 run_id（Run 起始
+// 生成的 ULID）。变异自证：Run 不带 run_id（publishModelDelta 不设 RunID）→ 本钉红。
+func TestModelDeltaRunIDPresent(t *testing.T) {
+	h := newHarness(t)
+	prov := &deltaProvider{textDeltas: []string{"你", "好"}}
+	lp := h.loop(func(c *loop.Config) { c.Provider = prov })
+	sub := h.bus.Subscribe(bus.Filter{})
+	defer sub.Close()
+
+	if _, err := lp.Run(context.Background(), "打招呼"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	seen := map[string]int{}
+	for _, ev := range drainSub(t, sub) {
+		if ev.Kind != loop.KindModelDelta {
+			continue
+		}
+		var p contracts.ModelDeltaPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		if p.RunID == nil || *p.RunID == "" {
+			t.Fatalf("model.delta 缺 run_id（G13 归组判别位）：%s", ev.Payload)
+		}
+		if !core.ValidUlid(contracts.Ulid(*p.RunID)) {
+			t.Fatalf("run_id 不是合法 ULID：%q", *p.RunID)
+		}
+		seen[*p.RunID]++
+	}
+	if len(seen) != 1 {
+		t.Fatalf("单次 Run 的 delta 应共享同一个 run_id，得到 %d 个：%v", len(seen), seen)
+	}
+}
+
+// TestModelDeltaConcurrentRunsGroupByRunID：同 session **并发**跑两轮——两轮的 delta
+// 按 run_id 可分成两组、互不混淆（G13 根治钉子）。变异自证：delta 不带 run_id →
+// 两轮 turn 都从 1 起、片段文本交错，按 (run_id, turn) 归组退化成一锅粥 → 本钉红。
+func TestModelDeltaConcurrentRunsGroupByRunID(t *testing.T) {
+	h := newHarness(t)
+	lp := h.loop(func(c *loop.Config) { c.Provider = concurrentDeltaProvider{} })
+	sub := h.bus.Subscribe(bus.Filter{})
+	defer sub.Close()
+
+	// 同一 Loop 并发 Run 两轮（loop 无可变状态，见包 doc）。
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, prompt := range []string{"alpha", "beta"} {
+		p := prompt
+		go func() {
+			<-start
+			_, err := lp.Run(context.Background(), p)
+			errs <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	}
+
+	// 按 run_id 归组：每组的文本拼接应完整等于某一轮的 prompt 标签（不混另一轮）。
+	groups := map[string]string{}
+	total := 0
+	for _, ev := range drainSub(t, sub) {
+		if ev.Kind != loop.KindModelDelta {
+			continue
+		}
+		var p contracts.ModelDeltaPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		if p.RunID == nil || *p.RunID == "" {
+			t.Fatalf("并发 Run 的 delta 缺 run_id：%s（无法归组）", ev.Payload)
+		}
+		if p.Text != nil {
+			groups[*p.RunID] += *p.Text
+		}
+		total++
+	}
+	if total != 2 {
+		t.Fatalf("delta 总数 = %d，want 2（每轮一条）", total)
+	}
+	if len(groups) != 2 {
+		t.Fatalf("按 run_id 分组 = %d 组，want 2（并发两轮可分）：%v", len(groups), groups)
+	}
+	for rid, text := range groups {
+		if text != "alpha-1 " && text != "beta-1 " {
+			t.Fatalf("run_id=%s 组的拼接文本 = %q，want \"alpha-1 \" 或 \"beta-1 \"（不混组）", rid, text)
+		}
+	}
+}

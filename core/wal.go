@@ -97,8 +97,9 @@ type WalSink interface {
 
 // WalTurnBeginPayload 是 KindWalTurnBegin 的载荷：一轮模型调用发起前的现场。
 type WalTurnBeginPayload struct {
-	// Turn 轮次号（每次 Run 内从 1 起；与 model.delta 的 turn 同口径——**同 session
-	// 并发跑两轮时会撞号**，这是 model.delta 已知边界的同一口径，别当精确归组用）。
+	// Turn 轮次号（每次 Run 内从 1 起；**同 session 并发跑两轮时会撞号**——WAL 载荷
+	// 刻意不带 run 判别位（可丢弃补充面，不随契约字段走；对账已按记录流分段归组兜住
+	// 跨 Run 撞号）。契约面的 model.delta 自 2026-11-01 v4-7 起另带 run_id 精确归组）。
 	Turn int `json:"turn"`
 	// Model 模型名（原样；不是凭据，可安全落盘）。
 	Model string `json:"model"`

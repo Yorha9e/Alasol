@@ -313,13 +313,18 @@ func adjudicate(adj Adjudicator, ctx context.Context, capability string) (d cont
 		if rec := recover(); rec != nil {
 			d = contracts.Decision{
 				Verdict: contracts.EffectDeny,
+				Code:    codePtr(contracts.DecisionCodeCapabilityDenied),
 				Reason:  strPtr(fmt.Sprintf("fail-close: 能力裁决 panic: %v", rec)),
 			}
 		}
 	}()
 	if adj == nil {
 		// 没有裁决器 = 无人裁决 = 拒绝（fail-close）。
-		return contracts.Decision{Verdict: contracts.EffectDeny, Reason: strPtr("fail-close: 无能力裁决器")}
+		return contracts.Decision{
+			Verdict: contracts.EffectDeny,
+			Code:    codePtr(contracts.DecisionCodeCapabilityDenied),
+			Reason:  strPtr("fail-close: 无能力裁决器"),
+		}
 	}
 	return adj.Adjudicate(ctx, capability)
 }

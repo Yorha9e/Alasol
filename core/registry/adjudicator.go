@@ -51,11 +51,22 @@ func (a *PolicyAdjudicator) Engine() *policy.Engine {
 // Adjudicate implements Adjudicator。
 func (a *PolicyAdjudicator) Adjudicate(ctx context.Context, capability string) contracts.Decision {
 	if a == nil || a.engine == nil {
-		return contracts.Decision{Verdict: contracts.EffectDeny, Reason: strPtr("fail-close: 无策略引擎")}
+		return contracts.Decision{
+			Verdict: contracts.EffectDeny,
+			Code:    codePtr(contracts.DecisionCodeCapabilityDenied),
+			Reason:  strPtr("fail-close: 无策略引擎"),
+		}
 	}
 	if capability == "" {
 		// 空能力名无法被任何规则命中（空 Tool 规则在 New 时即被拒绝）→ deny。
-		return contracts.Decision{Verdict: contracts.EffectDeny, Reason: strPtr("fail-close: 能力名为空")}
+		return contracts.Decision{
+			Verdict: contracts.EffectDeny,
+			Code:    codePtr(contracts.DecisionCodeCapabilityDenied),
+			Reason:  strPtr("fail-close: 能力名为空"),
+		}
 	}
 	return a.engine.Evaluate(ctx, policy.Query{Tool: capability})
 }
+
+// codePtr 取成因码地址（契约可选字段一律指针 + omitempty，D2）。
+func codePtr(c contracts.DecisionCode) *contracts.DecisionCode { return &c }

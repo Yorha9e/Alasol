@@ -25,6 +25,11 @@ const scanBatch = 500
 //     在表里——可读），但托管写面只对本进程的 loop 生效（不可发）——此前列表不区分，
 //     GUI 只能点下去吃 404。**只增不破坏**（行 JSON 多一个 bool，旧前端可忽略）。
 //     填充在 Hub.Sessions（投影不认识 h.loops；见 hub.go）。
+//   - host_hub：托管该 session 的 **hub 进程标识**（G25 跨进程托管注册，2026-11-01 v4-7）。
+//     本进程托管的行 = 本 hub 的 id（Hub.New 生成的 ULID）；别的进程托管/重启失管 = 空
+//     （托管登记是发现表的**进程本地**状态——跨进程读不到别家的登记，如实留空不猜）。
+//     前端配合 hostable 显示"本进程托管（id）/ 别的进程托管 / 失管"。HTTP 面非契约，只增。
+//     与 hostable 同在 Hub.Sessions 出口处补。
 type SessionRow struct {
 	SessionID  string `json:"session_id"`
 	FirstSeq   int64  `json:"first_seq"`
@@ -34,6 +39,7 @@ type SessionRow struct {
 	UpdatedAt  string `json:"updated_at"`
 	Watermark  int64  `json:"watermark"`
 	Hostable   bool   `json:"hostable"`
+	HostHub    string `json:"host_hub,omitempty"`
 }
 
 // sessionState 是投影里单个 session 的累积状态。

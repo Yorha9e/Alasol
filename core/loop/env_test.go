@@ -206,7 +206,7 @@ func TestEnvPolicyDecisionAppliesPerKey(t *testing.T) {
 
 // TestPolicySnapshotNeverCarriesEnv 保证 intent 的策略快照只记判定结论，
 // 不夹带参数里的敏感值之外的东西——这里断言快照字段集合就是
-// verdict/rule_id/reason（H19：只记结论与键名，不记值）。
+// verdict/code/rule_id/reason（H19：只记结论与键名，不记值；code 是 v4-7 结构化成因码）。
 func TestPolicySnapshotShape(t *testing.T) {
 	h := newHarness(t, allowRule("echo"))
 	h.addTool("echo", nil)
@@ -219,13 +219,18 @@ func TestPolicySnapshotShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatalf("快照不是对象: %v", err)
 	}
-	if len(m) != 3 {
-		t.Fatalf("快照应只含 verdict/rule_id/reason 三个字段，得到 %d: %s", len(m), raw)
+	if len(m) != 4 {
+		t.Fatalf("快照应只含 verdict/code/rule_id/reason 四个字段，得到 %d: %s", len(m), raw)
 	}
-	for _, k := range []string{"verdict", "rule_id", "reason"} {
+	for _, k := range []string{"verdict", "code", "rule_id", "reason"} {
 		if _, ok := m[k]; !ok {
 			t.Fatalf("快照缺字段 %s: %s", k, raw)
 		}
+	}
+	// 成因码钉子：allow 规则命中 → code=rule_matched（v4-7 后半 F7 只增）。
+	var code string
+	if err := json.Unmarshal(m["code"], &code); err != nil || code != string(contracts.DecisionCodeRuleMatched) {
+		t.Fatalf("快照 code = %s（want rule_matched，err=%v）: %s", m["code"], err, raw)
 	}
 }
 

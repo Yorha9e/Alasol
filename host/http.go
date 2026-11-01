@@ -32,6 +32,8 @@ var httpLog = slog.Default()
 //	GET /ws                      → transport.Server.ServeWS（NDJSON 行式事件流）
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
 //	GET /api/monitor             → MonitorView（K9：当前采样 + 阈值 + 告警环）
+//	GET /api/git                 → gitView（G17 git 观测面：hub 工作目录 branch/dirty/last_commit；
+//	                               拉式现采、HTTP-only **不进事件流**；?path= 覆盖采样目录；非仓库 → repo=false 如实报）
 //	GET /api/extensions          → [ExtensionView, ...]（扩展注册表全 kind 快照 + Health，只读；v4-5）
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12）
 //	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
@@ -161,6 +163,10 @@ func (h *Hub) Handler() http.Handler {
 
 	reg("GET", "/api/health", h.serveHealth)
 	reg("GET", "/api/monitor", h.serveMonitor)
+	// G17 git 观测面（v4-7 后半）：hub 工作目录的 git 状态快照（branch/dirty/last_commit）。
+	// 只做 HTTP 面（拉式现采）、**不进事件流**——git.state 事件走 F7 全链成本高，且
+	// git 状态是进程本地派生观测（非事实流事实）。详见 host/git.go。
+	reg("GET", "/api/git", h.serveGit)
 	// 扩展注册表管理/观测面（v4-5 extension runtime 收口）：全 kind 快照 + Health（只读）。
 	reg("GET", "/api/extensions", h.serveExtensions)
 	reg("GET", "/api/sessions", h.serveSessions)

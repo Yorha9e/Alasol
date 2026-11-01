@@ -257,10 +257,12 @@ type ModelTurnPayload struct {
 	Usage *ModelTurnUsage `json:"usage,omitempty"`
 }
 
-// model.delta —— 一次模型调用的**流式增量片段**（G13：打字机效果）。**durable=false**（F8/陷阱 11）：不入库、不占 seq、不回放——总线直发订阅者，转发性投递对订阅者不幂等（丢了就是丢了）。turn 是本轮次号（同一 Run 内从 1 递增；订阅端据此把片段归组）；text / reasoning 至少一个非空（text = 正文增量，reasoning = 思维链增量 G14）——**两者都空 = 没有可显示的内容，发布端不得发**（这条"至少一个"是语义规则，schema 不做条件表达，由发布端与样本钉子保证）。envelope.session_id/agent_id = 发起该轮模型调用的 session/agent。**同 session 并发 Run 的 delta 不可归组（已知边界）**：turn 是**每次 Run 内**的轮次号（两次并发 Run 的 turn 会撞号），本 payload **没有 run 判别位**（run_id / started_at 都没加——加它要走全链：schema + 生成物 + 样本 + 消费端）——故同一 session 上**并发跑两轮**时，订阅端**无法**把两轮的片段可靠归组；归组只对**单 session 串行跑**成立（宿主默认口径：一个 session 同时只跑一轮）。真撞上并发，只能拿 envelope 的 ts / 到达序近似切分，**不得当精确口径**用。
+// model.delta —— 一次模型调用的**流式增量片段**（G13：打字机效果）。**durable=false**（F8/陷阱 11）：不入库、不占 seq、不回放——总线直发订阅者，转发性投递对订阅者不幂等（丢了就是丢了）。run_id 是本次 Run 的判别位（Run 起始生成的 ULID；订阅端按 (run_id, turn) 归组——同 session 并发 Run 不再撞号）；turn 是本轮次号（同一 Run 内从 1 递增）；text / reasoning 至少一个非空（text = 正文增量，reasoning = 思维链增量 G14）——**两者都空 = 没有可显示的内容，发布端不得发**（这条"至少一个"是语义规则，schema 不做条件表达，由发布端与样本钉子保证）。envelope.session_id/agent_id = 发起该轮模型调用的 session/agent。run_id 为**可选**（F7 只增）：旧发布端/外部注入的 delta 可缺省，缺省时退回"单 session 串行跑"的归组口径（turn 在串行下唯一）。
 type ModelDeltaPayload struct {
-	// 本轮次号（**每次 Run 内**从 1 递增；JSON integer 序号非 id）。**同 session 并发 Run 时撞号**（payload 无 run 判别位，见本 $defs 的说明）——不可跨 Run 归组。
+	// 本轮次号（**每次 Run 内**从 1 递增；JSON integer 序号非 id）。与 run_id 联合归组：(run_id, turn) 才是全局判别，单独 turn 在同 session 并发 Run 时撞号。
 	Turn int64 `json:"turn"`
+	// 本次 Run 的判别标识（宿主在 Run 起始生成的 ULID）。订阅端按 (run_id, turn) 把片段归组——同 session 并发 Run 的 delta 可分。可选字段（F7 只增）：缺省时退回"单 session 串行跑"口径（turn 唯一）。
+	RunID *string `json:"run_id,omitempty"`
 	// 正文增量片段（与 reasoning 至少一个非空）。
 	Text *string `json:"text,omitempty"`
 	// 思维链增量片段（G14；与 text 至少一个非空）。

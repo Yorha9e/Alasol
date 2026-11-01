@@ -2,7 +2,10 @@ package discovery
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/Yorha9e/alasol/contracts"
@@ -78,6 +81,11 @@ type sessionState struct {
 	// live 是**进程本地**活状态（G17b）：本进程此刻持有该 session 的 loop。
 	// 不进 Snapshot——它不是事件能重建的东西。
 	live bool
+	// hostHub 是该 session 的**宿主 hub 标识**（G25 托管注册，2026-11-01 v4-7）：
+	// session 创建/接管时由宿主经 Claim 登记（进程标识，如 hub 的 ULID）。与 live 同款
+	// **进程本地**状态（不进 Snapshot——重启后失活，由宿主重新 Claim）。
+	// 空 = 未登记（老 Activate 路径 / 尚未接管）。
+	hostHub string
 }
 
 // gateActiveLocked 判定 (session, gate) 的成员关系是否**活跃**（G15 折叠口径：
@@ -240,7 +248,59 @@ func (t *Table) Deactivate(sessionID contracts.Ulid) {
 	defer t.mu.Unlock()
 	if st, ok := t.sessions[sessionID]; ok {
 		st.live = false
+		st.hostHub = "" // 失管即清宿主登记（重启后由新宿主重新 Claim）
 	}
+}
+
+// ErrHostConflict 表示 session 已由**另一个** hub 托管（G25 托管注册：拒绝接管，
+// fail-close——双宿主会各自 append 同一 session 的事件，seq 变成两进程的提交序混排，
+// 因果序假设被破坏）。
+var ErrHostConflict = errors.New("discovery: session 已由另一个 hub 托管（G25：一个 session 的事件只由其宿主进程 append）")
+
+// Claim 登记 session 由指定 hub 托管（G25 跨进程托管注册，2026-11-01 v4-7）。
+//
+// 语义 = Activate + 宿主归属：置 live=true 并记 hostHub=hubID（进程标识）。
+// 幂等：同一 hub 重复 Claim 同一 session 无副作用（重启后同进程续跑、loop 重建都走它）。
+// **冲突 fail-close**：该 session 已登记给**另一个** hub → 返回 ErrHostConflict 且
+// **不改动**现有登记（已有宿主 → 拒绝接管，调用方给用户提示而不是静默双写）。
+//
+// hubID 必填：没有宿主标识的托管登记无意义（查"谁托管"会得到空串）。
+// 与 live 同款**进程本地**：不进 Snapshot，崩溃重启后登记失活，由新宿主重新 Claim。
+func (t *Table) Claim(sessionID contracts.Ulid, hubID string) error {
+	if t == nil {
+		return errors.New("discovery: Table 为 nil")
+	}
+	if sessionID == "" {
+		return errors.New("discovery: Claim 需要非空 sessionID")
+	}
+	hubID = strings.TrimSpace(hubID)
+	if hubID == "" {
+		return errors.New("discovery: Claim 需要非空 hubID（宿主 hub 标识）")
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.sessionLocked(sessionID)
+	if st.hostHub != "" && st.hostHub != hubID {
+		return fmt.Errorf("%w: session=%s host=%s（本次想登记 %s）", ErrHostConflict, sessionID, st.hostHub, hubID)
+	}
+	st.hostHub = hubID
+	st.live = true
+	return nil
+}
+
+// HostOf 返回该 session 登记的宿主 hub 标识（G25：其他 hub / 诊断面可查"谁托管"）。
+// 未登记（或表 nil / session 未知）→ ok=false。
+func (t *Table) HostOf(sessionID contracts.Ulid) (string, bool) {
+	if t == nil || sessionID == "" {
+		return "", false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	st, ok := t.sessions[sessionID]
+	if !ok || st.hostHub == "" {
+		return "", false
+	}
+	return st.hostHub, true
 }
 
 // Reset 清空全部状态（重建入口：宿主随后从 seq 0 重放事件流）。
