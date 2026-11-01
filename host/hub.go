@@ -366,6 +366,17 @@ func New(cfg Config) (*Hub, error) {
 		}
 	}
 
+	// git_status（J3）：经**同一个** registry.RegisterTool 入口注册（与 read/write/bash
+	// 同一条 X1 三段写路径、同一套策略链与 R5 可见性）。它**不进 Descriptors()**（那三个
+	// 是 v0 起就有的内置核心三件，git_status 是后加的只读观测件）——单独注册，形态与
+	// vector_search 那件 opt-in 工具同款。**不进 prompt**：只经注册表暴露给模型按需调用，
+	// 不向 system prompt / 任何注入文本里加一个字。生产默认仍 deny-all（要放行显式
+	// allow = ["git_status"]）。
+	if err := reg.RegisterTool(tools.GitStatusDescriptor(), tools.NewGitStatus()); err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("host: 注册工具 %s: %w", "git_status", err)
+	}
+
 	// MCP client（v3-S1，N1）：外部 server 的工具注册进**同一个** reg——与内置工具
 	// 同一个入口、同一条 X1 三段写路径、同一套策略链与可见性（R5）。
 	//
@@ -461,7 +472,7 @@ func New(cfg Config) (*Hub, error) {
 		agentTypeIDs []string
 	)
 	if cfg.MultiAgent {
-		reg, ids, aterr := buildAgentTypeRegistry(cfg.Model, cfg.AgentTypes)
+		reg, ids, aterr := buildAgentTypeRegistry(cfg.Model, cfg.AgentTypes, cfg.ModelRouter)
 		if aterr != nil {
 			return nil, fmt.Errorf("host: 装配 agent 类型注册表: %w", aterr)
 		}

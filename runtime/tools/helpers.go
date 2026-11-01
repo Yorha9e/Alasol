@@ -84,6 +84,8 @@ func argsHint(tool string) string {
 		return `{"path":"a.txt","content":"新内容"}`
 	case toolNameBash:
 		return `{"command":"ls -la"}`
+	case toolNameGitStatus:
+		return `{"path":"."}`
 	default:
 		return "{...}"
 	}

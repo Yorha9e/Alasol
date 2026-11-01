@@ -340,6 +340,16 @@ func registerBuiltinTools(reg *registry.Registry, opts runnerOpts) (*sandbox.Env
 			return nil, fmt.Errorf("注册工具 %s: %w", d.Name, err)
 		}
 	}
+	// git_status（J3）：经**同一个** registry.RegisterTool 入口注册（与 read/write/bash
+	// 同一条 X1 三段写路径、同一套策略链与 R5 可见性）。它**不进 Descriptors()**（那是
+	// v0 起的内置核心三件）——单独注册，形态与 host 侧同款。走 os/exec 直接调系统 git，
+	// 与执行环境（local/sandbox/remote）无关；不进 prompt（按需经工具面调用）。
+	if err := reg.RegisterTool(tools.GitStatusDescriptor(), tools.NewGitStatus()); err != nil {
+		if env != nil {
+			_ = env.Close()
+		}
+		return nil, fmt.Errorf("注册工具 %s: %w", "git_status", err)
+	}
 	return env, nil
 }
 

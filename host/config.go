@@ -89,6 +89,12 @@ type Config struct {
 	Provider core.Provider
 	// Approver 覆盖（测试注入；nil = 按 Approval 选）。
 	Approver core.Approver
+	// ModelRouter 是模型路由扩展点（I7）：装配 agent 类型注册表与树 root 类型、按类型 id
+	// 解析模型名时的咨询面（见 host.resolveAgentModel 与 core.Router）。**生产 nil = 不路由
+	// = 零行为变化**（完全走既有解析口径：类型声明的 model 字段 / 主模型）。非 nil 时**优先
+	// 用其结果**；RouteModel 返回空 = 该类型无意见，回落既有口径。与 Provider / Approver
+	// 同性质的注入点（测试可注入 fake router）。
+	ModelRouter core.Router
 	// IndexerBatch 索引器单批处理上限（<=0 = 索引器默认）。
 	IndexerBatch int
 	// MaxSessionRows /api/sessions 的行数上限（<=0 = DefaultMaxSessionRows）。

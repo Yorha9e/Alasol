@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/agents"
 	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/loop"
@@ -68,7 +69,16 @@ const agentModelDefault = "default"
 // 宿主是唯一知道"主模型是什么"的装配处，故 sentinel 在这里落实——core 的 buildChildLoop
 // 只把**空** model 当"继承父模型"，非空（含字面 "default"）原样当模型名传给 provider
 // → 让 "default" 漏进运行期，子 agent 会拿一个叫 "default" 的模型去打端点（生产 400）。
-func resolveAgentModel(defaultModel, m string) string {
+//
+// **router 咨询（I7）**：非 nil 时**优先**用 router.RouteModel(agentType) 的结果（trim 后非空
+// 才算"有意见"；空 = 该类型无意见 → 回落下面的既有口径）。**nil = 不路由**，与 router 咨询
+// 加入前**逐字等价**（生产默认 nil = 零行为变化）。
+func resolveAgentModel(defaultModel, agentType, m string, r core.Router) string {
+	if r != nil {
+		if model := strings.TrimSpace(r.RouteModel(agentType)); model != "" {
+			return model // router 非 nil 且有意见：优先用它
+		}
+	}
 	if s := strings.TrimSpace(m); s == "" || s == agentModelDefault {
 		return defaultModel // "default"/空 = 用主模型
 	}
@@ -163,14 +173,20 @@ func builtinAgentTypes() []contracts.AgentType {
 // 当模型名传给 provider——若让 "default" 漏进运行期，子 agent 会拿一个叫 "default" 的模型去打
 // 端点（生产 400）。宿主是唯一知道"主模型是什么"的装配处，故在此把 sentinel 落实（D21：口径只
 // 定义一次）。
-func buildAgentTypeRegistry(defaultModel string, custom []contracts.AgentType) (*agents.TypeRegistry, []string, error) {
-	resolveModel := func(m string) string { return resolveAgentModel(defaultModel, m) }
+func buildAgentTypeRegistry(defaultModel string, custom []contracts.AgentType, routers ...core.Router) (*agents.TypeRegistry, []string, error) {
+	// router 是 I7 的可选注入（生产 host.Config.ModelRouter 传入；测试传 fake；不传 = nil）。
+	// 用可变参数是为了**不改动**既有调用方的形状（省得为一个可选依赖惊动所有调用点）。
+	var router core.Router
+	if len(routers) > 0 {
+		router = routers[0]
+	}
+	resolveModel := func(agentType, m string) string { return resolveAgentModel(defaultModel, agentType, m, router) }
 	builtins := builtinAgentTypes()
 	merged := make(map[string]contracts.AgentType, len(builtins)+len(custom))
 	order := make([]string, 0, len(builtins)+len(custom))
 	for _, t := range builtins {
 		id := strings.TrimSpace(t.ID)
-		t.Model = resolveModel(t.Model)
+		t.Model = resolveModel(id, t.Model)
 		merged[id] = t
 		order = append(order, id)
 	}
@@ -192,7 +208,7 @@ func buildAgentTypeRegistry(defaultModel string, custom []contracts.AgentType) (
 		}
 		seenCustom[id] = true
 		t.ID = id
-		t.Model = resolveModel(t.Model)
+		t.Model = resolveModel(id, t.Model)
 		if _, exists := merged[id]; !exists {
 			order = append(order, id) // 新自定义 id（覆盖内建的不动位置）
 		}
@@ -285,7 +301,7 @@ func (h *Hub) rootAgentType() contracts.AgentType {
 		ID:       agentTypeRoot,
 		Prompt:   "你是本 session 的协调人（主 agent）：统筹任务、按需派生子 agent（spawn）执行子任务、回收它们的 summary 再决策。可派生的类型见 spawn 工具说明。",
 		Tools:    h.rootToolNames(),
-		Model:    resolveAgentModel(h.cfg.Model, agentModelDefault),
+		Model:    resolveAgentModel(h.cfg.Model, agentTypeRoot, agentModelDefault, h.cfg.ModelRouter),
 		CanSpawn: append([]string(nil), h.agentTypeIDs...),
 		PermissionRequest: &contracts.PermissionRequest{
 			Read: contracts.ReadWriteLevelFull, Write: contracts.ReadWriteLevelFull, Exec: contracts.ExecLevelFull,
