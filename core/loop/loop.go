@@ -457,6 +457,16 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
 		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts)
 
+		// v4-4-A（07 M6/M7）**决策：这里不包 core/retry**。
+		//
+		// 两层重试会放大：provider 内部已对 429/5xx 与网络瞬断小重试（3 次指数退避），
+		// loop 再包一层就是"3×3 次请求 + 两段退避相加"——单次模型调用的耗时与端点压力
+		// 都成倍涨，而收益接近零（provider 已经覆盖了同一批瞬时失败）。
+		// 更要紧的是 loop **认不出**哪些失败值得再试：它只看到 core.Provider 的一个 error，
+		// 没有状态码/分类面；凭"是个 error"就重试会把 4xx 请求侧错误也重发三遍。
+		// 因此重试口径收敛在 provider 一处（runtime/provider/openai 的 providerRetryPolicy），
+		// 工具调用侧的重试另走 X1 三段写路径 + 契约 Idempotent/Replay 声明（M7），
+		// 不由本方法代劳。
 		mr, err := l.provider.Run(ctx, req, l.emitFunc(ctx, turn))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {

@@ -34,6 +34,24 @@ import (
 // anchor 核验同源）——host 不自己跑 git（那要把 git 依赖和 cwd 语义拉进 host）。被 review
 // 的 tip 在 review.recorded 事件里（core/gate V6），合并门禁拿"事件里记的 tip" vs "调用方
 // 喂的当前 tip"比对判定失效。
+//
+// # 重试接线（v4-4-A，07 M6/M7）：**不接，挂账**
+//
+// M6 说"CI 检查也走 core/retry"，但本文件的形态接不上，理由（不是懒，是形状不对）：
+//
+//   - 这里的三个操作都是"**读事件流判定** + **发射一条事件**"（RecordReview /
+//     CheckMerge / PredictPostMergeConflicts）。读面失败（store 错误）不是瞬时网络错误，
+//     而是库坏/句柄错——重试同一读三遍只会把同一个错报三遍；
+//   - 发射面（bus.Publish）有**副作用**（事件只增、不可重复消费），且未声明幂等 → 按 M7
+//     "只有声明幂等的操作才自动重试"**不可**自动重试；
+//   - 真正的"CI 检查"在 `runtime/gate.RunWith`：它跑一条不透明 shell 命令并产出一条
+//     receipt。那里重试 = 同一条命令跑两遍 = 两条 receipt（门禁语义从"一次门禁一次事实"
+//     变成"多次取最后一次"），且 CI 命令本身是否幂等由写命令的人决定、框架无从判定。
+//     要接得先定"一条门禁允许多少次运行"的语义，超出本刀范围。
+//
+// 结论：v4-4-A 只在 `runtime/provider/openai` 落 provider 级小重试（模型 API 429/5xx，
+// 07 拍板可重试的那一类），本文件与 runtime/gate 留作挂账；core/retry 的能力面已就位
+// （Do + Policy + 聚合错误），后续接线不必改框架。
 
 // RecordReview 记录一条分支 review 结论（V6）：发射一条 review.recorded durable 事件。
 //
