@@ -205,6 +205,11 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// 硬塞进命令行既难写又容易把凭据泄进 shell 历史与 ps 输出（H12/H19）。
 		// 默认关：一条 [[mcp.servers]] 都没有 = 不装 MCP。
 		MCP: fc.MCP.MCPConfig(),
+
+		// MCP **server** 面（v4-5，B 类）：`alasol mcp-serve` 的工具暴露白名单。
+		// **只走文件配置面**（TOML [mcp_server] expose_tools，与 [[mcp.servers]] 同款：
+		// 安全敏感的暴露名单不进命令行，H12/H19）。默认空 = 零暴露（fail-close）。
+		MCPExposeTools: fc.MCPServer.ExposeToolsCopy(),
 	}
 	if testProviderOverride != nil {
 		// 测试注入的脚本 provider（产物代码永远不设它 → 恒为真 provider）。

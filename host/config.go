@@ -219,6 +219,25 @@ type Config struct {
 	//     整体日志化；要打印用 MCP.Redacted()。
 	MCP mcp.Config
 
+	// ---- v4-5 MCP server（B 类：把 harness 暴露成 MCP server，`alasol mcp-serve`）----
+	//
+	// MCPExposeTools 是 MCP **server** 面的工具暴露白名单：`alasol mcp-serve` 起 stdio
+	// MCP server 时，只有名字进这份白名单、且注册表里真有对应工具条目的才被暴露成
+	// MCP tools（tools/list + tools/call）。
+	//
+	// **fail-close：空 = 一个工具都不暴露**（tools/list 空集、任何 tools/call 命中 unknown
+	// tool）。这是刻意的最小暴露面——任意能连上 stdio 的 MCP client 不等于被授权调用
+	// harness 的写面（write / bash）；要让某个工具可被外部调用，必须在白名单里**点名**它
+	// （显式 opt-in，与 R5"不暴露即不存在"同精神）。stdio 形态的鉴权口径 = 谁拉起谁负责
+	// （同 ACP 的 ssh 口径，N5）：白名单之外本包不自研鉴权。
+	//
+	// 另两条拒绝口径（在 runtime/mcpserver 落）：**不收 mcp__ 开头的名字**（内部命名空间，
+	// 白名单点名也拒）+ **注册表 State 参与判定**（停用的工具不暴露、调用前再查一次）。
+	//
+	// 来源：只走文件配置面（TOML `[mcp_server] expose_tools`，与 [[mcp.servers]] 同款：
+	// 安全敏感的暴露名单不进命令行——命令行会泄进 shell 历史 / ps 输出，H12/H19）。默认空。
+	MCPExposeTools []string
+
 	// ---- v3-S3 工作流引擎（W1 能力包，非强制）----
 	//
 	// WorkflowDir 是工作流**能力包**目录（W13：纯数据 JSON，可被任何语言写/组合/追加）。

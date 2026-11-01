@@ -13,6 +13,23 @@
 //   - 热重载语义（E6）：State 只描述注册表内的生命周期，Reloadable 是元数据声明，
 //     本包不因此改变任何行为。
 //
+// # extension runtime 收口（v4-5）：kind 开放清单里的三个"机制位"当前不建
+//
+// contracts.ExtensionMeta.Kind 是**开放字符串**，其注记列了 tool / provider / policy /
+// store / projection / **compaction / assembler / scheduler** / panel / endpoint /
+// transport / telemetry / approver / sandbox 等。v4-5 的落地口径（诚实记录，别让清单误导）：
+//
+//   - **A 类已落机制**（接口实现为主）：tool / provider / policy / store / projection
+//     五类在本仓有真实实现与接线；
+//   - **B 类边界已落**：MCP server（`alasol mcp-serve`，runtime/mcpserver）把 harness
+//     暴露成 MCP server，是 B 类（进程级边界）的第一个落点；GUI 面板 / IDE 插件 /
+//     第三方工具 / 不可信扩展同属 B 类，后续按需接入；
+//   - **compaction / assembler / scheduler 三个 kind 留位、当前不建机制**：它们只是 Kind
+//     开放清单里的占位名，本包（及 core）**没有**为它们建任何注册/解析/调度机制，也没有
+//     对应的机制契约。14 第 5 项拍板"extension runtime 重点不是新机制"——本轮只收口既有
+//     A 类剩余 + E3/E5 做实 + B 类 MCP server，不新造这三个扩展点的机制。后续要建时再补
+//     机制契约与实现，不要在没机制时按清单名假设它们已可用。
+//
 // 错误口径：调用方用 errors.Is 判定 ErrNotFound / ErrAlreadyRegistered / ErrNotAllowed
 // （以及 ErrStale：裁决期间实例被替换）。
 //

@@ -1034,6 +1034,24 @@ func (h *Hub) Addr() string {
 	return h.cfg.Addr
 }
 
+// Registry 返回 hub 的扩展注册表的**只读视图**（v4-5 B 类 MCP server 面用：
+// `alasol mcp-serve` 经 runtime/mcpserver 读工具条目 + 执行器，把它们暴露成 MCP tools）。
+//
+// 口径：这是**只读消费**出口——mcpserver 只 List/Get 工具条目与执行器，不 Register /
+// Enable / Disable（写面归装配期 host.New 与策略链）。
+//
+// **返回类型收窄成只读接口**（F5；与上面的 EventSource 同一纪律）：返回原始
+// *registry.Registry 等于把注册表的写面（Register / Enable / Disable / Unregister /
+// SetHealth）整个递出去——"约定只读"靠不住（谁都能 Disable 掉别人的扩展、Unregister 掉
+// 内置工具）。接口层不暴露 = 编译期就够不着写方法。返回 nil 仅当接收者为 nil 或 hub
+// 没装注册表（不该发生；调用方判空）。
+func (h *Hub) Registry() RegistryView {
+	if h == nil || h.reg == nil {
+		return nil
+	}
+	return h.reg
+}
+
 // EventSource 是 hub 事件总线的**只读出口**（订阅面）。
 //
 // 为什么是接口而不是 *bus.Bus（F6）：*bus.Bus 上有导出的 Publish——返回它等于把

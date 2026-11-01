@@ -69,6 +69,9 @@ type FileConfig struct {
 	Sandbox SandboxFileConfig `toml:"sandbox"`
 	// MCP MCP client（v3-S1，N1：client 先；默认关 = 不连任何外部 server）。
 	MCP MCPFileConfig `toml:"mcp"`
+	// MCPServer MCP **server** 面（v4-5，B 类：把 harness 暴露成 MCP server；
+	// `alasol mcp-serve` 读它）。默认关 = 白名单空 = 零工具暴露（fail-close 酸测试）。
+	MCPServer MCPExposeFileConfig `toml:"mcp_server"`
 	// WorkflowDir 工作流能力包目录（v3-S3，W13：纯数据 JSON；空 = 只用内建 tower）。
 	WorkflowDir string `toml:"workflow_dir"`
 	// GoalLedger 是否给 session 注入 goal ledger 更新工具（J19/X6；默认 false = 零行为变化）。
@@ -396,6 +399,39 @@ func (c MCPFileConfig) MCPConfig() mcp.Config {
 		})
 	}
 	return out
+}
+
+// MCPExposeFileConfig 是 MCP **server** 面的文件级配置（v4-5，B 类；TOML `[mcp_server]`）。
+//
+// 形如：
+//
+//	[mcp_server]
+//	expose_tools = ["read"]     # 只暴露 read；空/省略 = 一个都不暴露（fail-close）
+//
+// 口径（与 host.Config.MCPExposeTools 一致，不重抄）：
+//   - **fail-close**：`expose_tools` 空 = 零工具暴露（tools/list 空集、任何 tools/call
+//     命中 unknown tool）。这是刻意的最小暴露面，防 harness 写面（write/bash）被任意
+//     MCP client 摸到；
+//   - **只收非 mcp__ 名**：`mcp__*` 是 MCP **client** 侧的内部命名空间（外部 server 的
+//     工具已经由 client 聚合过一次），不上公网面——白名单点名也拒（F2，同 fail-close 精神）；
+//   - **只走文件配置面**：暴露名单是安全敏感的（与 [[mcp.servers]] 的凭据同性质），
+//     不进命令行（命令行泄进 shell 历史 / ps，H12/H19）；
+//   - 白名单里点名但注册表没有的工具名被**忽略**（fail-safe，不因悬空名让 server 残缺）。
+//
+// 命名注记：客户端每-server 元素已占用 MCPServerFileConfig（[[mcp.servers]] 的元素），
+// 故本表按"暴露面"命名，TOML 段仍是 [mcp_server]。
+type MCPExposeFileConfig struct {
+	// ExposeTools 是暴露成 MCP tools 的工具名白名单（注册表工具名，如 read / write）。
+	// 空 = 零暴露（fail-close）。**不收 mcp__ 开头的名字**（内部命名空间，见上）。
+	ExposeTools []string `toml:"expose_tools"`
+}
+
+// ExposeToolsCopy 返回白名单的一份拷贝（nil 安全；不共享底层数组，防调用方改到配置内部）。
+func (c MCPExposeFileConfig) ExposeToolsCopy() []string {
+	if len(c.ExposeTools) == 0 {
+		return nil
+	}
+	return append([]string(nil), c.ExposeTools...)
 }
 
 // copyEnvMap 拷一份键值表（nil 安全；不共享底层 map，防调用方改到配置内部）。

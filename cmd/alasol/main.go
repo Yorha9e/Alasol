@@ -58,6 +58,8 @@ func main() {
 		code = serveMain(os.Args[2:])
 	case "acp":
 		code = acpMain(os.Args[2:])
+	case "mcp-serve":
+		code = mcpServeMain(os.Args[2:])
 	case "chat":
 		code = chatMain(os.Args[2:])
 	case "tui":
@@ -90,6 +92,10 @@ func usage() {
   alasol acp   [flags]                 起 ACP agent 端点（JSON-RPC 2.0 over stdio；K19 跨机：
                                         ssh host alasol acp 接入，鉴权交 SSH；ask 审批经
                                         session/request_permission，无人应答=deny fail-close）
+  alasol mcp-serve [flags]             起 MCP server（B 类，v4-5；stdio 传输，把 harness 工具面
+                                        暴露成 MCP tools）。鉴权=谁拉起谁负责（同 ACP/SSH 口径）；
+                                        暴露面由配置 [mcp_server] expose_tools 白名单决定（空=零暴露，
+                                        fail-close）。stdout 只走 MCP 帧、日志走 stderr
   alasol chat   [flags]                 终端 REPL：对话 / /table / /ctx / /cost
   alasol tui    [flags]                 三面 TUI（对话/审批/在线表，bubbletea，O6/B2）
   alasol models [flags]                 列出端点支持的模型（发现模型名）

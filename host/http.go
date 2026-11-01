@@ -32,6 +32,7 @@ var httpLog = slog.Default()
 //	GET /ws                      → transport.Server.ServeWS（NDJSON 行式事件流）
 //	GET /api/health              → {"ok":bool,"watermark":int,"sessions":int}
 //	GET /api/monitor             → MonitorView（K9：当前采样 + 阈值 + 告警环）
+//	GET /api/extensions          → [ExtensionView, ...]（扩展注册表全 kind 快照 + Health，只读；v4-5）
 //	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12）
 //	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
 //	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
@@ -160,6 +161,8 @@ func (h *Hub) Handler() http.Handler {
 
 	reg("GET", "/api/health", h.serveHealth)
 	reg("GET", "/api/monitor", h.serveMonitor)
+	// 扩展注册表管理/观测面（v4-5 extension runtime 收口）：全 kind 快照 + Health（只读）。
+	reg("GET", "/api/extensions", h.serveExtensions)
 	reg("GET", "/api/sessions", h.serveSessions)
 	// 开新会话的 REST 入口（v3-S5 ①）：与 GET /api/sessions 同路径、不同方法
 	// （reg 的 probe/tbl 会把两种方法都记进 405 口径）。
