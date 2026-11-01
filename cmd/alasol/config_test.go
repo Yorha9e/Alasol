@@ -284,6 +284,60 @@ func TestBuildConfigGraphPrecedence(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 文档族配置面（G2 第 5 族）
+// ---------------------------------------------------------------------------
+
+// TestBuildConfigDocumentsFromFile 钉死 **[documents] 段 → host.Config.DocumentsEnabled**
+// 的映射（cmd/alasol 装配面）。
+//
+// 口径：**只走文件配置面**（不给 flag——与 [vectors] / [blob] 同款：一个布尔开关 +
+// 默认关）。enabled=false = 不建 DocStore、/api/docs* 四个端点不注册（404）= 零行为变化。
+func TestBuildConfigDocumentsFromFile(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := "model = \"m\"\n" +
+		"[documents]\n" +
+		"enabled = true\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+
+	// ① 文件里 enabled = true → host.Config.DocumentsEnabled = true。
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("① 意外错误: %v", err)
+	}
+	if !hc.DocumentsEnabled {
+		t.Error("① 文件的 [documents].enabled=true 应映射到 host.Config.DocumentsEnabled")
+	}
+
+	// ② 没写 [documents] 段 → 默认关（零行为变化，酸测试）。
+	noneFile := filepath.Join(t.TempDir(), "none.toml")
+	if err := os.WriteFile(noneFile, []byte("model = \"m\"\n"), 0o600); err != nil {
+		t.Fatalf("写空配置: %v", err)
+	}
+	hc2, err := buildConfigFrom(t, "-config", noneFile)
+	if err != nil {
+		t.Fatalf("② 意外错误: %v", err)
+	}
+	if hc2.DocumentsEnabled {
+		t.Error("② 无 [documents] 段时文档族应默认关闭")
+	}
+
+	// ③ 写了 enabled = false → 显式关（不是"没写"）。
+	offFile := filepath.Join(t.TempDir(), "off.toml")
+	if err := os.WriteFile(offFile, []byte("model = \"m\"\n[documents]\nenabled = false\n"), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	hc3, err := buildConfigFrom(t, "-config", offFile)
+	if err != nil {
+		t.Fatalf("③ 意外错误: %v", err)
+	}
+	if hc3.DocumentsEnabled {
+		t.Error("③ [documents].enabled=false 应映射为关闭")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // MCP client 配置面（v3-S1，N1）
 // ---------------------------------------------------------------------------
 

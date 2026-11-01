@@ -79,6 +79,18 @@ var httpLog = slog.Default()
 //	  两个端点都是**可选投影**的读写面：未启用时连路由都不注册（与 blob 同口径 = 404），
 //	  开了才可能出现；Score 跨实现不可比（只可在同一次检索内排序用）。
 //
+// 文档族投影（G2 第 5 族；默认关 = Config.DocumentsEnabled=false）：
+//
+//	GET  /api/docs/{collection}/{key} → 单条 storage.Doc JSON；不存在 → 404
+//	GET  /api/docs?collection=&prefix=&limit= → {"docs":[storage.Doc, ...]}
+//	  （按 (collection, key) 字节序；空 = 空数组不是 null；prefix 字节前缀大小写敏感；
+//	   limit 0 = 不截断、负值 → 400）
+//	POST /api/docs/upsert  body {"docs":[storage.Doc,...]} → {"ok":true}
+//	  （整批拒绝：版本冲突 → 409；写经 Transact 收口事务，G17 单写者 ingest 入口）
+//	POST /api/docs/delete  body {"collection":"…","keys":[…]} → {"ok":true}（幂等）
+//
+//	  四个端点**未启用时连路由都不注册**（404 not_found，与 vectors 同口径 = 零行为变化）。
+//
 // 多 worktree 隔离（v1-S5 D：并行任务各占一个工作区）：
 //
 //	GET    /api/worktrees          → [Worktree, ...]（已登记，按 name 排序）
@@ -199,6 +211,16 @@ func (h *Hub) Handler() http.Handler {
 	if h.cfg.VectorsEnabled {
 		reg("GET", "/api/vectors/search", h.serveVectorSearch)
 		reg("POST", "/api/vectors", h.serveVectorIngest)
+	}
+
+	// 文档族投影（G2 第 5 族）：**未启用（Config.DocumentsEnabled=false）时四个路由
+	// 根本不注册** → 路径认不得 → 404 not_found（与 vectors 端点同口径）；开了才注册。
+	// 读面 get/list，写面 upsert/delete（写经 Transact 收口事务，G17 单写者）。
+	if h.docs != nil {
+		reg("GET", "/api/docs/{collection}/{key}", h.serveDocGet)
+		reg("GET", "/api/docs", h.serveDocList)
+		reg("POST", "/api/docs/upsert", h.serveDocUpsert)
+		reg("POST", "/api/docs/delete", h.serveDocDelete)
 	}
 
 	// 合并门禁（v3-S3 清 V6/V7 挂账）：review 记录 + 合并前查放行 + 合并后冲突预测。

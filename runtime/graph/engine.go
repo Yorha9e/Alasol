@@ -319,6 +319,23 @@ func (t sqlTx) Exec(ctx context.Context, query string, args ...any) error {
 	return err
 }
 
+// QueryContext 在**调用方事务里**跑一条查询（读回本事务未提交的写）。
+//
+// # 为什么加这个方法（additive，不扩 core/graph.Tx）
+//
+// core/graph.Tx 刻意只留 `Exec`（G2b：不泄漏引擎特性，N5 拍板保留 raw-exec 形状）——
+// 但有些写面需要**在同一个事务里读回自己刚写的行**做版本/冲突检查
+// （runtime/store/sqlite.DocStore 的 Upsert：库内现存版本检查必须看得见本事务的未提交写，
+// 否则"同事务二次 Upsert 不同版本"的冲突会被静默吞掉）。
+//
+// 实现侧的做法是**可选能力面**：写面自己声明一个局部接口
+// （`QueryContext(ctx, query, args...) (*sql.Rows, error)`）并对传入的 Tx 做类型断言——
+// 断言不过就**显式报错**（fail-close），绝不静默退回"看不见未提交写"的旧读法。
+// 这样 core 契约零改动（core/graph.Tx 形状不动），而真实 SQL 事务（*sql.Tx）天然满足。
+func (t sqlTx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return t.tx.QueryContext(ctx, query, args...)
+}
+
 // SQLExecTx 是"能执行语句的面"（建表用：DDL 幂等，无需事务边界）。
 //
 // 它也是 Projection 自建表的句柄类型（F6：DDL 不塞进调用方事务）。

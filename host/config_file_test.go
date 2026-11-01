@@ -609,6 +609,35 @@ func TestLoadFileConfigWALAndBudgetDefaults(t *testing.T) {
 	}
 }
 
+// TestLoadFileConfigDocumentsSection（G2 第 5 族）：[documents] 段正常解析
+// （未知键 fail-close 不许误伤合法配置——反射派生的合法键清单自动含本段）。
+func TestLoadFileConfigDocumentsSection(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[documents]
+enabled = true
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if !fc.Documents.Enabled {
+		t.Error("[documents].enabled 解析错：应为 true")
+	}
+}
+
+// TestLoadFileConfigDocumentsDefaults（G2 第 5 族）：不写 [documents] 段 = 默认关
+// （零行为变化的配置面口径：不建 DocStore、/api/docs* 四个端点 404）。
+func TestLoadFileConfigDocumentsDefaults(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `model = "m"`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if fc.Documents.Enabled {
+		t.Error("[documents].enabled 缺省应为 false（关），got true")
+	}
+}
+
 // TestLoadFileConfigTelemetrySection（L2/D19）：[telemetry] 段正常解析
 // （未知键 fail-close 不许误伤合法配置——反射派生的合法键清单自动含本段）。
 func TestLoadFileConfigTelemetrySection(t *testing.T) {

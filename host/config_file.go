@@ -93,6 +93,9 @@ type FileConfig struct {
 	// Vectors 向量引擎 + RAG 检索（v4-3-B，G2d）：[vectors] 段。默认关（enabled=false）=
 	// 不建向量库、`vector_search` 工具不注册、/api/vectors* 端点 404——零行为变化（酸测试）。
 	Vectors VectorsFileConfig `toml:"vectors"`
+	// Documents 文档族投影（G2 第 5 族）：[documents] 段。默认关（enabled=false）=
+	// 不建 DocStore、/api/docs* 四个端点 404——零行为变化（酸测试）。
+	Documents DocumentsFileConfig `toml:"documents"`
 	// Wal WAL 预写日志（v4-4-B）：[wal] 段。默认关（dir 空）= 一个文件都不建、一次追加
 	// 都不做、行为与现状**逐事件等价**（酸测试）。
 	Wal WalFileConfig `toml:"wal"`
@@ -157,6 +160,25 @@ type VectorsFileConfig struct {
 	Enabled bool `toml:"enabled"`
 	// TopK 检索默认 top-k（0 = vecmem 默认 10；负值非法 = 启动即拒）。
 	TopK int `toml:"top_k"`
+}
+
+// DocumentsFileConfig 是文档族投影的文件级配置（G2 第 5 族）。
+// 形如：
+//
+//	[documents]
+//	enabled = true      # 是否装配文档族存储（默认 false = 关 = 零行为变化）
+//
+// 口径（与 host.Config.DocumentsEnabled 一致）：
+//   - **enabled 默认 false = 关**：不建 DocStore、GET /api/docs/{collection}/{key}、
+//     GET /api/docs、POST /api/docs/upsert、POST /api/docs/delete 都不注册（404）——
+//     与现状完全等价（酸测试）；
+//   - **没有路径/dir**：DocStore 是**事件库的同库单表**（SQLite docs 表，(collection,key)
+//     主键），表由 EnsureSchema 建——要换实现是换存储的事（G2b），消费方零改动；
+//   - **写只经宿主 ingest 入口**（/api/docs/upsert、/api/docs/delete，经 Transact 收口
+//     事务；G17 单写者：与 IngestVectors 同口径）。文档是投影，事件流才是事实源（F5）。
+type DocumentsFileConfig struct {
+	// Enabled 是否装配文档族存储（默认 false = 关 = 零行为变化）。
+	Enabled bool `toml:"enabled"`
 }
 
 // WalFileConfig 是 WAL 预写日志的文件级配置（v4-4-B）。

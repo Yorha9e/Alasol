@@ -330,6 +330,20 @@ type Config struct {
 	// 只有 VectorsEnabled=true 时才被消费（关了连槽位都不看）。
 	EmbeddingProvider EmbeddingProvider
 
+	// ---- 文档族投影（G2 第 5 族，v4 装配面）----
+	//
+	// DocumentsEnabled 是否装配文档族存储（DocStore：单表 docs，(collection,key) 主键寻址）。
+	// **默认 false = 零行为变化**（酸测试）：不建 DocStore、GET/POST /api/docs* 四个端点
+	// 都不注册（404）——与装配前的形态逐字节等价。开了才建**所有 session 共享的一个**
+	// DocStore（runtime/store/sqlite，与事件库同一连接池）；EnsureSchema 失败拒绝启动。
+	//
+	// 写面口径：文档是投影、事件流才是事实源（F5）——HTTP 写只经宿主 ingest 入口
+	//（/api/docs/upsert、/api/docs/delete，经 DocStore.Transact 收口事务；G17 单写者：
+	// 写只经宿主这一个 ingest 入口，与 IngestVectors 同口径）；索引器路径自带事务。
+	//
+	// 形态对齐 Config.VectorsEnabled：opt-in 布尔开关，默认关、零开销、关 = 零行为变化。
+	DocumentsEnabled bool
+
 	// ---- L2/D19 telemetry 观测管道（独立出站口）----
 	//
 	// Telemetry 是观测管道的模式："" | "none" = **关**（默认）；"file" = NDJSON 落盘；

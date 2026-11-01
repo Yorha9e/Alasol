@@ -179,6 +179,11 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		VectorsEnabled: fc.Vectors.Enabled,
 		VectorsTopK:    fc.Vectors.TopK,
 
+		// 文档族投影（G2 第 5 族）：**只走文件配置面**（TOML `[documents]`，与 [vectors]
+		// 同款：一个布尔开关 + 默认关）。enabled=false = 不建 DocStore、/api/docs* 四个
+		// 端点不注册（404）= 零行为变化（酸测试）。
+		DocumentsEnabled: fc.Documents.Enabled,
+
 		// WAL 预写日志（v4-4-B）：**只走文件配置面**（TOML `[wal]`，与 [blob] / [vectors]
 		// 同款：一个目录路径 + 默认关）。dir 空 = 关 = 一个文件都不建 = 零行为变化（酸测试）。
 		// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面。

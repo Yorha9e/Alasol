@@ -740,14 +740,30 @@ func joinChunks(parts [][]byte) []byte {
 
 type mapDocs struct {
 	mu   sync.RWMutex
-	data map[string]Doc
+	data map[docKey]Doc
 }
 
 func newMapDocs() *mapDocs {
-	return &mapDocs{data: map[string]Doc{}}
+	return &mapDocs{data: map[docKey]Doc{}}
 }
 
-func docKey(collection, key string) string { return collection + "\x00" + key }
+// docKey 是文档的**复合主键**（collection + key）。
+//
+// **为什么是结构体而不是拼字符串**（F3）：`collection + "\x00" + key` 这种拼法**会撞键**——
+// ("a\x00b", "c") 与 ("a", "b\x00c") 拼出来是同一个字符串 → 两条**不同的文档**被当成同一条：
+// 版本检查互相顶掉、pending 里后者覆盖前者 → 一条文档的版本冲突被**静默吞掉**
+// （写面以为"批内同键"、实际是两行数据）。结构体键没有这种歧义（两段分别比较，
+// NUL 只是普通字节）。
+type docKey struct {
+	collection string
+	key        string
+}
+
+// docKeyOf 造一个复合主键。
+func docKeyOf(collection, key string) docKey { return docKey{collection: collection, key: key} }
+
+// String 把复合主键渲染成可读形态（报错文案用；不是编码，只是显示）。
+func (k docKey) String() string { return k.collection + "/" + k.key }
 
 func (d *mapDocs) EnsureSchema(context.Context) error { return nil }
 func (d *mapDocs) Upsert(ctx context.Context, tx coregraph.Tx, docs []Doc) error {
@@ -764,7 +780,7 @@ func (d *mapDocs) Upsert(ctx context.Context, tx coregraph.Tx, docs []Doc) error
 		return err
 	}
 	for _, doc := range docs {
-		d.data[docKey(doc.Collection, doc.Key)] = doc
+		d.data[docKeyOf(doc.Collection, doc.Key)] = doc
 	}
 	return nil
 }
@@ -772,9 +788,9 @@ func (d *mapDocs) Upsert(ctx context.Context, tx coregraph.Tx, docs []Doc) error
 // checkBatch 校验一批文档的写入口径（调用方持有锁）：批内同一键的版本必须一致，
 // 且与库里现存版本一致（doc.Revision 非 0 时）。
 func (d *mapDocs) checkBatch(docs []Doc) error {
-	pending := map[string]Doc{}
+	pending := map[docKey]Doc{}
 	for _, doc := range docs {
-		k := docKey(doc.Collection, doc.Key)
+		k := docKeyOf(doc.Collection, doc.Key)
 		if prev, ok := pending[k]; ok && doc.Revision > 0 && prev.Revision != doc.Revision {
 			return fmt.Errorf("%w: 批内 doc %s 版本 %d ≠ %d", ErrConflict, k, doc.Revision, prev.Revision)
 		}
@@ -794,7 +810,7 @@ func (d *mapDocs) Delete(ctx context.Context, tx coregraph.Tx, collection string
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, k := range keys {
-		delete(d.data, docKey(collection, k))
+		delete(d.data, docKeyOf(collection, k))
 	}
 	return nil
 }
@@ -804,13 +820,13 @@ func (d *mapDocs) Clear(ctx context.Context, tx coregraph.Tx) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.data = map[string]Doc{}
+	d.data = map[docKey]Doc{}
 	return nil
 }
 func (d *mapDocs) Get(_ context.Context, collection, key string) (Doc, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	doc, ok := d.data[docKey(collection, key)]
+	doc, ok := d.data[docKeyOf(collection, key)]
 	if !ok {
 		return Doc{}, fmt.Errorf("%w: doc %s/%s", ErrNotFound, collection, key)
 	}
@@ -846,11 +862,11 @@ func (d *mapDocs) List(_ context.Context, q DocQuery) ([]Doc, error) {
 type logDocs struct {
 	mu   sync.RWMutex
 	log  []Doc
-	seen map[string]int // docKey → 最新版本在 log 里的下标
+	seen map[docKey]int // docKey → 最新版本在 log 里的下标
 }
 
 func newLogDocs() *logDocs {
-	return &logDocs{seen: map[string]int{}}
+	return &logDocs{seen: map[docKey]int{}}
 }
 
 func (d *logDocs) EnsureSchema(context.Context) error { return nil }
@@ -866,7 +882,7 @@ func (d *logDocs) Upsert(ctx context.Context, tx coregraph.Tx, docs []Doc) error
 		return err
 	}
 	for _, doc := range docs {
-		k := docKey(doc.Collection, doc.Key)
+		k := docKeyOf(doc.Collection, doc.Key)
 		d.log = append(d.log, doc)
 		d.seen[k] = len(d.log) - 1
 	}
@@ -875,9 +891,9 @@ func (d *logDocs) Upsert(ctx context.Context, tx coregraph.Tx, docs []Doc) error
 
 // checkBatch 校验一批文档的写入口径（调用方持有锁）。
 func (d *logDocs) checkBatch(docs []Doc) error {
-	pending := map[string]Doc{}
+	pending := map[docKey]Doc{}
 	for _, doc := range docs {
-		k := docKey(doc.Collection, doc.Key)
+		k := docKeyOf(doc.Collection, doc.Key)
 		if prev, ok := pending[k]; ok && doc.Revision > 0 && prev.Revision != doc.Revision {
 			return fmt.Errorf("%w: 批内 doc %s 版本 %d ≠ %d", ErrConflict, k, doc.Revision, prev.Revision)
 		}
@@ -909,7 +925,7 @@ func (d *logDocs) Delete(ctx context.Context, tx coregraph.Tx, collection string
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, k := range keys {
-		key := docKey(collection, k)
+		key := docKeyOf(collection, k)
 		if i, ok := d.seen[key]; ok {
 			d.log[i] = Doc{} // 墓碑：保留行、内容清空（读时视为不存在）
 		}
@@ -922,13 +938,13 @@ func (d *logDocs) Clear(ctx context.Context, tx coregraph.Tx) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.log, d.seen = nil, map[string]int{}
+	d.log, d.seen = nil, map[docKey]int{}
 	return nil
 }
 func (d *logDocs) Get(_ context.Context, collection, key string) (Doc, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	i, ok := d.seen[docKey(collection, key)]
+	i, ok := d.seen[docKeyOf(collection, key)]
 	if !ok || d.log[i].Key == "" {
 		return Doc{}, fmt.Errorf("%w: doc %s/%s", ErrNotFound, collection, key)
 	}
@@ -940,7 +956,7 @@ func (d *logDocs) List(_ context.Context, q DocQuery) ([]Doc, error) {
 	var out []Doc
 	for i := range d.log {
 		doc := d.log[i]
-		if doc.Key == "" || d.seen[docKey(doc.Collection, doc.Key)] != i {
+		if doc.Key == "" || d.seen[docKeyOf(doc.Collection, doc.Key)] != i {
 			continue // 被后来的版本/墓碑盖掉
 		}
 		if q.Collection != "" && doc.Collection != q.Collection {
@@ -1611,6 +1627,64 @@ func TestDocumentProjectionDeleteThenUpsert(t *testing.T) {
 		// 反面：没删的时候版本不同 → 仍然冲突（别把防线一起拆了）。
 		if err := tc.impl.Upsert(ctx, tx, []Doc{{Collection: "c", Key: "k", Revision: 7}}); !errors.Is(err, ErrConflict) {
 			t.Fatalf("%s: 未删时版本不同应 ErrConflict，得到 %v", tc.name, err)
+		}
+	}
+}
+
+// TestDocumentProjectionCompositeKeyNoCollision（F3 回归）：**复合主键不许撞键**。
+//
+// 旧口径用 `collection + "\x00" + key` 拼字符串当 map 键 → ("a\x00b", "c") 与
+// ("a", "b\x00c") 拼出来是**同一个字符串** → 两条**不同的文档**被当成同一条：
+// 批内 pending 里后者覆盖前者、库内版本检查也拿后者的版本去比 → 前者的版本冲突被
+// **静默吞掉**（写面以为"批内同键 LWW"，实际是两行数据，其中一行的 rev9 悄悄落库）。
+//
+// 现在的口径：复合主键是**结构体**（两段分别比较，NUL 只是普通字节）→ 两条是两个键 →
+// 版本冲突如实判出、整批拒绝。
+//
+// 这条同时钉死"两套替身口径一致"（map ↔ 追加日志）：撞键是**共同的**缺陷，
+// 只修一套 = 契约没被钉住。
+func TestDocumentProjectionCompositeKeyNoCollision(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		impl interface {
+			DocumentProjection
+			Documents
+		}
+	}{
+		{"map 文档", newMapDocs()},
+		{"追加日志文档", newLogDocs()},
+	} {
+		tx := &txRecorder{}
+		if err := tc.impl.EnsureSchema(ctx); err != nil {
+			t.Fatalf("%s: EnsureSchema: %v", tc.name, err)
+		}
+		// 种子：("a\x00b", "c") rev1。
+		if err := tc.impl.Upsert(ctx, tx, []Doc{{Collection: "a\x00b", Key: "c", Revision: 1}}); err != nil {
+			t.Fatalf("%s: 种子 Upsert: %v", tc.name, err)
+		}
+		// 一批里同时写两条**不同**的文档：
+		//   ("a\x00b", "c") rev9 —— 与库里 rev1 冲突；
+		//   ("a", "b\x00c")  rev0 —— 另一条文档（LWW 免检，本来不冲突）。
+		// 撞键口径下这两条被当成"批内同键" → pending 被 rev0 覆盖 → 免检 → rev9 静默落库。
+		err := tc.impl.Upsert(ctx, tx, []Doc{
+			{Collection: "a\x00b", Key: "c", Revision: 9},
+			{Collection: "a", Key: "b\x00c", Revision: 0},
+		})
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("%s: 复合键撞键会让 rev9 静默落库（应 ErrConflict），得到 %v", tc.name, err)
+		}
+		// 整批拒绝：库里那条仍是 rev1（没被 rev9 覆盖）。
+		doc, err := tc.impl.Get(ctx, "a\x00b", "c")
+		if err != nil {
+			t.Fatalf("%s: Get(a\\x00b/c): %v", tc.name, err)
+		}
+		if doc.Revision != 1 {
+			t.Fatalf("%s: 冲突批次不该改已有文档（版本仍应是 1），得到 %d", tc.name, doc.Revision)
+		}
+		// 另一条文档也不该出现（整批拒绝 = 零写入）。
+		if _, err := tc.impl.Get(ctx, "a", "b\x00c"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s: 冲突批次零写入（a/b\\x00c 不该存在），得到 %v", tc.name, err)
 		}
 	}
 }

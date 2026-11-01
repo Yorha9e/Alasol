@@ -99,6 +99,16 @@ type Hub struct {
 	// 不丢事实 F5；所有 session 共享一个库）。
 	vecs     storage.Retriever
 	vecIndex storage.VectorIndex
+	// docs 是文档族（G2 第 5 族）的存储槽位（**接口面** docStore，见 host/docs.go；
+	// 当前实现 = runtime/store/sqlite.DocStore；nil = 未启用 = 零行为变化酸测试）。
+	// 开了才建（Config.DocumentsEnabled=true）——所有 session 共享**一个** DocStore
+	// （事件库同库单表，EnsureSchema 建表）。
+	// 读面供 /api/docs 查询；写只经宿主 ingest 入口（/api/docs/upsert、
+	// /api/docs/delete，经 Transact 收口事务——G17 单写者，与 IngestVectors 同口径）。
+	//
+	// **槽位是接口不是具体类型**（形态照 blob 的 storage.Blob）：换实现**宿主零改动**
+	// （方法集全在实现侧，零适配层）。
+	docs docStore
 	// wal 是 v4-4-B WAL 预写日志的目录管理器（runtime/store/walfile；nil = 未启用 =
 	// 零行为变化酸测试）。开了才建（Config.WalDir 非空）——per-session Writer 由它懒建，
 	// loop 经 walFor 拿到 sink（turn.begin / turn.delta / turn.end / turn.failed / blob.plan 五个写点）。
@@ -526,6 +536,29 @@ func New(cfg Config) (*Hub, error) {
 	// 恒建（极廉价：一把 mutex + 一个计数器）——向量面没开时没人用它。
 	vecGate := &vectorGate{}
 
+	// 文档族存储（G2 第 5 族）：**默认不启用**（Config.DocumentsEnabled=false = 不建
+	// DocStore、/api/docs* 四个端点不注册（404）= 零行为变化，酸测试）。开了才建一个
+	// 所有 session 共享的 DocStore（runtime/store/sqlite：事件库同库单表 docs，
+	// (collection,key) 主键寻址），并 EnsureSchema 建表（F6：DDL 归实现侧）。
+	// EnsureSchema 失败 → 拒绝启动（与 blobfs 同口径：显式要的能力没起来，比静默不建好排查）。
+	// 写只经宿主 ingest 入口（G17 单写者：与 IngestVectors 同口径）；文档是投影，
+	// 事件流才是事实源（F5）。
+	//
+	// 槽位类型是**接口**（docStore，见 host/docs.go）：当前实现 = sqlite.DocStore，
+	// 换实现宿主零改动。
+	var docsStore docStore
+	if cfg.DocumentsEnabled {
+		ds, derr := sqlite.NewDocStore(st)
+		if derr != nil {
+			return nil, fmt.Errorf("host: 建文档族存储: %w", derr)
+		}
+		if derr := ds.EnsureSchema(context.Background()); derr != nil {
+			return nil, fmt.Errorf("host: 建文档表: %w", derr)
+		}
+		docsStore = ds
+		hubLog.Info("host: 已启用文档族存储（SQLite 单表投影）", "table", "docs")
+	}
+
 	// WAL 预写日志（v4-4-B）：**默认不启用**（Config.WalDir 空 = 不建目录、不建任何文件、
 	// loop.Config.WalSink 恒 nil = 一个字节都不多写 = 零行为变化，酸测试）。配了目录才建
 	// 目录管理器；per-session Writer 由它懒建（loopFor → walFor），Close 时统一收口。
@@ -614,6 +647,7 @@ func New(cfg Config) (*Hub, error) {
 		blob:              blobStore,
 		vecs:              vecReader,
 		vecIndex:          vecWriter,
+		docs:              docsStore,
 		embed:             cfg.EmbeddingProvider,
 		vecGate:           vecGate,
 		wal:               walStore,
