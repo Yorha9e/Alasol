@@ -238,8 +238,9 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	// **崩溃窗口（如实记口径，消不掉）**：fail-open 只覆盖 Put **返错**这一种失败。blob 写成功、
 	// completed 落盘前进程崩掉 → 磁盘上多一份没人引用的 blob（孤儿内容）；本实现"先写 blob
 	// 成功、再落引用"的顺序保证**引用与内容最终一致**（引用不会指向空处），崩溃续跑按事件里的
-	// `binary_ref` 调 blob.Get 补取全文。孤儿 blob 的回收策略未做（磁盘单调增长 + 崩溃残留
-	// 临时文件/孤儿目录），挂账见 11 施工计划。
+	// `binary_ref` 调 blob.Get 补取全文。孤儿 blob / .tmp 残留的回收走 blobfs.GC
+	// （CLI：`alasol blob-gc`；Retention=0 默认只做安全两扫；mtime 清扫的**龄期 = 最后外置
+	// 时间**——幂等 Put 刷新 meta.json 的 mtime，故重复引用过的 blob 不被当超期残留删掉）。
 	//
 	// 注意：回填给模型的始终是**完整** res（末尾 toolResultText(res)）——外置只瘦身事件流，
 	// 不让模型看不到完整工具输出。

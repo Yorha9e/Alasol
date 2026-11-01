@@ -147,7 +147,15 @@ func (s *Store) Put(_ context.Context, meta storage.BlobMeta, content io.Reader)
 			return storage.BlobMeta{}, fmt.Errorf("blobfs: id %s 已存在且内容不一致（调用方须换新 id，不许静默覆盖）: %w",
 				string(id), storage.ErrConflict)
 		}
-		return existing, nil // 幂等：原样返回已有元数据，不写第二份
+		// 幂等：原样返回已有元数据，**不写第二份**（内容文件零写入、meta 内容零改写）。
+		//
+		// 但**触碰 meta.json 的 mtime**（F3：龄期 = 最后外置时间）：内容寻址 id 下"重复引用
+		// 同一份内容"是常态（重放、再次引用同一份大 result）——GC 的 mtime 清扫按 meta 的
+		// mtime 判龄，不刷新就会把**仍在被引用**的 blob 当超期残留删掉。刷 mtime **不算
+		// "写第二份"**：meta 的**内容**一个字节都没改（契约"原样返回已有元数据"不动）。
+		// 触碰失败**不影响 Put 返回**（尽力而为：GC 少回收一点 ≠ 数据损失）。
+		s.touchMeta(filepath.Join(dir, metaFileName))
+		return existing, nil
 	}
 
 	// 新建：content 先落（临时文件 + rename），meta.json 后落（权威存在标记）。
@@ -356,3 +364,12 @@ func (s *Store) writeMeta(dir string, meta storage.BlobMeta) error {
 
 // nowRFC3339 返回 UTC 的 RFC 3339 时间戳（BlobMeta.CreatedAt；诊断用）。
 func nowRFC3339() string { return time.Now().UTC().Format(time.RFC3339) }
+
+// touchMeta 刷 meta.json 的 mtime（= "最后外置时间"标记；见 Put 幂等分支的 F3 口径）。
+//
+// **尽力而为**：失败**不报错、不影响调用方**——刷不动只是让 GC 少回收一点（真数据损失
+// 的方向相反：GC 删得太多才是损失）。故这里吞掉错误，不往 Put 的错误路径上抛。
+func (s *Store) touchMeta(path string) {
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+}

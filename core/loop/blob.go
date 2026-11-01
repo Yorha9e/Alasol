@@ -3,12 +3,14 @@ package loop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"unicode/utf8"
 
 	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/storage"
 )
 
@@ -81,8 +83,10 @@ import (
 // 指向空处的悬空引用。
 //
 // 崩溃续跑口径：引用最终一致——续跑按事件里的 `binary_ref` 调 blob.Get **补取全文**；取不到
-// （已回收/未落地）时报"内容已回收"，不假装事件不存在。孤儿 blob 的**回收策略未做**（磁盘单调
-// 增长 + 崩溃残留临时文件/孤儿目录），挂账见 11 施工计划。
+// （已回收/未落地）时报"内容已回收"，不假装事件不存在。孤儿 blob / .tmp 残留的**回收**走
+// blobfs.GC（三扫：.tmp → 孤儿目录 → 可选 mtime 清扫；CLI：`alasol blob-gc`，Retention=0
+// 默认只做安全两扫）。mtime 清扫的**龄期 = 最后外置时间**：幂等 Put（同 id 同内容）会刷新
+// meta.json 的 mtime（见 blobfs.Put）→ 仍在被引用的 blob 不会被当成超期残留删掉。
 //
 // # 接线覆盖面：哪些 completed 写路径走外置
 //
@@ -213,6 +217,41 @@ func blobSummaryRestPlaceholder(blobID contracts.Ulid, n int) string {
 // blobLog 是 D4 外置失败（fail-open）时的告警出口。用 slog（结构化、可被宿主接管）。
 var blobLog = slog.Default()
 
+// blobIDDomain 是 blob id 派生的**域前缀**（与 host/vectors.go 的 "vec\x00" 隔开，
+// 防跨用途撞键——同是短哈希 id，域不同才不会互相覆盖）。
+const blobIDDomain = "blob\x00"
+
+// contentBlobID 由**完整 ToolResult JSON 字节**派生内容寻址 blob id（重放幂等）。
+//
+// # 公式（与 host/vectors.go 的 vectorEntryID 同款纪律；本文 = 实现口径）
+//
+//	id = Crockford26( SHA-256( "blob\x00" ‖ raw )[:16] )
+//
+// 其中：
+//   - "blob\x00" 是**域前缀**（与 "vec\x00" 等其它短哈希隔开，防跨用途撞键）；
+//   - raw 是单输入（完整 ToolResult JSON 字节）→ **不需要长度前缀**（域前缀 + 内容
+//     拼接无歧义，不像 vectorEntryID 的双输入需要 u64be(len) 分段）；
+//   - 取 SHA-256 的**前 128bit** 编 Crockford base32（core.EncodeCrockford26，框架
+//     26 编码的单一实现处）→ 恒为合法 ULID 形态（blobfs.Put 的 ValidUlid 校验过）。
+//
+// # 口径（内容寻址：同内容同 id）
+//
+//   - 同一内容重放（或不同工具产出同内容）→ 同一 id → blobfs.Put 走**既有幂等路径**
+//     （内容一致原样返回，不写第二份）——重放不再多造 blob；
+//   - 不同内容 → 不同 id（SHA-256 抗碰撞）；
+//   - 哈希碰撞（不同内容同 id，概率 2^-128）→ Put 报 ErrConflict → 外置 **fail-open**
+//     原样内联（见 externalizeResult 的既有失败路径），不覆盖已落库内容。
+//
+// meta.Name（tool_result_<callid>.json）保留作诊断；共享 blob 的 Name 记**首个写入者**
+// （幂等二次 Put 原样返回已有 meta，不改 Name）。
+func contentBlobID(raw []byte) contracts.Ulid {
+	h := sha256.New()
+	h.Write([]byte(blobIDDomain))
+	h.Write(raw)
+	sum := h.Sum(nil)
+	return contracts.Ulid(core.EncodeCrockford26(sum[:16]))
+}
+
 // planExternalize（v4-4-B）：在 **tool.call.intent 发布之前**记一条外置计划（blob.plan）。
 //
 // 为什么单独一个写点、且在 intent 之前：写点插在 intent→completed 之间 = 在 X1 关键路径
@@ -256,8 +295,12 @@ func (l *Loop) externalizeResult(ctx context.Context, payload *contracts.ToolCal
 	if int64(len(raw)) <= threshold {
 		return nil // 不大：原样内联（酸测试等价）
 	}
-	// 写 blob（fresh id：实现发号，永不撞已落库的引用 → 不走 ErrConflict 路径）。
+	// 内容寻址 id（见 contentBlobID）：同内容同 id（重放幂等、天然去重）——重放路径
+	// （replay.go）同口径外置时走 blobfs.Put 的既有幂等路径，不写第二份；碰撞概率
+	// 2^-128，撞了 Put 报 ErrConflict → 走下方 fail-open（原样内联，不覆盖已落库内容）。
+	// meta.Name 保留诊断用（tool_result_<callid>.json）；共享 blob 的 Name 记首个写入者。
 	meta, err := l.blob.Put(ctx, storage.BlobMeta{
+		ID:        contentBlobID(raw),
 		MediaType: "application/json",
 		Name:      "tool_result_" + string(payload.ToolCallID) + ".json", // 诊断用
 	}, bytes.NewReader(raw))

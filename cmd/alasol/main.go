@@ -74,6 +74,8 @@ func main() {
 		code = modelsMain(os.Args[2:])
 	case "wal":
 		code = walMain(os.Args[2:])
+	case "blob-gc":
+		code = blobGCMain(os.Args[2:])
 	case "eval":
 		code = evalMain(os.Args[2:])
 	case "-h", "--help", "help":
@@ -111,6 +113,15 @@ func usage() {
                                         （上次崩在第几轮/跑的什么模型/吐过几段 delta/
                                         哪些 tool_call 的 blob 是孤儿候选）。**观察面，
                                         不写回事件流**；未配 [wal].dir = wal_exists=false
+  alasol blob-gc [flags]                blob 外置仓库 GC（读 [blob].dir）：回收崩溃残留
+                                        （.tmp / 孤儿目录）；-retention 默认 0 = 只安全
+                                        两扫（不碰有引用的完整 blob），>0 才按 mtime 清扫
+                                        （龄期 = 最后外置时间，幂等引用会刷新；binary_ref
+                                        不动，读侧报"内容已回收"）。-grace 默认 1h（显式 0
+                                        = 仍用 1h，安全网不给关）；负值 = 非法配置 → 退出码
+                                        2。锁只在同进程内互斥，跨进程唯一防线是 Grace。
+                                        单行 JSON 到 stdout；[blob].dir 未配 = 退出码 2
+                                        （不静默成功）
   alasol eval -session <id> [flags]     最小评测面（L4/L5）：事件流即数据集——回放该
                                         session 的 durable 事件，折叠逐 turn 指标
                                         （轮数/工具调用数/成本 tokens/时长），单行 JSON

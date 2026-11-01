@@ -15,7 +15,7 @@
 | `turn_id` | 框架 | session 内 | int64 序号 | 终身 | 轮次引用（可比较、可排序） |
 | `step_id` | 框架 | turn 内 | int64 序号 | 终身 | 步骤引用 |
 | `tool_call_id` | **provider** | provider 内 | **不透明字符串** | 一次调用 | **必须原样回传 provider** |
-| `blob_id` | 框架 | 全局 | ULID | 终身 | 大对象引用 |
+| `blob_id` | 框架（**内容寻址派生**，见 §2 例外注记） | 全局 | **内容寻址短哈希**（26 字符 Crockford base32，**形态兼容 ULID**；**无时间序**：字典序 ≠ 时间序、不自带创建时间） | 终身（内容不变则 id 不变） | 大对象引用 |
 | `artifact_id` | 框架 | 全局 | ULID | 终身 | 产物引用 |
 | `project_id` | 框架 | 全局 | `hash(canonical_cwd)` 短 base32（SHA-256 截短 128bit→26 字符） | 路径变更则变 | 目录分组 |
 | `repo_id` | 框架 | 全局 | `hash(canonical_git_root)` 短 base32（同上） | 同上 | 跨 worktree 聚合 |
@@ -52,6 +52,14 @@
 
 **不选 UUIDv4**：完全随机 → 不可排序、不含时间、需要额外索引列
 **不选 UUIDv7**：可用（v7 也是时间前缀），但带连字符且大小写敏感，不如 ULID 适合做文件名
+
+**例外注记（2026-11-02，缺口 4）——`blob_id` 是内容寻址短哈希**：
+`blob_id` 现为 **内容寻址短哈希** = `Crockford26(SHA-256("blob\x00"‖content)[:16])`
+（实现见 `core/loop/blob.go` 的 `contentBlobID`）：**形态兼容 ULID**（26 字符 Crockford
+base32、文件名/URL 安全、字符集合法），但**无时间序**——**字典序 ≠ 时间序**、**不自带创建
+时间**（创建时间看 `BlobMeta.CreatedAt`）。它由**调用方按内容派生**，**不是框架发号**：
+框架发号的 id 仍**唯一来自 `core.NewUlid`**（§1 表其余各行不变）。换取的是**重放幂等**
+——同一份内容重放（崩溃续跑）→ **同一个 id** → blobfs 的幂等分支生效（不写第二份）。
 
 ---
 
