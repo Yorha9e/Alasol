@@ -282,6 +282,7 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 		BlobSink:        h.blob,
 		BlobMaxInline:   h.cfg.BlobMaxInline,
 		WalSink:         h.walFor(forkSID),
+		TelemetrySink:   h.telemetrySink(),
 	})
 	if err != nil {
 		btw := BtwResult{

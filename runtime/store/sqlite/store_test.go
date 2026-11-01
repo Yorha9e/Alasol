@@ -302,6 +302,172 @@ func TestReadFromFilterAndLimit(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// G5：ReadSlice（seq 闭区间分段读）——与 ReadFrom 全量等价 + 边界。
+// ---------------------------------------------------------------------------
+
+// TestReadSliceMatchesReadFrom：分段拼接（步长 3）与 ReadFrom 全量结果逐事件一致
+// （两 session 交错 + 幂等重追加制造 seq 空洞——空洞必须被区间扫描跳过，不产出假事件）。
+func TestReadSliceMatchesReadFrom(t *testing.T) {
+	st := openStore(t, "file")
+	ctx := context.Background()
+
+	// 交错 append，并中途重追加制造 seq 空洞（冲突吃号，不产生新行）。
+	for i := 0; i < 8; i++ {
+		sess := testSession
+		if i%2 == 1 {
+			sess = testSession2
+		}
+		if _, err := st.Append(ctx, []contracts.Event{mkEvent(core.NewUlid(), "k", sess, fmt.Sprintf(`{"i":%d}`, i))}); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+		if i == 2 {
+			// 追加 + 立即幂等重追加同一 ID → 吃掉一个 seq 号（空洞）。
+			e := mkEvent(core.NewUlid(), "k", sess, `{"hole":true}`)
+			if _, err := st.Append(ctx, []contracts.Event{e}); err != nil {
+				t.Fatalf("append hole: %v", err)
+			}
+			if _, err := st.Append(ctx, []contracts.Event{e}); err != nil {
+				t.Fatalf("re-append hole: %v", err)
+			}
+		}
+	}
+	full, err := st.ReadFrom(ctx, nil, 0, 0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(full) != 9 {
+		t.Fatalf("全量应 9 条（重追加不产新行），得到 %d", len(full))
+	}
+
+	// 分段拼接：闭区间步进 3（1..3, 4..6, ...），与全量逐事件比对。
+	var got []contracts.Event
+	for start := int64(1); start <= 16; start += 3 {
+		slice, err := st.ReadSlice(ctx, nil, start, start+2, 0)
+		if err != nil {
+			t.Fatalf("ReadSlice [%d,%d]: %v", start, start+2, err)
+		}
+		got = append(got, slice...)
+	}
+	if len(got) != len(full) {
+		t.Fatalf("分段拼接 %d 条 != ReadFrom 全量 %d 条", len(got), len(full))
+	}
+	for i := range got {
+		if got[i].ID != full[i].ID || got[i].Seq == nil || *got[i].Seq != *full[i].Seq ||
+			got[i].Kind != full[i].Kind || string(got[i].Payload) != string(full[i].Payload) {
+			t.Fatalf("第 %d 条不一致：slice=%+v full=%+v", i, got[i], full[i])
+		}
+	}
+	// tip 之后的区间 → 空。
+	after, err := st.ReadSlice(ctx, nil, 100, 200, 0)
+	if err != nil {
+		t.Fatalf("ReadSlice beyond tip: %v", err)
+	}
+	if len(after) != 0 {
+		t.Fatalf("tip 之后的区间应为空，得到 %d 条", len(after))
+	}
+}
+
+// TestReadSliceBoundaries：空区间 / 超界 limit / 缺 seq / session 过滤 / 单点区间。
+func TestReadSliceBoundaries(t *testing.T) {
+	st := openStore(t, "file")
+	ctx := context.Background()
+
+	// session A seq 1、B seq 2、A seq 3、B seq 4、A seq 5（交错）+ 空洞。
+	appendOne := func(session contracts.Ulid) int64 {
+		out, err := st.Append(ctx, []contracts.Event{mkEvent(core.NewUlid(), "k", session, `{}`)})
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		return *out[0].Seq
+	}
+	appendOne(testSession)  // 1 A
+	appendOne(testSession2) // 2 B
+	a3 := appendOne(testSession)
+	appendOne(testSession2) // 4 B
+	appendOne(testSession)  // 5 A
+	appendOne(testSession)  // 6 A
+	// 空洞：e 落库拿 seq 7，幂等重追加吃掉 seq 8（无行）。
+	e := mkEvent(core.NewUlid(), "k", testSession, `{}`)
+	if _, err := st.Append(ctx, []contracts.Event{e}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := st.Append(ctx, []contracts.Event{e}); err != nil { // 吃掉 seq 8
+		t.Fatalf("re-append: %v", err)
+	}
+	appendOne(testSession) // seq 9 A
+
+	// ① 空区间（倒挂）→ 空切片、不报错。
+	empty, err := st.ReadSlice(ctx, nil, 5, 1, 0)
+	if err != nil {
+		t.Fatalf("倒挂区间不应报错: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("倒挂区间应为空，得到 %d 条", len(empty))
+	}
+
+	// ② 单点区间：只回那一条。
+	one, err := st.ReadSlice(ctx, nil, a3, a3, 0)
+	if err != nil {
+		t.Fatalf("单点区间: %v", err)
+	}
+	if len(one) != 1 || *one[0].Seq != a3 {
+		t.Fatalf("单点区间 [%d] 应恰 1 条，得到 %v", a3, seqs(one))
+	}
+
+	// ③ 超界 limit：limit > 区间内行数 → 全量返回，不报错。
+	big, err := st.ReadSlice(ctx, nil, 1, 100, 1000)
+	if err != nil {
+		t.Fatalf("超界 limit: %v", err)
+	}
+	all, _ := st.ReadFrom(ctx, nil, 0, 0)
+	if len(big) != len(all) {
+		t.Fatalf("超界 limit 应回全量 %d 条，得到 %d 条", len(all), len(big))
+	}
+
+	// ④ 小 limit：区间内前 N 条。
+	lim, err := st.ReadSlice(ctx, nil, 1, 100, 2)
+	if err != nil {
+		t.Fatalf("limit=2: %v", err)
+	}
+	if len(lim) != 2 || *lim[0].Seq != 1 || *lim[1].Seq != 2 {
+		t.Fatalf("limit=2 应得 seqs 1,2，得到 %v", seqs(lim))
+	}
+
+	// ⑤ 缺 seq：区间横跨空洞（8 无行）→ 只回有行的 seq。
+	holes, err := st.ReadSlice(ctx, nil, 1, 100, 0)
+	if err != nil {
+		t.Fatalf("跨空洞: %v", err)
+	}
+	want := []int64{1, 2, 3, 4, 5, 6, 7, 9}
+	gotSeqs := seqs(holes)
+	if len(gotSeqs) != len(want) {
+		t.Fatalf("跨空洞应得 %v，得到 %v", want, gotSeqs)
+	}
+	for i := range want {
+		if gotSeqs[i] != want[i] {
+			t.Fatalf("跨空洞应得 %v，得到 %v", want, gotSeqs)
+		}
+	}
+
+	// ⑥ session 过滤 + 区间：只回 A 的、且在区间内。
+	onlyA, err := st.ReadSlice(ctx, &testSession, 3, 100, 0)
+	if err != nil {
+		t.Fatalf("session 过滤: %v", err)
+	}
+	for _, ev := range onlyA {
+		if ev.SessionID != testSession {
+			t.Fatalf("session 过滤泄漏: %s", ev.SessionID)
+		}
+		if *ev.Seq < 3 {
+			t.Fatalf("区间下界泄漏: seq=%d", *ev.Seq)
+		}
+	}
+	if len(onlyA) != 5 { // A 的 seq 3,5,6,7,9
+		t.Fatalf("A 在 [3,∞) 应 5 条，得到 %d", len(onlyA))
+	}
+}
+
 // TestCloseIdempotent：Close 可重复调用。
 func TestCloseIdempotent(t *testing.T) {
 	for _, mode := range []string{"file", "memory"} {

@@ -330,6 +330,24 @@ type Config struct {
 	// 只有 VectorsEnabled=true 时才被消费（关了连槽位都不看）。
 	EmbeddingProvider EmbeddingProvider
 
+	// ---- L2/D19 telemetry 观测管道（独立出站口）----
+	//
+	// Telemetry 是观测管道的模式："" | "none" = **关**（默认）；"file" = NDJSON 落盘；
+	// "otlp" = **留位**（尚未实现，装配期拒绝——见 runtime/telemetry.ErrUnsupported）。
+	//
+	// **独立管道，默认关、脱敏、单向**（L2 拍板）：与事件流（唯一事实源，F5）、WAL
+	// 都是分开的面。关 = loop.Config.TelemetrySink 恒 nil → 一条 record 都不造、
+	// 一次 Emit 都不调 = **零行为变化**（酸测试）。开了也**不参与任何判定**；
+	// emit 前对自由文本跑 core.Redact；Emit 失败只 Warn 不阻断。
+	//
+	// **事件流即 trace**（L1 拍板）：不另建 trace 系统——跨边界调用链就是 core.Store
+	// 那条全局 seq 有序流；telemetry 只是把既成事实外送到观测后端的出站口。
+	Telemetry string
+	// TelemetryDir 是 mode=file 时的落盘目录（runtime/telemetry 落地处；
+	// 单文件 `<dir>/telemetry.ndjson`）。**mode=file 时必填**（启动即拒，不静默关）。
+	// mode 非 file 时本字段被忽略。
+	TelemetryDir string
+
 	// ---- v4-4-B WAL 预写日志（崩溃恢复补充面）----
 	//
 	// WalDir 是 WAL 预写日志的根目录（runtime/store/walfile 落地处；per-session 一个
@@ -564,6 +582,22 @@ func (c *Config) validate() error {
 	// MultiAgent=false 不校验 agent_types 同口径）。目录建不出来在 host.New 才炸
 	//（那是"显式要的能力没起来"，比静默不外置好排查）。
 	c.WalDir = walDirOf(c.WalDir)
+	// telemetry（L2/D19）："" / "none" = 关（默认，零行为变化）；"file" = NDJSON 落盘
+	//（dir 必填，fail-close）；"otlp" = 留位（尚未实现，装配期拒绝——不静默降级成关，
+	// 否则使用者以为在送观测、实际一条都没有）。未知模式启动即拒（打错的 mode 不该拖到
+	// 每次 emit 才发现）。
+	c.Telemetry = telemetryModeOf(c.Telemetry)
+	c.TelemetryDir = strings.TrimSpace(c.TelemetryDir)
+	switch c.Telemetry {
+	case "", "none", "file":
+	case "otlp":
+		return fmt.Errorf("host: Config.Telemetry=otlp 为留位（尚未实现；请用 none 或 file）")
+	default:
+		return fmt.Errorf("host: Config.Telemetry 只支持 none | file | otlp（otlp 留位未实现；得到 %q）", c.Telemetry)
+	}
+	if c.Telemetry == "file" && c.TelemetryDir == "" {
+		return fmt.Errorf("host: Config.Telemetry=file 时 TelemetryDir 必填（落盘目录）")
+	}
 	// 成本预算闸门（W15，v4-4-B）：负值拒绝；0 = 不设上限（默认）。
 	// 与其它阈值同一纪律（BlobMaxInline / VectorsTopK）：负阈值静默当成 0 = 悄悄把用户
 	// 以为开着的闸门关掉，现场零线索 → fail-close 启动即拒。

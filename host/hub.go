@@ -37,6 +37,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/store/vecmem"
 	"github.com/Yorha9e/alasol/runtime/store/walfile"
+	"github.com/Yorha9e/alasol/runtime/telemetry"
 	"github.com/Yorha9e/alasol/runtime/tools"
 	"github.com/Yorha9e/alasol/runtime/transport"
 	"github.com/Yorha9e/alasol/runtime/worktree"
@@ -104,6 +105,11 @@ type Hub struct {
 	// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面
 	//（见 host/wal.go）。
 	wal *walfile.Store
+	// tel 是 L2/D19 telemetry 的 file 落盘 sink（runtime/telemetry；nil = 未启用 =
+	// 零行为变化酸测试）。开了才建（Config.Telemetry=file）——hub 级**一个共享** sink
+	//（单文件 NDJSON，record 自带 session_id），所有 loop/fork 经 telemetrySink() 拿到
+	// 同一个；Close 时收口。**独立管道**：不参与任何判定（见 host/telemetry.go）。
+	tel *telemetry.File
 	// embed 是**文本 → 向量**的宿主槽位（框架不算 embedding；生产 nil = 未接）。
 	// nil 时：vector_search 工具不注册、检索/ingest 端点回 503 说明（见 host/vectors.go）。
 	embed EmbeddingProvider
@@ -534,6 +540,21 @@ func New(cfg Config) (*Hub, error) {
 		hubLog.Info("host: 已启用 WAL 预写日志（崩溃恢复补充面，非事实源）", "dir", dir)
 	}
 
+	// telemetry（L2/D19）：**默认不启用**（mode 空/none = nil Sink = 一条 record 都不造
+	// = 零行为变化，酸测试）。mode=file 才建共享 file sink；mode=otlp 留位在装配期拒。
+	// **独立管道**：不参与任何判定、不是事实源；emit 前 core.Redact；失败只 Warn 不阻断
+	//（见 host/telemetry.go 与 core/loop/telemetry.go）。
+	//
+	// 建失败 → 拒绝启动：那是"显式要的能力没起来"，比静默不送好排查（与 blobfs 同口径）。
+	telFile, terr := newTelemetrySink(cfg.Telemetry, cfg.TelemetryDir)
+	if terr != nil {
+		return nil, terr
+	}
+	if telFile != nil {
+		hubLog.Info("host: 已启用 telemetry file 落盘（独立观测管道，非事实源）",
+			"dir", telemetryDirOf(cfg.TelemetryDir), "path", telFile.Path())
+	}
+
 	// vector_search 工具（RAG 检索）：**只有"向量开着 + 配了 embedding 提供者"才注册**。
 	//
 	// 为什么没配提供者就不注册（而不是注册一个必然报错的工具）：模型给的是 query **文本**，
@@ -589,6 +610,7 @@ func New(cfg Config) (*Hub, error) {
 		embed:             cfg.EmbeddingProvider,
 		vecGate:           vecGate,
 		wal:               walStore,
+		tel:               telFile,
 	}
 
 	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持
@@ -712,6 +734,11 @@ func (h *Hub) Close() error {
 	// 往已关的 fd 上写（噪声 + 丢尾部记录）。放在停索引器/关库之前：WAL 与事件库无关，
 	// 但它收得越早越好（磁盘句柄不泄漏）。
 	if err := h.closeWAL(); err != nil {
+		errs = append(errs, err)
+	}
+	// telemetry 收口（L2/D19）：与 WAL 同时机——等在跑的 prompt 之后（那一轮可能还在
+	// Emit），关早了就是往已关的 fd 上写。
+	if err := h.closeTelemetry(); err != nil {
 		errs = append(errs, err)
 	}
 	if h.ixCancel != nil {
@@ -957,6 +984,9 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		//（Config.WalDir 非空）；walFor 懒建 per-session Writer，开失败只告警不拒绝本轮
 		//（WAL 是尽力而为的补充面）。五个写点都在 X1 三段路径**之外**（见 core/loop/wal.go）。
 		WalSink: h.walFor(sessionID),
+		// telemetry（L2/D19；nil = 关 = 零行为变化）。h.tel 开了才非 nil（Config.Telemetry=file）；
+		// 三个发点都在 X1 三段路径**之外**（见 core/loop/telemetry.go）。独立管道，不参与判定。
+		TelemetrySink: h.telemetrySink(),
 	})
 	if err != nil {
 		h.mu.Unlock()

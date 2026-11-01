@@ -62,10 +62,13 @@ func IsCredentialKey(k string) bool {
 	return false
 }
 
+// 凭据值形态的**整值锚定**判定（H18）：与 Redact（子串脱敏，见 redact.go）共用同一组
+// shape* 形状核——这边加首尾锚定（"整个值就是凭据"），那边不加（"文本里混有凭据"）。
+// 形状核只在 redact.go 定义一次，避免判定与脱敏各写一遍字面量而静默漂移。
 var (
-	valueSkRe  = regexp.MustCompile(`^sk-[A-Za-z0-9_-]{8,}$`)
-	valueGhpRe = regexp.MustCompile(`^gh[pous]_[A-Za-z0-9]{8,}$`)
-	valueJwtRe = regexp.MustCompile(`^ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$`)
+	valueSkRe  = regexp.MustCompile(`^(?:` + shapeSk + `)$`)
+	valueGhpRe = regexp.MustCompile(`^(?:` + shapeGhp + `)$`)
+	valueJwtRe = regexp.MustCompile(`^(?:` + shapeJwt + `)$`)
 )
 
 // IsCredentialValue 判定凭据形态的值（H18：sk- / ghp_ / gho_ / JWT 形态）。

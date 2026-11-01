@@ -608,3 +608,36 @@ func TestLoadFileConfigWALAndBudgetDefaults(t *testing.T) {
 		t.Errorf("[budget].max_tokens 缺省应为 0（不设上限），got %d", fc.Budget.MaxTokens)
 	}
 }
+
+// TestLoadFileConfigTelemetrySection（L2/D19）：[telemetry] 段正常解析
+// （未知键 fail-close 不许误伤合法配置——反射派生的合法键清单自动含本段）。
+func TestLoadFileConfigTelemetrySection(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[telemetry]
+mode = "file"
+dir = "C:/Users/me/alasol/tel"
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if fc.Telemetry.Mode != "file" {
+		t.Errorf("[telemetry].mode 解析错: %q", fc.Telemetry.Mode)
+	}
+	if fc.Telemetry.Dir != "C:/Users/me/alasol/tel" {
+		t.Errorf("[telemetry].dir 解析错: %q", fc.Telemetry.Dir)
+	}
+}
+
+// TestLoadFileConfigTelemetryDefaults（L2/D19）：不写 [telemetry] = 默认关
+// （mode/dir 空 = 一条 record 都不造 = 零行为变化的配置面口径）。
+func TestLoadFileConfigTelemetryDefaults(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `model = "m"`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if fc.Telemetry.Mode != "" || fc.Telemetry.Dir != "" {
+		t.Errorf("[telemetry] 缺省应为空（关），got mode=%q dir=%q", fc.Telemetry.Mode, fc.Telemetry.Dir)
+	}
+}

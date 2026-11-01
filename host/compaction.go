@@ -34,6 +34,10 @@ const contextStrategyTiered = "tiered"
 // 一次 recall 可能拉回几十万 token，把上下文预算一次打穿。
 const defaultRecallReadLimit = 2000
 
+// recallSliceSize 是分段读（G5）的单段步长：每次 ReadSlice 最多拉这么多条进内存，
+// 段间用 lastSeq+1 推进——长区间不再一次整段读（全文重放），而是按需分段、惰性加载。
+const recallSliceSize = 256
+
 // contextStrategyFactory 按策略 kind 造 per-Run 的策略工厂（nil = 不挂 = append）。
 //
 // 只有 "tiered" 一个实现（其余/空 = append 兜底）。kind 由调用方收敛后传入（宿主默认
@@ -214,9 +218,11 @@ func (s *storeSeqSource) Tip(ctx context.Context) (int64, error) {
 
 // storeTextSource 按 seq 区间读对话原文（recall 取回全文）。折成 provider 无关消息再拍成文本。
 //
-// 口径（F17/F18）：
+// 口径（F17/F18/G5）：
 //   - **有界读**：只读指针区间（[fromSeq, toSeq]），不再"读整个 session 再过滤"
 //     （那是全量扫描：一次 recall 把整场会话都搬回来）；
+//   - **分段惰性读（G5）**：store 实现 core.SliceReader 时按 recallSliceSize 逐段
+//     ReadSlice（seq 索引范围扫描 + LIMIT），未实现时退回 ReadFrom——两条路径结果逐事件等价；
 //   - **按 agent 过滤**：同一 session 里别的 agent 的对话不该被回捞（视角隔离，K25）；
 //   - **有上限**：区间过长时截断并说明（不让一次 recall 打穿上下文预算）。
 type storeTextSource struct {
@@ -241,7 +247,7 @@ func (s storeTextSource) Text(ctx context.Context, fromSeq, toSeq int64) (string
 		span = int64(limit)
 		truncated = true
 	}
-	events, err := s.store.ReadFrom(ctx, &s.sessionID, fromSeq, int(span))
+	events, err := s.readRange(ctx, fromSeq, toSeq, int(span))
 	if err != nil {
 		return "", err
 	}
@@ -260,6 +266,48 @@ func (s storeTextSource) Text(ctx context.Context, fromSeq, toSeq int64) (string
 		text = fmt.Sprintf("（区间过长，已按上限截断：只回捞了前 %d 条事件）\n%s", limit, text)
 	}
 	return text, nil
+}
+
+// readRange 取 [fromSeq, toSeq] 闭区间内本 session 的前 want 条事件（G5 分段惰性读）。
+//
+// store 实现了 core.SliceReader（如 runtime/store/sqlite）→ 按 recallSliceSize 逐段
+// ReadSlice：每段一次带 LIMIT 的 seq 索引范围扫描，段间用 lastSeq+1 推进——区间之外
+// （含本 session 在 toSeq 之后的事件）根本不进内存，长区间不再"读一大段再裁尾巴"。
+//
+// 未实现（旧 store / 测试替身）→ 退回 ReadFrom 全文重放式一次读（调用方照旧在内存里
+// 裁到区间）——**两条路径结果逐事件等价**（同序同集：分段路径按 lastSeq+1 严格接续、
+// want 封顶；兜底路径靠"同 session 事件按 seq 升序、区间内事件必在区间外事件之前"保证
+// 前缀一致），这是 G5 的酸测试口径：不启用 = 关，逐事件等价。
+func (s storeTextSource) readRange(ctx context.Context, fromSeq, toSeq int64, want int) ([]contracts.Event, error) {
+	reader, ok := s.store.(core.SliceReader)
+	if !ok {
+		// 兜底（不启用 G5）：全文重放式一次读，调用方裁区间。
+		return s.store.ReadFrom(ctx, &s.sessionID, fromSeq, want)
+	}
+	out := make([]contracts.Event, 0, 8)
+	for cur := fromSeq; cur <= toSeq && len(out) < want; {
+		n := recallSliceSize
+		if remain := want - len(out); remain < n {
+			n = remain
+		}
+		slice, err := reader.ReadSlice(ctx, &s.sessionID, cur, toSeq, n)
+		if err != nil {
+			return nil, err
+		}
+		if len(slice) == 0 {
+			break // 区间内本 session 事件已穷尽。
+		}
+		out = append(out, slice...)
+		if len(slice) < n || len(out) >= want {
+			break // 段没读满 = 区间穷尽；或已到 want 上限（截断口径与旧路径一致）。
+		}
+		last := slice[len(slice)-1].Seq
+		if last == nil {
+			break // 防御：读回的事件不该缺 seq，缺了就没法推进游标（不空转）。
+		}
+		cur = *last + 1
+	}
+	return out, nil
 }
 
 // indexerLedgerSource 从索引器的 ledger_state 投影读当前 goal ledger（级联 C 案的"总体局势"）。

@@ -24,8 +24,12 @@ import (
 	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
-// 编译期断言：*Store 实现 core.Store（D15：接口在 core，实现在 runtime）。
-var _ core.Store = (*Store)(nil)
+// 编译期断言：*Store 实现 core.Store（D15：接口在 core，实现在 runtime）
+// 与 core.SliceReader（G5：seq 闭区间分段读的只读增量面）。
+var (
+	_ core.Store       = (*Store)(nil)
+	_ core.SliceReader = (*Store)(nil)
+)
 
 // driverName 是 ncruces/go-sqlite3 注册到 database/sql 的驱动名（spike 实测：sqlite3）。
 const driverName = "sqlite3"
@@ -290,6 +294,38 @@ func (s *Store) ReadFrom(ctx context.Context, sessionID *contracts.Ulid, fromSeq
 	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: read from seq=%d: %w", fromSeq, err)
+	}
+	defer rows.Close()
+	return scanEvents(rows)
+}
+
+// ReadSlice 读 seq **闭区间** [fromSeq, toSeq] 内的事实事件，按 seq 升序（G5 只读增量面）。
+// sessionID 为 nil 读全部；limit<=0 不限；toSeq < fromSeq 空区间 → 空切片。
+//
+// 分段读的实现口径：seq 是全局偏移（INTEGER PRIMARY KEY = 主键索引），区间条件
+// `seq BETWEEN ? AND ?` 直接走主键范围扫描（带 session 时叠加 (session_id, seq) 索引），
+// LIMIT 之外的行不进内存——对比 ReadFrom"只有下界"的全文重放式读取，这里每次只拉
+// 一个分段（惰性按需）。空洞 seq（冲突吃号不回收）天然被区间扫描跳过，与 ReadFrom 同口径。
+func (s *Store) ReadSlice(ctx context.Context, sessionID *contracts.Ulid, fromSeq, toSeq int64, limit int) ([]contracts.Event, error) {
+	if toSeq < fromSeq {
+		return nil, nil // 空区间（倒挂）：直接空结果，不打查询。
+	}
+	var sb strings.Builder
+	sb.WriteString(selectEventCols)
+	sb.WriteString(" WHERE seq BETWEEN ? AND ?")
+	args := []any{fromSeq, toSeq}
+	if sessionID != nil {
+		sb.WriteString(" AND session_id = ?")
+		args = append(args, string(*sessionID))
+	}
+	sb.WriteString(" ORDER BY seq ASC")
+	if limit > 0 {
+		sb.WriteString(" LIMIT ?")
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: read slice [%d,%d]: %w", fromSeq, toSeq, err)
 	}
 	defer rows.Close()
 	return scanEvents(rows)

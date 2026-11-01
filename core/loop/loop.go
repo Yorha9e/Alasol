@@ -176,6 +176,15 @@ type Config struct {
 	//
 	// **写失败不阻断 Run**（尽力而为）：只留一条 Warn（一次），不为一条观测中止模型调用。
 	WalSink core.WalSink
+	// TelemetrySink 是 telemetry 观测管道的写面（L2/D19；core.Sink）。**nil = 关**（默认，
+	// 零行为变化酸测试）：一条 record 都不造、一次 Emit 都不调、行为与配置前逐事件等价。
+	//
+	// 非 nil 时 loop 在三个点发观测（都在 X1 三段写路径**之外**，落盘序一字不动）：
+	// run.begin（Run 开始）/ tool.call（普通工具调用解析后）/ run.end（Run 收场，deferred）。
+	// **独立管道、默认关、脱敏、单向**（L2 拍板）：telemetry 不是事实源（F5 不受影响）、
+	// 不参与任何判定；emit 前对自由文本跑 core.Redact 脱敏；Emit 失败只 Warn 不阻断
+	// （与 WAL 同纪律）。见 core/loop/telemetry.go 与 core/telemetry.go 的定位说明。
+	TelemetrySink core.Sink
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -230,6 +239,9 @@ type Loop struct {
 	// wal.go 的五个写点。walWriter 只多一个 atomic 告警去重标记，不破坏"Loop 无可变状态
 	// → 可并发 Run"这条不变式（每轮历史/污点/spawn 缓存仍是 Run 的局部变量）。
 	wal *walWriter
+	// tel 支撑 telemetry 观测管道（L2/D19；nil = 关 = 零行为变化）。见 Config.TelemetrySink
+	// 与 telemetry.go 的三个发点。telWriter 只多一个 atomic 告警去重标记，同 walWriter 纪律。
+	tel *telWriter
 }
 
 // Result 是一次 Run 的产出。
@@ -336,7 +348,16 @@ func New(cfg Config) (*Loop, error) {
 		blob:            cfg.BlobSink,
 		blobMaxInline:   cfg.BlobMaxInline,
 		wal:             newWalWriter(cfg.WalSink),
+		tel:             newTelWriter(cfg.TelemetrySink),
 	}, nil
+}
+
+// newTelWriter 把 Config.TelemetrySink 包成 loop 内部的 telWriter（nil sink → nil = 关）。
+func newTelWriter(sink core.Sink) *telWriter {
+	if sink == nil {
+		return nil // 未配置 telemetry：零行为变化（酸测试）
+	}
+	return &telWriter{sink: sink}
 }
 
 // newWalWriter 把 Config.WalSink 包成 loop 内部的 walWriter（nil sink → nil = 关）。
@@ -452,6 +473,14 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	// 重建完整对话）。旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。
 	l.publishUserPrompt(ctx, prompt)
 
+	// L2/D19 telemetry：run.begin（user.prompt 之后、第一轮之前）+ deferred run.end
+	//（正常/出错/截断都发）。发点全在 X1 三段写路径**之外**；nil sink = 关 = 零行为变化。
+	// defer 注册在 publishUserPrompt **之后**：setup 期失败（策略/ledger）没有 run.begin，
+	// 也就不该有 run.end（成对口径）。命名返回值让 defer 看到最终 res/err。
+	l.telRunBegin()
+	telStarted := time.Now()
+	defer func() { l.telRunEnd(res, err, time.Since(telStarted)) }()
+
 	var lastText string
 
 	for turn := 1; turn <= l.maxTurns; turn++ {
@@ -557,7 +586,11 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 				}
 				continue
 			}
+			// L2/D19 telemetry：tool.call——runToolCall **返回后**（completed/failed 已落盘、
+			// X1 三段窗口之外）。ok = 写路径是否走通（err==nil）；dur 含落盘与执行。
+			telT0 := time.Now()
 			text, events, err := l.runToolCall(ctx, turn, tc, st)
+			l.telToolCall(turn, tc.Name, err == nil, time.Since(telT0))
 			res.Events += events
 			if err != nil {
 				// 写路径断裂（intent 没落盘 / ctx 取消）：中止，不编造结果。

@@ -96,6 +96,9 @@ type FileConfig struct {
 	// Wal WAL 预写日志（v4-4-B）：[wal] 段。默认关（dir 空）= 一个文件都不建、一次追加
 	// 都不做、行为与现状**逐事件等价**（酸测试）。
 	Wal WalFileConfig `toml:"wal"`
+	// Telemetry 观测管道（L2/D19）：[telemetry] 段。默认关（mode 空/none）= 一条 record
+	// 都不造 = 零行为变化（酸测试）。
+	Telemetry TelemetryFileConfig `toml:"telemetry"`
 	// Budget 成本预算闸门（W15，v4-4-B）：[budget] 段。**默认不设上限**（max_tokens 0）
 	// ——W15 拍板"长时程自主是卖点，预算不可控"；配了才启用 per-Run 粒度的检查点。
 	Budget BudgetFileConfig `toml:"budget"`
@@ -177,6 +180,29 @@ type VectorsFileConfig struct {
 type WalFileConfig struct {
 	// Dir WAL 根目录（runtime/store/walfile 落地处；per-session 一个 `<session>.wal`）。
 	// 空 = 关 = 零行为变化。
+	Dir string `toml:"dir"`
+}
+
+// TelemetryFileConfig 是 telemetry 观测管道的文件级配置（L2/D19）。
+//
+// 形如：
+//
+//	[telemetry]
+//	mode = "file"                            # "" | none（关，默认）| file | otlp（留位）
+//	dir = "C:\\Users\\me\\alasol\\telemetry" # mode=file 时必填；单文件 telemetry.ndjson
+//
+// 口径（与 host.Config.Telemetry / TelemetryDir 一致）：
+//   - **mode 空 / "none" = 关**（默认）：loop.Config.TelemetrySink 恒 nil → 一条 record
+//     都不造、一次 Emit 都不调 = **零行为变化**（酸测试）；
+//   - **mode "file"**：dir 必填（启动即拒，不静默关）；落盘是可丢弃的观测出站口
+//     （不是事实源，F5 不受影响；emit 前自由文本已过 core.Redact）；
+//   - **mode "otlp" = 留位**（尚未实现）：装配期拒绝——不静默降级，否则使用者以为在送；
+//   - **只走文件配置面**（与 [wal] / [blob] 同款：结构化数据 + 默认关，不给 flag）；
+//   - **只收 mode/dir 两个键**（反射派生的合法键清单自动含本表，未知键 fail-close 点名）。
+type TelemetryFileConfig struct {
+	// Mode 模式："" | "none" = 关（默认）| "file" = NDJSON 落盘 | "otlp" = 留位（拒）。
+	Mode string `toml:"mode"`
+	// Dir mode=file 时的落盘目录（单文件 `<dir>/telemetry.ndjson`）。空 = 非法（拒）。
 	Dir string `toml:"dir"`
 }
 

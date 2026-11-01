@@ -184,6 +184,12 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面。
 		WalDir: strings.TrimSpace(fc.Wal.Dir),
 
+		// telemetry（L2/D19）：**只走文件配置面**（TOML `[telemetry]`，与 [wal] 同款：
+		// 结构化数据 + 默认关，不给 flag）。mode 空/none = 关 = 一条 record 都不造 =
+		// 零行为变化（酸测试）；file 时 dir 必填；otlp 留位（host.validate 拒）。
+		Telemetry:    strings.TrimSpace(fc.Telemetry.Mode),
+		TelemetryDir: strings.TrimSpace(fc.Telemetry.Dir),
+
 		// 成本预算闸门（W15，v4-4-B）：只走文件配置面（TOML `[budget].max_tokens`）。
 		// **默认不设上限**（0）——W15 拍板口径；非 0 才在 Run 前/后设检查点。
 		BudgetMaxTokens: fc.Budget.MaxTokens,

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Yorha9e/alasol/contracts"
@@ -439,6 +441,135 @@ func TestConfigValidateRejectsOverflowingInjectionBudget(t *testing.T) {
 	c2.ContextStrategyRulesBudget = 30_000
 	if err := c2.validate(); err != nil {
 		t.Errorf("注入区预算装得下应通过: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// G5：storeTextSource 分段惰性读——关/开逐事件等价（酸测试）+ 分段读钉子。
+// ---------------------------------------------------------------------------
+
+// noSliceStore 只暴露 core.Store 面（内嵌接口值把 ReadSlice 藏掉）——模拟"未启用 G5
+// 分段读"的旧实现：消费点应自动退回 ReadFrom 全文重放，结果逐事件等价（酸测试关/开一致）。
+type noSliceStore struct{ core.Store }
+
+// countingSliceStore 包装 sqlite store 并统计读路径（G5 钉子：消费点必须真走分段读——
+// 把分段读变异回全文读，slices 恒 0 → 本钉子红）。
+type countingSliceStore struct {
+	inner     *sqlite.Store
+	slices    atomic.Int32
+	fullReads atomic.Int32
+}
+
+func (c *countingSliceStore) Append(ctx context.Context, evs []contracts.Event) ([]contracts.Event, error) {
+	return c.inner.Append(ctx, evs)
+}
+
+func (c *countingSliceStore) ReadFrom(ctx context.Context, sid *contracts.Ulid, from int64, limit int) ([]contracts.Event, error) {
+	c.fullReads.Add(1)
+	return c.inner.ReadFrom(ctx, sid, from, limit)
+}
+
+func (c *countingSliceStore) ReadSlice(ctx context.Context, sid *contracts.Ulid, from, to int64, limit int) ([]contracts.Event, error) {
+	c.slices.Add(1)
+	return c.inner.ReadSlice(ctx, sid, from, to, limit)
+}
+
+// TestStoreTextSourceSegmentedEquivalence 酸测试：store 支持/不支持 SliceReader（开/关 G5），
+// recall 取回的原文逐字节一致（含 agent 过滤、区间裁剪、截断说明）。
+func TestStoreTextSourceSegmentedEquivalence(t *testing.T) {
+	st := openCompactionStore(t)
+	ctx := context.Background()
+	sid := core.NewUlid()
+	agentA, agentB := core.NewUlid(), core.NewUlid()
+
+	var appended []contracts.Event
+	for i := 0; i < 12; i++ {
+		aid, kind := agentA, "user.prompt"
+		if i%3 == 1 {
+			aid = agentB // 别的 agent 的对话：两条路径都必须滤掉（F18）
+		}
+		if i%3 == 2 {
+			kind = "model.turn"
+		}
+		out, err := st.Append(ctx, []contracts.Event{convEventOf(sid, aid, kind, fmt.Sprintf("原文-%d", i))})
+		if err != nil {
+			t.Fatalf("Append %d: %v", i, err)
+		}
+		appended = append(appended, out[0])
+	}
+	first := *appended[0].Seq
+	last := *appended[len(appended)-1].Seq
+
+	cases := []struct {
+		name     string
+		limit    int
+		from, to int64
+	}{
+		{"全区间", 0, first, last},
+		{"单点区间", 0, first, first},
+		{"倒挂空区间", 0, last, first},
+		{"起点超界", 0, last + 100, last + 200},
+		{"区间中段（滤他 agent）", 0, first + 1, last - 1},
+		{"截断开启（limit=3）", 3, first, last},
+		{"截断开启（limit=1）", 1, first, last},
+	}
+	for _, c := range cases {
+		on := storeTextSource{store: st, sessionID: sid, agentID: agentA, limit: c.limit}
+		off := storeTextSource{store: noSliceStore{Store: st}, sessionID: sid, agentID: agentA, limit: c.limit}
+		gotOn, err := on.Text(ctx, c.from, c.to)
+		if err != nil {
+			t.Fatalf("%s: 开（分段读）: %v", c.name, err)
+		}
+		gotOff, err := off.Text(ctx, c.from, c.to)
+		if err != nil {
+			t.Fatalf("%s: 关（全文重放）: %v", c.name, err)
+		}
+		if gotOn != gotOff {
+			t.Fatalf("%s: 关/开结果必须逐字节一致\n开=%q\n关=%q", c.name, gotOn, gotOff)
+		}
+	}
+}
+
+// TestStoreTextSourceUsesReadSlice 钉子：store 支持 SliceReader 时消费点必须走分段读
+// （长区间逐段推进），且不退回 ReadFrom 全文读；结果与全文重放兜底一致。
+func TestStoreTextSourceUsesReadSlice(t *testing.T) {
+	st := openCompactionStore(t)
+	ctx := context.Background()
+	sid := core.NewUlid()
+	agentA := core.NewUlid()
+
+	// 300 条 > recallSliceSize（256）→ 必须分至少两段推进。
+	const n = 300
+	batch := make([]contracts.Event, n)
+	for i := range batch {
+		batch[i] = convEventOf(sid, agentA, "user.prompt", fmt.Sprintf("长历史-%d", i))
+	}
+	out, err := st.Append(ctx, batch)
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	first := *out[0].Seq
+	last := *out[len(out)-1].Seq
+
+	counted := &countingSliceStore{inner: st}
+	on := storeTextSource{store: counted, sessionID: sid}
+	off := storeTextSource{store: noSliceStore{Store: st}, sessionID: sid}
+	gotOn, err := on.Text(ctx, first, last)
+	if err != nil {
+		t.Fatalf("分段读: %v", err)
+	}
+	gotOff, err := off.Text(ctx, first, last)
+	if err != nil {
+		t.Fatalf("全文重放兜底: %v", err)
+	}
+	if gotOn != gotOff {
+		t.Fatalf("长区间分段读与全文重放结果必须一致（%d 字节 vs %d 字节）", len(gotOn), len(gotOff))
+	}
+	if slices := counted.slices.Load(); slices < 2 {
+		t.Fatalf("300 条 > 单段步长，应至少 2 段 ReadSlice，得到 %d（G5 钉子：变异回全文读这里红）", slices)
+	}
+	if reads := counted.fullReads.Load(); reads != 0 {
+		t.Fatalf("支持 SliceReader 的 store 不该退回 ReadFrom 全文读，却读了 %d 次", reads)
 	}
 }
 
