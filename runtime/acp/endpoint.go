@@ -76,6 +76,13 @@ const turnDrainGrace = 2 * time.Second
 //	SubscribeEvents   —— 订阅该 session 的增量事件（含 durable=false 的 model.delta）供
 //	                      桥接成 session/update；返回 nil = 订阅不可用 → 端点降级为
 //	                      "整轮结束发一整段 agent_message_chunk"（doc 降级口径）
+//
+// session/load 走**可选能力** sessionLoader（type assertion 探测，见其类型 doc——Backend
+// 接口不变，没实现它的后端收到 session/load 回 -32000 能力缺失）。
+//
+// **能力声明按后端实际能力动态给**（initialize 的 agentCapabilities.loadSession =
+// 后端是否实现 sessionLoader）——宣称 true 却回 -32000 = 骗客户端（客户端会真的去
+// session/load，然后拿到一个能力缺失的错）。
 type Backend interface {
 	CreateSession(cwd string) (contracts.Ulid, error)
 	RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt string) (loop.Result, error)
@@ -109,6 +116,43 @@ type turnOutcomeAware interface {
 type turnCapAware interface {
 	// TurnCap 返回单轮的轮数上限（≤ 0 = 未知）。
 	TurnCap() int
+}
+
+// ErrSessionNotFound 是 session/load 面的哨兵错误：**会话不存在**（该 sessionId 没有
+// 持久化历史，载不进来）。后端（或其适配层）在"查无此会话"时返回它，端点据此回
+// **协议错误帧**（-32602，与 session/prompt 的"未知 session"同一错误形状）——其它错误
+// 一律按后端内部错误走 -32603（消息带脱敏摘要）。
+var ErrSessionNotFound = errors.New("acp: session 不存在")
+
+// sessionLoader 是后端的**可选能力**：载入既有会话（session/load 面）。
+//
+// 为什么是可选接口而不是 Backend 加方法（本刀范围铁律：只动 runtime/acp/）：与
+// turnOutcomeAware / turnCapAware 同模式——**Backend 接口不变**，靠 type assertion 探测，
+// cmd 适配层的 hubBackend 不必跟改（go build ./... 不受影响）。没实现它的后端收到
+// session/load 时回 -32000（能力缺失），**不**假装载入成功。
+//
+// # 语义（载入 = 与 resume 同源的回放路径）
+//
+// 后端按 sessionId 把既有会话接回来：事件流回放（runtime.ReplaySession 先例）+ 折叠出
+// 对话（runtime.FoldConversation 先例——与 host resume / fork 续跑同一条路径），返回
+// 折叠出的对话历史；会话不存在 → 返回 ErrSessionNotFound。端点拿到历史后在 **load 响应
+// 之前**把整段对话以 session/update 回放给客户端（ACP 口径：restore context + stream
+// the entire conversation history back via notifications），随后 load 后的 session/prompt
+// 走**既有 prompt 路径**（端点把它登记进 sessions）。
+//
+// # 诚实边界：历史**只回放给客户端** ≠「模型记住了」
+//
+// loader 的契约是"把折叠出的历史**交回客户端**"，它**不**保证下一轮 prompt 自带这段
+// 历史。模型侧能不能续上，取决于后端的 RunPrompt：**hub 的 RunPrompt 不带历史**
+// （hub 每一轮都不带历史——历史只存在于事件流里，靠 fold 重建，见 host/fork.go 的
+// "历史口径"）。故"load 之后模型接着此前的对话往下说"这件事**在本实现里不成立**：
+// 要让模型续跑，得走 **resume 式路径**（把 fold 出的历史灌回 loop 再跑一轮）——
+// 那是 hub 侧的能力，不是 ACP 端点能替代的（挂账：端点侧直连续跑需要给 Backend 加一条
+// "带历史跑一轮"的能力，超出本刀范围，不在本刀偷偷加）。
+type sessionLoader interface {
+	// LoadSession 载入 sid 指向的既有会话，返回折叠出的对话历史（按 seq 升序 fold 的
+	// 结果；空会话返回空历史不报错——只要后端认得这个会话）。查无此会话 → ErrSessionNotFound。
+	LoadSession(ctx context.Context, sid contracts.Ulid) ([]core.Message, error)
 }
 
 // Options 是 Serve 的装配参数。
@@ -388,7 +432,7 @@ func (e *endpoint) handleResponse(f *inbound) {
 	e.conn.deliverResponse(resp, key)
 }
 
-// handleRequest 处理入站请求（initialize / session/new / session/prompt）。
+// handleRequest 处理入站请求（initialize / session/new / session/load / session/prompt）。
 func (e *endpoint) handleRequest(f *inbound) {
 	method := *f.Method
 	id := idOrNull(f.ID) // id:null（非法但带键）时回指 null，不 panic
@@ -397,10 +441,11 @@ func (e *endpoint) handleRequest(f *inbound) {
 		e.handleInitialize(id, f.Params)
 	case "session/new":
 		e.handleNewSession(id, f.Params)
+	case "session/load":
+		e.handleLoadSession(id, f.Params)
 	case "session/prompt":
 		e.handlePrompt(id, f.Params)
 	default:
-		// 含 session/load（未实现：agentCapabilities.loadSession=false，客户端不该调）。
 		_ = e.conn.sendError(id, codeMethodNotFound,
 			fmt.Sprintf("Method not found: %q", method), nil)
 	}
@@ -432,11 +477,18 @@ func (e *endpoint) handleInitialize(id json.RawMessage, params json.RawMessage) 
 		e.log.Warn("acp: 客户端协议版本高于本实现",
 			"client", p.ProtocolVersion, "agent", protocolVersion)
 	}
+	// 能力声明**按后端实际能力动态给**（不无条件 true）：
+	//
+	//	sessionLoader 是可选接口（type assertion 探测）。后端没实现它 → session/load 只能回
+	//	-32000（能力缺失）；若这里仍宣称 loadSession=true，就是**骗客户端**——客户端会
+	//	真的去 session/load，然后拿到一个"能力缺失"的错（生产后端若没接这条能力，此前
+	//	就是每次 session/load 都 -32000）。
+	_, hasLoadSession := e.backend.(sessionLoader)
 	res := initializeResult{
 		ProtocolVersion: protocolVersion,
 		AgentCapabilities: agentCapabilities{
-			LoadSession:      false, // session/load 未实现
-			PromptSuggestion: false, // 不发 prompt 建议
+			LoadSession:      hasLoadSession, // 后端实现了 sessionLoader 才宣称 true
+			PromptSuggestion: false,          // 不发 prompt 建议
 		},
 		AgentInfo: agentInfo{Name: agentName, Version: agentVersion},
 	}
@@ -470,6 +522,146 @@ func (e *endpoint) handleNewSession(id json.RawMessage, params json.RawMessage) 
 	e.mu.Unlock()
 	if err := e.conn.sendResult(id, newSessionResult{SessionID: string(sid)}); err != nil {
 		e.log.Error("acp: 回 session/new 失败", "err", err.Error())
+	}
+}
+
+// handleLoadSession 载入既有会话（session/load，agentCapabilities.loadSession=true 的那半）。
+//
+// # 流程（ACP Loading Sessions 口径）
+//
+//	① 解 params（sessionId 必须是合法 ULID；cwd/mcpServers 宽容——mcpServers 按
+//	   session/new 同一口径**忽略**，hub 的 MCP 走装配期配置）；
+//	② 探后端载入能力（sessionLoader 可选接口）→ **派 goroutine** 跑真正的载入
+//	   （runLoad）：后端按 sessionId 回放事件流、折叠出对话（与 resume 同源路径），
+//	   **查无此会话 → 协议错误帧**（ErrSessionNotFound → -32602，与 session/prompt 的
+//	   "未知 session"同一形状；其它后端错误 → -32603 + 脱敏摘要，与建 session 失败同形状）；
+//	③ 载入成功 → 登记进 sessions（此后该 session 的 session/prompt 走**既有 prompt
+//	   路径**，与 session/new 开出来的无差别）；
+//	④ 在 load **响应之前**把折叠出的整段历史以 session/update 回放（replayHistory）——
+//	   ACP 要求 restore context 后把整个对话历史流回客户端，回放完才回 {}。
+//
+// # 为什么载入跑在 goroutine 上（头阻塞修）
+//
+// 读循环是**唯一**的入站通道。载入要回放整段历史（后端回放 + 折叠 + 一串 update），
+// 同步跑在读循环上时，这段时间里**别的 session 的帧全部排队**：最要命的是
+// session/cancel 与 session/request_permission 的应答——前者迟迟不被处理（用户点取消
+// 没反应），后者迟迟不被投递（审批悬着，整轮预算白烧到超时）。故：参数校验留在读循环
+// （快、纯本地），**真正的载入 + 回放 + 响应搬 goroutine**，读循环立刻回到收下一帧。
+//
+// # 顺序怎么保（回放必须先于响应）
+//
+// 回放与响应在**同一个 goroutine** 里顺序写（conn.writeFrame 持写互斥，一行一帧）：
+// update 帧先写、result 帧后写 → 客户端看到的顺序天然正确（update 先于 result）。
+// 别的 session 的 update 可能夹在中间——那是正常的（通知本就允许交错）。
+//
+// # 登记时点（载入成功**之后**才登记进 sessions）
+//
+// session 的登记发生在**载入成功之后**（载入失败就不该留下一个"已知 session"）。
+// 故：**不等 load 响应就立刻发 prompt** 的客户端，可能撞上"未知 session"（-32602）——
+// ACP 的正常时序是"等 load 响应再发 prompt"，那时 session 已登记。
+func (e *endpoint) handleLoadSession(id json.RawMessage, params json.RawMessage) {
+	var p loadSessionParams
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &p); err != nil {
+			_ = e.conn.sendError(id, codeInvalidParams, "session/load params 解不开: "+err.Error(), nil)
+			return
+		}
+	}
+	sid, ok := parseSessionID(p.SessionID)
+	if !ok {
+		_ = e.conn.sendError(id, codeInvalidParams, "sessionId 不是合法 ULID", nil)
+		return
+	}
+	// mcpServers 忽略（与 session/new 同口径：hub MCP 走装配期配置，不在 session 面动态接）。
+	if len(p.MCPServers) > 0 {
+		e.log.Debug("acp: session/load 带了 mcpServers，按口径忽略（hub MCP 走装配期配置）")
+	}
+	loader, ok := e.backend.(sessionLoader)
+	if !ok {
+		// 后端没实现载入能力：**不假装成功**（回能力缺失的服务器错误帧）。
+		_ = e.conn.sendError(id, codeServerError,
+			"后端未实现 session/load（载入能力缺失，无法载入会话）", nil)
+		return
+	}
+	// 真正的载入搬 goroutine（读循环不因回放整段历史而头阻塞——见函数头）。
+	go e.runLoad(loader, id, sid)
+}
+
+// runLoad 跑一次载入（handleLoadSession 派出的 goroutine）：后端回放 → 登记 session →
+// 回放历史 → 回响应。
+//
+// 错误分流与同步版逐字一致（ErrSessionNotFound → -32602；其它 → -32603 + 脱敏摘要）。
+func (e *endpoint) runLoad(loader sessionLoader, id json.RawMessage, sid contracts.Ulid) {
+	history, err := loader.LoadSession(e.turnRoot, sid)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			// 会话不存在 → 协议错误回执（与 prompt 的"未知 session"同形状：-32602）。
+			_ = e.conn.sendError(id, codeInvalidParams,
+				"session 不存在（该 sessionId 没有可载入的历史）", nil)
+			return
+		}
+		// 其它后端错误 → 内部错误帧，摘要**脱敏后**外发（与建 session 失败同口径——H18）。
+		_ = e.conn.sendError(id, codeInternalError,
+			"载入 session 失败: "+sanitizeErrSummary(err), nil)
+		return
+	}
+	e.mu.Lock()
+	e.sessions[sid] = true
+	e.mu.Unlock()
+	// 回放历史（必须在响应之前：ACP 客户端拿到 load 响应即认为历史同步完成）。
+	e.replayHistory(sid, history)
+	if err := e.conn.sendResult(id, loadSessionResult{}); err != nil {
+		e.log.Error("acp: 回 session/load 失败", "err", err.Error())
+	}
+	e.log.Info("acp: session/load 完成", "session", string(sid), "history", len(history))
+}
+
+// replayHistory 把折叠出的对话历史逐条映射成 session/update 回放（load 响应前发出）。
+//
+// 映射（core.Message 的角色 → ACP sessionUpdate）：
+//
+//	user      → user_message_chunk（ACP v1 有**用户侧** chunk 类型——load 回放要补全
+//	            整段 transcript，客户端可能换了进程、手里没有旧 prompt）
+//	assistant → agent_message_chunk；挂着的 ToolCalls → tool_call（rawInput 经 redactJSON
+//	            脱敏，与 live 桥同口径——H18：历史里的工具参数同样可能含凭据）
+//	tool      → tool_call_update（completed + 结果文本）
+//	其它角色  → 跳过（宽容：未来新增角色不因回放崩）
+//
+// # 工具调用**统一按 completed 回放**（fold 取舍，如实标注）
+//
+// runtime.FoldConversation 把 tool.call.completed 与 tool.call.failed **都**折成一条
+// role="tool" 的消息（不带成功/失败标记）——所以回放时分不出"这次工具是成功还是失败"，
+// 只能**统一按 completed** 发。这是 fold 的既有取舍（不是回放层偷懒）：要分得清，得改
+// fold 的消息形状（core.Message 加字段 = 契约面改动，超出本刀范围）。诚实边界写在这里，
+// 免得客户端把"completed"当成"这次工具真的成功了"。
+//
+// # 脱敏口径：键名遮蔽只在**结构化面**成立
+//
+// rawInput 经 redactJSON：它**只处理合法 JSON**（非 JSON 的工具参数 → 整体不转发，
+// 宁缺毋滥）；键名遮蔽（token/secret/password/…）也只在 JSON 的**键**这一层成立——
+// 散文/命令里的凭据靠**值级**启发式（core.IsCredentialValue 同口径 + 鉴权头/连接串/
+// PEM/AKIA 等形态）兜。故：回放里的 rawInput 是**参数摘要**，不是完整参数回放。
+//
+// 与 live 桥的分工：live 事件流里 user.prompt **不发**（用户自己说的，回显是噪声，见
+// bridge.go 映射表）；load 回放则**必须**发——那是另一回事（补全历史，不是回显刚说的）。
+func (e *endpoint) replayHistory(sid contracts.Ulid, history []core.Message) {
+	for _, m := range history {
+		switch m.Role {
+		case "user":
+			if m.Content == "" {
+				continue
+			}
+			e.sendUpdate(sid, userMessageChunkUpdate(m.Content))
+		case "assistant":
+			if m.Content != "" {
+				e.sendUpdate(sid, messageChunkUpdate(m.Content))
+			}
+			for _, tc := range m.ToolCalls {
+				e.sendUpdate(sid, toolCallUpdateStarted(string(tc.ID), tc.Name, redactJSON(tc.Args)))
+			}
+		case "tool":
+			e.sendUpdate(sid, toolCallUpdateCompleted(string(m.ToolCallID), m.Content))
+		}
 	}
 }
 
@@ -805,6 +997,19 @@ type newSessionParams struct {
 type newSessionResult struct {
 	SessionID string `json:"sessionId"`
 }
+
+// loadSessionParams 是 session/load 的 params（ACP LoadSessionRequest 的本实现子集：
+// sessionId 必填；cwd / mcpServers 按宽容口径吃下——mcpServers 忽略，见 handleLoadSession）。
+type loadSessionParams struct {
+	SessionID  string          `json:"sessionId"`
+	CWD        string          `json:"cwd,omitempty"`
+	MCPServers json.RawMessage `json:"mcpServers,omitempty"`
+}
+
+// loadSessionResult 是 session/load 的 result：ACP LoadSessionResponse 的 v1 形状里
+// configOptions / modes 全是可选（无必填字段），本实现回一个空对象 `{}`——历史不在
+// result 里，走 session/update 回放（见 replayHistory）。
+type loadSessionResult struct{}
 
 type promptParams struct {
 	SessionID string          `json:"sessionId"`

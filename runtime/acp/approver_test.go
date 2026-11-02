@@ -419,3 +419,110 @@ func derefStr(s *string) string {
 	}
 	return *s
 }
+
+// ---------------------------------------------------------------------------
+// 缺口 7 脱敏加固：漏网场景逐格钉住
+// ---------------------------------------------------------------------------
+
+// 六类漏网场景逐格（脱敏后**不含原凭据**；每类至少一格）。
+//
+// 格的性质：
+//   - Authorization/Bearer、URL userinfo、连接串口令段是**既有覆盖的回归格**（本刀不动
+//     其语义——既有脱敏用例全部原样保绿）；
+//   - api-key 连字符赋值、AWS AKIA 长串、PEM 私钥块是**本刀补上的漏**（加固前实测全漏，
+//     见 redactSecretText 的七步口径）。
+//
+// 变异自证：去掉 reAuthzValue（Authorization 模式）→ "Authorization/Bearer token" 格红。
+func TestRedactSecretText_HardenedLeakScenarios(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		secrets []string // 脱敏后不允许出现的原凭据片段
+		keep    string   // 轮廓保留（空 = 不查；审批人要看得懂在干什么）
+	}{
+		{
+			name:    "Authorization/Bearer token",
+			in:      `curl -H "Authorization: Bearer abc123def456secret99" https://api.example.com`,
+			secrets: []string{"abc123def456secret99"},
+			keep:    "Bearer",
+		},
+		{
+			name:    "api_key 赋值(=)",
+			in:      `export api_key=zzzqqqxxxwwwvvv111`,
+			secrets: []string{"zzzqqqxxxwwwvvv111"},
+		},
+		{
+			name:    "api-key 赋值(: 连字符键)",
+			in:      `curl -H "api-key: zzzqqqxxxwwwvvv111" https://api.example.com`,
+			secrets: []string{"zzzqqqxxxwwwvvv111"},
+			keep:    "curl",
+		},
+		{
+			name:    "URL userinfo",
+			in:      `http://alice:hunter2secret@host.example/x`,
+			secrets: []string{"hunter2secret"},
+			keep:    "alice",
+		},
+		{
+			name:    "AWS AKIA 长串(裸)",
+			in:      `aws sts get-caller-identity --access-key-id AKIAIOSFODNN7EXAMPLE`,
+			secrets: []string{"AKIAIOSFODNN7EXAMPLE"},
+			keep:    "aws",
+		},
+		{
+			name:    "AWS AKIA 长串(赋值)",
+			in:      `AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE`,
+			secrets: []string{"AKIAIOSFODNN7EXAMPLE"},
+		},
+		{
+			name: "PEM 私钥块",
+			in: "-----BEGIN RSA PRIVATE KEY-----\n" +
+				"MIIEpAIBAAKCAQEAyabc123SECRETbody\n" +
+				"-----END RSA PRIVATE KEY-----",
+			secrets: []string{"MIIEpAIBAAKCAQEAyabc123SECRETbody", "BEGIN RSA PRIVATE KEY"},
+		},
+		{
+			name:    "postgres 连接串口令段",
+			in:      `psql postgres://dbuser:dbpassSECRET@db.example:5432/prod`,
+			secrets: []string{"dbpassSECRET"},
+			keep:    "postgres://dbuser:",
+		},
+	}
+	for _, c := range cases {
+		got := redactSecretText(c.in)
+		for _, s := range c.secrets {
+			if strings.Contains(got, s) {
+				t.Errorf("%s：原凭据泄漏：%q → %q", c.name, c.in, got)
+			}
+		}
+		if c.keep != "" && !strings.Contains(got, c.keep) {
+			t.Errorf("%s：轮廓应保留 %q：%q", c.name, c.keep, got)
+		}
+	}
+}
+
+// JSON 键面的加固格：api-key（**连字符**键名——apikey / api_key 两个子串都套不中它）
+// 与 AWS_ACCESS_KEY_ID（键名不在敏感词表 → 靠**值级** AKIA 形状兜）脱敏后值必须打码。
+// Authorization 是既有键的回归格（敏感词 "auth" 命中，不许因加固改语义）。
+func TestRedactJSON_HardenedKeyScenarios(t *testing.T) {
+	cases := []struct {
+		key    string
+		value  string
+		secret string
+	}{
+		{"api-key", "zzzqqqxxxwwwvvv111", "zzzqqqxxxwwwvvv111"},
+		{"AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"},
+		{"Authorization", "Custom abc123def456", "abc123def456"},
+	}
+	for _, c := range cases {
+		raw, _ := json.Marshal(map[string]string{c.key: c.value})
+		out := redactJSON(raw)
+		if out == nil {
+			t.Errorf("%s：redactJSON 返 nil（合法 JSON 不该解不开）", c.key)
+			continue
+		}
+		if bytes.Contains(out, []byte(c.secret)) {
+			t.Errorf("JSON 键 %s：凭据值泄漏：%s", c.key, out)
+		}
+	}
+}

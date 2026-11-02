@@ -69,6 +69,15 @@ func messageChunkUpdate(text string) sessionUpdate {
 	return sessionUpdate{SessionUpdate: "agent_message_chunk", Content: contentBlock{Type: "text", Text: text}}
 }
 
+// userMessageChunkUpdate 造**用户侧**正文 chunk（ACP v1 的 user_message_chunk）。
+//
+// 只用于 session/load 的历史回放（replayHistory）：live 事件流里 user.prompt 不发
+// （用户自己说的，回显是噪声），但换进程载入旧会话时客户端手里没有旧 prompt——
+// transcript 要补全。
+func userMessageChunkUpdate(text string) sessionUpdate {
+	return sessionUpdate{SessionUpdate: "user_message_chunk", Content: contentBlock{Type: "text", Text: text}}
+}
+
 func thoughtChunkUpdate(text string) sessionUpdate {
 	return sessionUpdate{SessionUpdate: "agent_thought_chunk", Content: contentBlock{Type: "text", Text: text}}
 }

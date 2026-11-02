@@ -13,10 +13,13 @@ import (
 	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/host"
+	"github.com/Yorha9e/alasol/runtime"
 	"github.com/Yorha9e/alasol/runtime/acp"
+	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 )
 
 // acpMain 是 `alasol acp`：起 ACP agent 端点（JSON-RPC 2.0 over stdio，v4-2-B，K19）。
@@ -78,7 +81,26 @@ func acpMain(args []string) int {
 	// stdout 纯净性：ACP 端点占住 os.Stdout 只写 RPC 帧；上面的错误都走 os.Stderr。
 	// 起点一行都不往 stdout 打（banner / 日志全走 stderr，见 runtime/acp 的纪律）。
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	backend := &hubBackend{h: h, log: logger, maxTurns: cfg.MaxTurns}
+
+	// session/load 的**回放面**：host 不导出事件库句柄，故按同一个 DB 路径另开一条连接
+	// （与 `alasol resume` 同款：它也自己开库回放）。**口径如实**（critic F3）：拿到的是
+	// core.Store 完整句柄（含 Append 能力）——本处**只用读方法**，写面纪律靠用法维持；
+	// 另 :memory: 路径下两次 Open 是两个不同的库 → 载不到会话（生产 DBPath 是文件库，不受影响）。
+	// 开不出来 → 载入能力降级（端点会因"后端没实现 sessionLoader"… 注意：hubBackend 的
+	// LoadSession 方法**在**，故 initialize 仍宣称 loadSession=true；此时载入一律回
+	// "会话不存在"——如实记一条 Warn，别静默）。
+	loadStore, lerr := sqlite.Open(cfg.DBPath, sqlite.Options{})
+	var loadFace core.Store // 接口零值（不是 typed-nil *sqlite.Store——见下）
+	if lerr != nil {
+		logger.Warn("alasol acp: 开只读回放面失败（session/load 将回'会话不存在'）", "db", cfg.DBPath, "err", lerr.Error())
+	} else {
+		defer func() { _ = loadStore.Close() }()
+		loadFace = loadStore
+	}
+	// **typed-nil 陷阱**（critic F2）：Open 失败时 loadStore 是 (*sqlite.Store)(nil)——
+	// 直接赋进 core.Store 接口会让 `b.store == nil` 判定为 false，nil 闸门失效 →
+	// ReplaySession 空指针 panic（进程崩）。只有真拿到句柄才装进接口，失败留接口零值。
+	backend := &hubBackend{h: h, log: logger, maxTurns: cfg.MaxTurns, store: loadFace}
 
 	// 整轮预算：-prompt-timeout（秒）→ TurnTimeout；0 = 用 acp 缺省（= host 同一常量）。
 	if err := acp.Serve(ctx, acp.Options{
@@ -115,6 +137,8 @@ func acpTurnTimeout(cfg host.Config) time.Duration {
 //   - RunPrompt：透传 hub.RunPrompt（同步跑完一整轮）。
 //   - SubscribeEvents：订阅该 session 的增量事件（含 durable=false 的 model.delta）供
 //     桥接 session/update；按 SessionID 过滤（种类由 acp 侧按 kind 映射）。
+//   - LoadSession：**可选能力** sessionLoader（session/load 面）——按 sessionId 回放事件
+//     流、折叠出对话（与 resume 续跑同源路径），见下。
 type hubBackend struct {
 	h   *host.Hub
 	log *slog.Logger
@@ -124,6 +148,13 @@ type hubBackend struct {
 	// 可选能力）。**权威**判据是 loop.Result.TruncatedByMaxTurns（loop 亲自打的截断标记，
 	// hub 原样透传）——"轮数 ≥ 上限"分不清"正常收敛在最后一轮"与"被截断"，故只作兜底。
 	maxTurns int
+	// store 是 **session/load 的只读回放面**（nil = 没有回放面 → 载入一律回"会话不存在"）。
+	//
+	// 为什么另开一条连接：host **不导出**事件库句柄（09 依赖方向 + 单一写者纪律：写面
+	// 只归 hub 一家），而 runtime.ReplaySession 需要一个 core.Store。故 cmd 侧按**同一个
+	// DB 路径**另开一条**只读**连接（与 `alasol resume` 的装配同款：它也是自己开库读
+	// 回放）。只读不改：事件流仍是唯一事实源，写面仍只有 hub。
+	store core.Store
 }
 
 // 编译期断言：*hubBackend 满足 acp.Backend。
@@ -181,6 +212,42 @@ func (b *hubBackend) SubscribeEvents(sessionID contracts.Ulid) *bus.Subscription
 		return nil // hub 未装配总线（不该发生）→ acp 降级为整段消息
 	}
 	return src.Subscribe(bus.Filter{SessionIDs: []contracts.Ulid{sessionID}})
+}
+
+// LoadSession 实现 acp 的**可选能力** sessionLoader（session/load 面）。
+//
+// # 路径：与 resume 续跑**同源**
+//
+//	runtime.ReplaySession（事件流按 seq 全量读回——事件流是唯一事实源）
+//	+ runtime.FoldConversation（折叠出对话）→ 返回折叠出的 []core.Message。
+//
+// 与 host 的 fork 旁支续跑同一条路径（host/fork.go 的 RunBtw 也用这两个函数）。
+//
+// # 会话不存在 → acp.ErrSessionNotFound
+//
+// 端点据此回**协议错误帧**（-32602，与 session/prompt 的"未知 session"同一形状）——
+// **不**假装载入成功。判据 = "该 sessionId 没有任何持久化历史"（与端点的
+// ErrSessionNotFound 文档同口径：查无此会话 / 还没跑过任何一轮）。
+//
+// # 诚实边界（模型侧不因此"记住"历史）
+//
+// 本方法只把历史**交回客户端**（端点据此以 session/update 回放）。下一轮 prompt 是否
+// 带这段历史由后端决定：**hub 的 RunPrompt 不带历史**（hub 每轮不带历史，历史只在
+// 事件流里）——要让模型续跑得走 resume 式路径（把 fold 出的历史灌回 loop），不在本刀
+// 范围（见 runtime/acp 的 sessionLoader 文档）。
+func (b *hubBackend) LoadSession(ctx context.Context, sid contracts.Ulid) ([]core.Message, error) {
+	if b.store == nil {
+		// 没有回放面（读面没装配）→ 无从载入会话：按"查无此会话"回（不假装成功）。
+		return nil, acp.ErrSessionNotFound
+	}
+	events, err := runtime.ReplaySession(ctx, b.store, sid)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, acp.ErrSessionNotFound
+	}
+	return runtime.FoldConversation(events), nil
 }
 
 // resolveACPCwd 校验客户端给的 cwd 在**服务端**是否可用，返回规范化后的绝对路径。

@@ -17,6 +17,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime/acp"
+	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 )
 
 // cmd 层集成钉子：**真 hub + 脚本 provider** 装配（fake provider 装配口径），经
@@ -414,6 +415,132 @@ func TestACP_RealHub_MaxTurnsStopReason(t *testing.T) {
 // ---------------------------------------------------------------------------
 // F7 / F8 / F10 的回归钉子
 // ---------------------------------------------------------------------------
+
+// TestACP_RealHub_LoadSessionCapability（T3-1 钉子，cmd 层）：hubBackend 实现了
+// sessionLoader → initialize 必须**宣称 loadSession=true**，且 session/load 真能载回
+// 历史（事件流 → fold → session/update 回放）。
+//
+// 病根（修前）：生产后端 hubBackend **没实现** sessionLoader，而端点**无条件**宣称
+// loadSession=true → 客户端照着声明去 session/load，每次都吃 -32000（能力缺失）。
+func TestACP_RealHub_LoadSessionCapability(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "events.db")
+	cfg := host.Config{
+		DBPath:   dbPath,
+		Model:    "scripted",
+		MaxTurns: 4,
+		CWD:      t.TempDir(),
+		Provider: acpScriptProvider{},
+	}
+	h, err := host.New(cfg)
+	if err != nil {
+		t.Fatalf("host.New: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	// 只读回放面（与 acpMain 同款：按同一个 DB 路径另开一条只读连接）。
+	loadStore, err := sqlite.Open(dbPath, sqlite.Options{})
+	if err != nil {
+		t.Fatalf("开只读回放面: %v", err)
+	}
+	t.Cleanup(func() { _ = loadStore.Close() })
+
+	backend := &hubBackend{h: h, store: loadStore}
+
+	// 先跑一轮，造出可回放的历史（user.prompt + model.turn 落事件流）。
+	sid, err := backend.CreateSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if _, err := backend.RunPrompt(context.Background(), sid, "先说点什么"); err != nil {
+		t.Fatalf("RunPrompt: %v", err)
+	}
+
+	out := &cmdLineSink{ch: make(chan struct{}, 1)}
+	pr, pw := io.Pipe()
+	serveErr := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		serveErr <- acp.Serve(ctx, acp.Options{
+			Backend: backend,
+			In:      pr,
+			Out:     out,
+		})
+	}()
+
+	send := func(id int, method string, params any) {
+		o := map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}
+		raw, _ := json.Marshal(o)
+		if _, err := pw.Write(append(raw, '\n')); err != nil {
+			t.Fatalf("写请求: %v", err)
+		}
+	}
+	waitResult := func(id int, timeout time.Duration) map[string]any {
+		want := jsonInt(id)
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			for _, f := range out.frames() {
+				if f.isResponse() && f.Result != nil && f.ID != nil && string(*f.ID) == want {
+					var m map[string]any
+					json.Unmarshal(*f.Result, &m)
+					return m
+				}
+			}
+			out.waitCount(len(out.snapshot())+1, 50*time.Millisecond)
+		}
+		return nil
+	}
+
+	// ① initialize：loadSession 必须宣称 true（后端有该能力）。
+	send(1, "initialize", map[string]any{"protocolVersion": 1})
+	init := waitResult(1, 5*time.Second)
+	if init == nil {
+		t.Fatal("没收到 initialize 响应")
+	}
+	caps, _ := init["agentCapabilities"].(map[string]any)
+	if caps == nil {
+		t.Fatalf("initialize 结果缺 agentCapabilities: %v", init)
+	}
+	if caps["loadSession"] != true {
+		t.Errorf("hubBackend 实现了 LoadSession → loadSession 应宣称 true，得到 %v", caps["loadSession"])
+	}
+
+	// ② session/load：真能载回历史（回放成 session/update）。
+	send(2, "session/load", map[string]any{"sessionId": string(sid)})
+	if res := waitResult(2, 5*time.Second); res == nil {
+		t.Fatal("没收到 session/load 响应")
+	}
+	var replayed bool
+	for _, f := range out.frames() {
+		if !f.isNotification() || f.Method == nil || *f.Method != "session/update" {
+			continue
+		}
+		var p struct {
+			Update struct {
+				SessionUpdate string `json:"sessionUpdate"`
+				Content       struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"update"`
+		}
+		if json.Unmarshal(f.Params, &p) == nil && p.Update.SessionUpdate == "user_message_chunk" {
+			if strings.Contains(p.Update.Content.Text, "先说点什么") {
+				replayed = true
+			}
+		}
+	}
+	if !replayed {
+		t.Error("session/load 没把历史回放给客户端（user_message_chunk 缺用户原话）")
+	}
+
+	_ = pw.Close()
+	cancel()
+	select {
+	case <-serveErr:
+	case <-time.After(5 * time.Second):
+		t.Error("Serve 未收场")
+	}
+}
 
 // F7 钉子：session/new 的 cwd 在**服务端**不存在 → 回落服务端进程 cwd（不报错）。
 //

@@ -133,9 +133,10 @@ const methodRequestPermission = "session/request_permission"
 //
 // 脱敏是**两道**（都是启发式，诚实边界见下）：
 //
-//	① 键名形状：键名命中敏感词（token/secret/password/…）→ 整个值打码；
+//	① 键名形状：键名命中敏感词（token/secret/password/api-key/…）→ 整个值打码；
 //	② 值级形状：值**本身**像凭据（core.IsCredentialValue 同口径：sk- / ghp_ / JWT），
-//	   或出现在 Authorization/Bearer 头、URL userinfo 里 → 打码。
+//	   或出现在 Authorization/Bearer 头、URL userinfo（含连接串口令段）、api-key 赋值、
+//	   PEM 私钥块、AWS AKIA 长串里 → 打码。
 //
 // ② 是必需的：bash 的 `command` 参数键名完全不敏感，凭据却明晃晃写在值里
 // （`curl -H "Authorization: Bearer sk-xxxx"`）——只按键名脱敏等于没脱敏（F9）。
@@ -343,9 +344,11 @@ func normOutcome(s string) string { return strings.ToLower(strings.TrimSpace(s))
 // sensitiveKeySubstrings 是触发脱敏的键名子串（大小写不敏感）。
 //
 // 保守取向：宁可多打码（把非凭据的值也藏了）也不漏放凭据值。都是高特异词，误伤面小。
+// "api-key"（连字符）与 "api_key"（下划线）都要：JSON 键 `api-key` 两个下划线词都套不中
+// （加固补的漏网场景之一），子串命中才遮得住。
 var sensitiveKeySubstrings = []string{
 	"secret", "token", "password", "passwd", "pwd",
-	"credential", "apikey", "api_key", "auth", "bearer", "private",
+	"credential", "apikey", "api_key", "api-key", "auth", "bearer", "private",
 }
 
 // maxRedactedValueLen 是脱敏后单个字符串值的长度上限（防一条巨值把帧撑爆）。
@@ -354,9 +357,11 @@ const maxRedactedValueLen = 512
 // 值级脱敏的正则（F9：脱敏不能只看键名）。
 //
 //	① Authorization: <scheme> <value> / authorization=<value> → **值**打码（scheme 留着）
-//	② 参数化鉴权头 response= / Credential= / Signature= / token= → **值**打码
+//	② 参数化鉴权头 response= / Credential= / Signature= / token= / api-key: … → **值**打码
 //	③ Bearer <token>                                        → token 打码
 //	④ URL userinfo https://user:pass@host                    → 口令打码（用户名留着）
+//	⑤ PEM 私钥块（-----BEGIN … -----…-----END … -----）       → 整块打码
+//	⑥ AWS 风格访问 key id（AKIA/ASIA/… + 16 位大写长串）      → 打码
 //
 // 凭据**形状**（sk- / ghp_ / JWT）不重复写正则：复用 core.IsCredentialValue（同一事实源），
 // 由 maskSecretTokens 按"词元"扫（core 那个是整串匹配，扫不出嵌在命令里的凭据）。
@@ -393,7 +398,11 @@ var (
 	// ② **不认白名单**：任何"词"都能当 scheme（见上面的"为什么"）。
 	reAuthzValue = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)((?:[^\s"',;]+\s+)?)("[^"]*"|[^\s"',;]+(?:"[^"]*")?)`)
 	// reAuthzParam 匹配**参数化**鉴权头里的敏感参数（response= / Credential= /
-	// Signature= / token= …）。
+	// **收窄记录（critic F4/F5，如实）**：①B 档通用词（response/signature/nonce/cnonce/opaque/pwd）
+	// 只认**紧贴** name=value——`response = "abc"`（= 两侧带空白）与 `pwd: xxx`（冒号+空格）**不遮**
+	// （旧单档曾遮 = 两侧空白那档，此处是刻意收窄换误伤面）；②截断 PEM（缺 END）的 body 行认定
+	// 有 >=16 字符门槛——尾行短残余（<=15 字符 ≈ 11 字节密钥料）不遮。
+	// Signature= / token= / api-key: …）。
 	//
 	// 为什么单加一条：`Authorization: Digest username="u", response="abc…"` 这种头
 	// **没有**"scheme 值"那半——凭据藏在参数里，reAuthzValue 只能遮住第一个词
@@ -405,11 +414,136 @@ var (
 	//
 	// 名字**不锚词首**（无 \b）：`auth_token=` / `x_token=` 这类带前缀的参数名也要遮
 	// （带前缀才是常见写法）；锚了词首反而漏。
-	reAuthzParam  = regexp.MustCompile(`(?i)((?:response|credential|signature|token|secret|password|passwd|pwd|apikey|api_key|access_token|refresh_token|id_token|nonce|cnonce|opaque)\s*=\s*)("[^"]*"|[^\s"',;]+)`)
-	reBearerValue = regexp.MustCompile(`(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
-	reURLUserinfo = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+:)([^/\s:@]*)(@)`)
+	//
+	// # 两档名单（收紧误伤面：散文不该被整段打码）
+	//
+	// 旧实现一张名单 + `[:=]` 分隔 + 值前允许空白 → **普通散文被误伤**：
+	// "The response: 200 OK" 里的 "response: 200" 被当成凭据参数打码（response 本是
+	// 通用词）。故拆成两档：
+	//
+	//	**A 档（高特异凭据名）**：secret/password/passwd/credential/apikey/api_key/
+	//		api-key/token/access_token/refresh_token/id_token —— 分隔符 `[:=]`、值前
+	//		**允许空白**（`api-key: hunter2` 这类冒号赋值是常见真凭据形态，加固时专门
+	//		补的覆盖，不能因收紧误伤而丢）。
+	//	**B 档（通用词）**：response/signature/nonce/cnonce/opaque/pwd —— 只认**紧贴**的
+	//		`name=value` 形态（分隔符前后**都没有空白**）。Digest 鉴权的
+	//		`response="abc…"` 正是这个形态（照旧遮住）；散文里的 "The response: 200 OK"
+	//		（冒号 + 空格）**不再**被当成凭据。
+	//
+	// 诚实边界：B 档的 `pwd: xxx`（冒号 + 空格）不再遮——这是收紧误伤的**代价**，
+	// 如实记在这里（要遮就写 `pwd=xxx`；`password:` 仍在 A 档里照遮）。
+	reAuthzParam = regexp.MustCompile(`(?i)((?:secret|password|passwd|credential|apikey|api_key|api-key|token|access_token|refresh_token|id_token)\s*[:=]\s*)("[^"]*"|[^\s"',;]+)`)
+	// reAuthzParamTight 是 B 档（通用词）的**紧贴**形态：名字与分隔符之间、分隔符与值
+	// 之间都**不许有空白**（`response="abc"` 遮；`The response: 200 OK` 不遮）。
+	reAuthzParamTight = regexp.MustCompile(`(?i)\b(response|signature|nonce|cnonce|opaque|pwd)([=])("[^"]*"|[^\s"',;]+)`)
+	reBearerValue     = regexp.MustCompile(`(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]{8,})`)
+	reURLUserinfo     = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^/\s:@]+:)([^/\s:@]*)(@)`)
+	// rePEMBlockHead 匹配 PEM 块的**头**（"-----BEGIN <类型>-----"）。
+	// rePEMBlockTail 匹配 PEM 块的**尾**（"-----END <类型>-----"）。
+	//
+	// 完整块（头尾都有）→ 整块打码（body 是密钥，必须遮）。
+	// **缺 END**（被截断的块）→ 旧实现用 `$` 兜底**吞掉整段余文**（误伤面极大：一行
+	// 散文里的 "-----BEGIN" 能把后面所有内容都吃掉）。新口径见 redactPEMBlocks：
+	// 截断块只吞**到行尾**（+ 其后连续的 base64 行 = 真正的密钥体），且**限长 8KB**。
+	rePEMBlockHead = regexp.MustCompile(`-----BEGIN [^-]+-----`)
+	rePEMBlockTail = regexp.MustCompile(`-----END [^-]+-----`)
+	// reAWSKeyID 匹配 AWS 风格访问 key id：4 字母前缀（AKIA 长期/ASIA 临时/…）+ 16 位
+	// 大写字母数字 = 20 位整串（AWS 文档示例 AKIAIOSFODNN7EXAMPLE 的形状）。词边界锚定：
+	// 无 \b 会把 `XAKIA…` 这类词中串也吃掉（没必要的误伤）。
+	reAWSKeyID    = regexp.MustCompile(`\b(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA)[0-9A-Z]{16}\b`)
 	reSecretToken = regexp.MustCompile("[^\\s\"'`,;()\\[\\]{}<>]+")
 )
+
+// maxPEMFallbackBytes 是**截断 PEM 块**（缺 END）的兜底遮罩长度上限（8KB）。
+//
+// 为什么限长：旧实现用 `$` 兜底（吞到串尾）——一行散文里的 "-----BEGIN" 能把后面
+// 几十 KB 的余文全吃掉（误伤面失控）。限长 = 最多吞 8KB，其余原样保留。
+const maxPEMFallbackBytes = 8 * 1024
+
+// redactPEMBlocks 把 PEM 块（-----BEGIN … -----…-----END … -----）整块打码。
+//
+// 两档口径：
+//
+//	**完整块**（有 END）→ 从 BEGIN 头到 END 尾**整块**打码（body 是密钥，必须遮）。
+//	**截断块**（缺 END）→ 只吞**到行尾**（BEGIN 头所在行）+ 其后**连续的 base64 行**
+//	  （那才是真正的密钥体），并**限长 maxPEMFallbackBytes（8KB）**。
+//
+// 为什么截断块不再"吞到串尾"：那是误伤面（散文里一个 "-----BEGIN" 能吃掉整段余文）。
+// 诚实边界：截断块里**不是** base64 形态的密钥体（少见）认不出来——宁可少遮，也不
+// 吞掉整段余文。
+func redactPEMBlocks(s string) string {
+	if !strings.Contains(s, "-----BEGIN ") {
+		return s
+	}
+	var b strings.Builder
+	rest := s
+	for {
+		loc := rePEMBlockHead.FindStringIndex(rest)
+		if loc == nil {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:loc[0]])
+		rest = rest[loc[0]:]
+		if tail := rePEMBlockTail.FindStringIndex(rest); tail != nil {
+			// 完整块：头 → 尾整块打码（含 END 标记本身）。
+			b.WriteString("***")
+			rest = rest[tail[1]:]
+			continue
+		}
+		// 截断块：吞到行尾 + 其后连续的 base64 行，限长 8KB。
+		n := truncatedPEMSpan(rest)
+		b.WriteString("***")
+		rest = rest[n:]
+	}
+}
+
+// truncatedPEMSpan 算"截断 PEM 块"要吞掉多长：从块首起，吞掉 BEGIN 头所在行，
+// 再吞其后**连续的 base64 行**（真密钥体），总长限 maxPEMFallbackBytes。
+func truncatedPEMSpan(block string) int {
+	consumed := len(block)
+	if i := strings.IndexByte(block, '\n'); i >= 0 {
+		consumed = i + 1 // 含换行
+	}
+	rest := block[consumed:]
+	for consumed < maxPEMFallbackBytes && rest != "" {
+		i := strings.IndexByte(rest, '\n')
+		line := rest
+		if i >= 0 {
+			line = rest[:i]
+		}
+		if !isPEMBodyLine(line) {
+			break // 不是 base64 行 = 块体结束（后面的余文**不吞**）
+		}
+		if i < 0 {
+			consumed += len(line)
+			break
+		}
+		consumed += i + 1
+		rest = rest[i+1:]
+	}
+	if consumed > maxPEMFallbackBytes {
+		consumed = maxPEMFallbackBytes
+	}
+	return consumed
+}
+
+// isPEMBodyLine 报告一行是否是 PEM 体（base64 行）：非空、全是 base64 字符、长度 ≥ 16。
+func isPEMBodyLine(line string) bool {
+	if len(line) < 16 {
+		return false
+	}
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '+', c == '/', c == '=':
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // redactJSON 脱敏一段参数 JSON：递归走查，敏感键的值打码 "***"，**值里的凭据**也打码，
 // 超长字符串截断。
@@ -460,15 +594,24 @@ func redactValue(v any) any {
 
 // redactSecretText 把自由文本（命令行 / URL / 请求头）里的凭据打码。
 //
-// 五步（顺序有意义）：
+// 七步（顺序有意义）：
 //
 //	① Authorization 头**值**打码（scheme 留着：`Authorization: Bearer ***`）；② 参数化
-//	   鉴权头的敏感参数打码（`response=***` / `Credential=***`）；③ Bearer token 打码；
-//	④ URL userinfo 的口令打码；
-//	⑤ 词元扫描：core.IsCredentialValue 同口径的形状（sk- / ghp_ / JWT），外加
-//	   "key=value" 形态里=value 那半（同 runtime/cap/remote 的 isCredentialArg 口径）。
+//	   鉴权头的敏感参数打码（`response=***` / `api-key: ***`——分隔符 = 或 :；通用词走
+//	   **紧贴**形态 `name=value`，见 reAuthzParam 的两档名单）；③ Bearer
+//	   token 打码；④ URL userinfo 的口令打码（含连接串 `postgres://user:***@`——同一
+//	   规则吃任意 scheme）；⑤ PEM 私钥块打码（**完整块整块遮；截断块只遮到行尾 + 限长 8KB**——
+//	   见 redactPEMBlocks）；⑥ AWS 风格
+//	   访问 key id 打码（AKIA… 等 20 位整串）；⑦ 词元扫描：core.IsCredentialValue 同
+//	   口径的形状（sk- / ghp_ / JWT），外加 "key=value" 形态里=value 那半（同
+//	   runtime/cap/remote 的 isCredentialArg 口径）。
 //
-// 诚实边界：变形过的凭据（base64 / 拼接 / 拆片）**认不出**——这一层是启发式。
+// 诚实边界：**尽力而为**的启发式——变形过的凭据（base64 / 拼接 / 拆片）与**没见过的
+// 新形态**都认不出；真正防线是凭据不进日志/事件（H15），本函数只是外发面前的兜底。
+//
+// **误伤面也如实说**：② 的 B 档（通用词 response/signature/nonce/opaque/pwd）只认紧贴
+// 形态，故散文里的 "The response: 200 OK" 不再被整段打码；代价是 `pwd: xxx`（冒号 +
+// 空格）不再遮（写 `pwd=xxx` 才遮，`password:` 照遮）。
 func redactSecretText(s string) string {
 	if s == "" {
 		return s
@@ -476,11 +619,18 @@ func redactSecretText(s string) string {
 	// ① Authorization：**打码值**（第三组），scheme（第二组，可选）留着。
 	//    替换串不能写成 "${1}***"——那会把 scheme 当值打掉，真凭据反而明文外发。
 	out := reAuthzValue.ReplaceAllString(s, "${1}${2}***")
-	// ② 参数化鉴权头：敏感参数（response= / Credential= / Signature= / token=）的值打码
+	// ② 参数化鉴权头：敏感参数（response= / Credential= / api-key: …）的值打码
 	//    ——这种头里没有"scheme 值"那半（① 只能遮住第一个词），值藏在参数里。
 	out = reAuthzParam.ReplaceAllString(out, "${1}***")
+	out = reAuthzParamTight.ReplaceAllString(out, "${1}${2}***")
 	out = reBearerValue.ReplaceAllString(out, "${1}***")
 	out = reURLUserinfo.ReplaceAllString(out, "${1}***${3}")
+	// ⑤⑥ 加固（缺口 7 脱敏补漏）：PEM 私钥块 / AWS 访问 key id——两者的 body/keyid
+	//    都不具 sk-/ghp_ 形状，词元扫描兜不住，必须立规则。
+	//    PEM：完整块整块遮；**截断块（缺 END）只遮到行尾 + 限长 8KB**（旧实现用 `$`
+	//    兜底吞掉整段余文——误伤面失控）。
+	out = redactPEMBlocks(out)
+	out = reAWSKeyID.ReplaceAllString(out, "***")
 	return maskSecretTokens(out)
 }
 

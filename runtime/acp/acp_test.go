@@ -17,6 +17,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 	"github.com/Yorha9e/alasol/core/bus"
 	"github.com/Yorha9e/alasol/core/loop"
+	"github.com/Yorha9e/alasol/runtime"
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 )
 
@@ -70,6 +71,41 @@ func (b *fakeBackend) RunPrompt(ctx context.Context, sid contracts.Ulid, prompt 
 
 func (b *fakeBackend) SubscribeEvents(sid contracts.Ulid) *bus.Subscription {
 	return b.bus.Subscribe(bus.Filter{SessionIDs: []contracts.Ulid{sid}})
+}
+
+// LoadSession 实现 acp 的载入能力（sessionLoader 可选接口）：**与 resume 同源的回放路径**
+// ——runtime.ReplaySession（事件流按 seq 全量读回）+ runtime.FoldConversation（折叠出
+// 对话），事件流是唯一事实源。查无此会话 → ErrSessionNotFound（端点回协议错误帧）。
+func (b *fakeBackend) LoadSession(ctx context.Context, sid contracts.Ulid) ([]core.Message, error) {
+	b.mu.Lock()
+	known := b.sessions[sid]
+	b.mu.Unlock()
+	if !known {
+		return nil, ErrSessionNotFound
+	}
+	events, err := runtime.ReplaySession(ctx, b.store, sid)
+	if err != nil {
+		return nil, err
+	}
+	return runtime.FoldConversation(events), nil
+}
+
+// publishUserPrompt / publishModelTurn 落 durable 对话事件（模拟"上一次运行"留下的历史，
+// 供 session/load 的回放路径读回）。与 core/loop 落的 kind / 载荷形状一致。
+func (b *fakeBackend) publishUserPrompt(sid contracts.Ulid, text string) {
+	payload, _ := json.Marshal(contracts.UserPromptPayload{Text: text})
+	b.publish(contracts.Event{
+		V: 1, ID: core.NewUlid(), Kind: loop.KindUserPrompt, TS: nowTS(),
+		SessionID: sid, Durable: true, Payload: payload,
+	})
+}
+
+func (b *fakeBackend) publishModelTurn(sid contracts.Ulid, text string) {
+	payload, _ := json.Marshal(contracts.ModelTurnPayload{Text: text})
+	b.publish(contracts.Event{
+		V: 1, ID: core.NewUlid(), Kind: loop.KindModelTurn, TS: nowTS(),
+		SessionID: sid, Durable: true, Payload: payload,
+	})
 }
 
 // publishDelta 发一条 model.delta 流事件（durable=false，模拟 loop 的 G13 增量）。
@@ -349,8 +385,8 @@ func TestACP_EndToEnd_PromptStreamsMessage(t *testing.T) {
 	if init.ProtocolVersion != 1 || init.AgentInfo.Name != agentName {
 		t.Errorf("initialize 结果不对: %+v", init)
 	}
-	if init.AgentCapabilities.LoadSession {
-		t.Errorf("loadSession 应声明 false")
+	if !init.AgentCapabilities.LoadSession {
+		t.Errorf("loadSession 应声明 true（session/load 已实现）")
 	}
 
 	// session/new
@@ -1046,5 +1082,170 @@ func TestACP_TruncatedByBudget_MaxTurnRequests(t *testing.T) {
 	// 枚举纪律：产出值必须落在 ACP 的 stopReason 枚举内。
 	if !validStopReasons[pr.StopReason] {
 		t.Errorf("stopReason=%q 不在 ACP 枚举内", pr.StopReason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// session/load（缺口 7 第一件）
+// ---------------------------------------------------------------------------
+
+// session/load 全链路：载入"上一次运行"开的会话 → 历史以 session/update 回放（**先于**
+// load 响应）→ load 后的 session/prompt 走既有 prompt 路径。
+func TestACP_LoadSession_ReplaysHistoryAndPromptWorks(t *testing.T) {
+	backend := newFakeBackend(t)
+	// 模拟跨"进程"的既有会话：不经 ACP 连接创建，先落 durable 对话事件（历史事实源）。
+	sid, err := backend.CreateSession(t.TempDir())
+	if err != nil {
+		t.Fatalf("造既有会话: %v", err)
+	}
+	backend.publishUserPrompt(sid, "历史上的问题")
+	backend.publishModelTurn(sid, "历史上的答复")
+
+	client, cleanup := startACP(t, backend, nil, 5*time.Second)
+	defer cleanup()
+
+	// initialize：loadSession=true（能力声明与实现一致）。
+	id0 := client.sendRequest("initialize", map[string]any{"protocolVersion": 1})
+	res, ok := client.waitForResult(id0, 2*time.Second)
+	if !ok {
+		t.Fatal("没收到 initialize 响应")
+	}
+	var init initializeResult
+	if err := json.Unmarshal(res, &init); err != nil {
+		t.Fatal(err)
+	}
+	if !init.AgentCapabilities.LoadSession {
+		t.Fatal("loadSession 应声明 true（session/load 已实现）")
+	}
+
+	// session/load：sessionId + cwd + mcpServers（宽容吃下——mcpServers 按口径忽略）。
+	idLoad := client.sendRequest("session/load", map[string]any{
+		"sessionId":  string(sid),
+		"cwd":        t.TempDir(),
+		"mcpServers": []any{},
+	})
+	resLoad, ok := client.waitForResult(idLoad, 3*time.Second)
+	if !ok {
+		t.Fatal("没收到 session/load 响应")
+	}
+	// ACP LoadSessionResponse 无必填字段：回空对象（历史走 update 回放，不在 result 里）。
+	if got := strings.TrimSpace(string(resLoad)); got != "{}" {
+		t.Errorf("session/load result 应为 {}，得到 %s", got)
+	}
+
+	// 历史回放：user / agent 两侧的 chunk 都要补全（FoldConversation 折叠出的整段对话）。
+	var userHist, agentHist strings.Builder
+	for _, m := range client.findUpdates("user_message_chunk") {
+		userHist.WriteString(contentText(m.Content))
+	}
+	for _, m := range client.findUpdates("agent_message_chunk") {
+		agentHist.WriteString(contentText(m.Content))
+	}
+	if !strings.Contains(userHist.String(), "历史上的问题") {
+		t.Errorf("load 应回放用户侧历史（user_message_chunk），得到 %q", userHist.String())
+	}
+	if !strings.Contains(agentHist.String(), "历史上的答复") {
+		t.Errorf("load 应回放助手侧历史（agent_message_chunk），得到 %q", agentHist.String())
+	}
+
+	// 顺序钉子：回放通知必须**先于** load 响应（ACP：回放完才回响应）。
+	loadIdx, updateIdx := -1, -1
+	for i, f := range client.frames() {
+		if f.isResponse() && f.ID != nil && string(*f.ID) == string(idLoad) {
+			loadIdx = i
+		}
+		if updateIdx < 0 && f.isNotification() && f.Method != nil && *f.Method == "session/update" {
+			updateIdx = i
+		}
+	}
+	if loadIdx < 0 || updateIdx < 0 || updateIdx > loadIdx {
+		t.Errorf("回放通知应在 load 响应之前：first update[%d] load response[%d]", updateIdx, loadIdx)
+	}
+
+	// load 后继续对话 → 既有 prompt 路径（端点已把该 session 登记为 known）。
+	idP := client.sendRequest("session/prompt", map[string]any{
+		"sessionId": string(sid),
+		"prompt":    "继续聊",
+	})
+	resP, ok := client.waitForResult(idP, 3*time.Second)
+	if !ok {
+		t.Fatal("load 后 session/prompt 没回应（载入的 session 没走通既有 prompt 路径？）")
+	}
+	var pr promptResult
+	if err := json.Unmarshal(resP, &pr); err != nil {
+		t.Fatal(err)
+	}
+	if pr.StopReason != stopReasonEndTurn {
+		t.Errorf("load 后 prompt 的 stopReason=%q want %q", pr.StopReason, stopReasonEndTurn)
+	}
+}
+
+// session/load：会话不存在 → 协议错误帧（-32602，与 prompt 的"未知 session"同形状），
+// 且**不能**同时回成功 result。
+func TestACP_LoadSession_NotFound(t *testing.T) {
+	backend := newFakeBackend(t)
+	client, cleanup := startACP(t, backend, nil, 5*time.Second)
+	defer cleanup()
+
+	_ = client.sendRequest("initialize", map[string]any{"protocolVersion": 1})
+	id := client.sendRequest("session/load", map[string]any{
+		"sessionId": string(core.NewUlid()), // 合法 ULID，但后端查无此会话
+		"cwd":       t.TempDir(),
+	})
+	rpcErr, ok := client.waitForError(id, 2*time.Second)
+	if !ok {
+		t.Fatal("会话不存在应收到错误帧（没收到）")
+	}
+	if rpcErr.Code != codeInvalidParams {
+		t.Errorf("code=%d want %d (-32602)", rpcErr.Code, codeInvalidParams)
+	}
+	if !strings.Contains(rpcErr.Message, "不存在") {
+		t.Errorf("错误消息应写明会话不存在: %q", rpcErr.Message)
+	}
+	for _, f := range client.frames() {
+		if f.isResponse() && f.Result != nil && f.ID != nil && string(*f.ID) == string(id) {
+			t.Fatalf("会话不存在却回了成功 result: %s", string(*f.Result))
+		}
+	}
+}
+
+// session/load：sessionId 不是合法 ULID → -32602（与 session/prompt 同一校验口径）。
+func TestACP_LoadSession_InvalidSessionID(t *testing.T) {
+	backend := newFakeBackend(t)
+	client, cleanup := startACP(t, backend, nil, 5*time.Second)
+	defer cleanup()
+
+	_ = client.sendRequest("initialize", map[string]any{"protocolVersion": 1})
+	id := client.sendRequest("session/load", map[string]any{"sessionId": "not-a-ulid"})
+	rpcErr, ok := client.waitForError(id, 2*time.Second)
+	if !ok {
+		t.Fatal("非法 sessionId 应收到错误帧（没收到）")
+	}
+	if rpcErr.Code != codeInvalidParams {
+		t.Errorf("code=%d want %d (-32602)", rpcErr.Code, codeInvalidParams)
+	}
+}
+
+// noLoadBackend 只暴露 Backend 的三方法（嵌接口不带 LoadSession）——模拟**未实现**载入
+// 能力的后端（如范围外的 cmd hub 适配层）。
+type noLoadBackend struct{ Backend }
+
+// 后端没实现 sessionLoader → -32000 能力缺失（**不假装载入成功**）。
+func TestACP_LoadSession_BackendWithoutCapability(t *testing.T) {
+	base := newFakeBackend(t)
+	client, cleanup := startACP(t, &noLoadBackend{Backend: base}, nil, 5*time.Second)
+	defer cleanup()
+
+	_ = client.sendRequest("initialize", map[string]any{"protocolVersion": 1})
+	id := client.sendRequest("session/load", map[string]any{
+		"sessionId": string(core.NewUlid()),
+		"cwd":       t.TempDir(),
+	})
+	rpcErr, ok := client.waitForError(id, 2*time.Second)
+	if !ok {
+		t.Fatal("能力缺失应回错误帧（没收到）")
+	}
+	if rpcErr.Code != codeServerError {
+		t.Errorf("code=%d want %d (-32000 能力缺失)", rpcErr.Code, codeServerError)
 	}
 }

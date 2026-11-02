@@ -18,12 +18,35 @@
 //
 //	initialize             能力协商（protocolVersion / agentCapabilities / agentInfo）
 //	session/new            cwd → sessionId（本实现用 hub 的 ULID **原样**作 sessionId）
+//	session/load           sessionId → 载入既有会话（agentCapabilities.loadSession=true：
+//	                       后端回放事件流、折叠出对话（与 resume 同源路径，挂在可选能力
+//	                       sessionLoader 上）；响应前把整段历史以 session/update 回放，
+//	                       随后 session/prompt 走既有 prompt 路径；**会话不存在 → 错误帧**）
 //	session/prompt         content blocks → 跑完一整轮才回 {stopReason}
-//	session/update         （通知，agent→client）流式增量：agent_message_chunk /
-//	                       agent_thought_chunk / tool_call / tool_call_update
+//	session/update         （通知，agent→client）流式增量：user_message_chunk（仅 load 回放）/
+//	                       agent_message_chunk / agent_thought_chunk / tool_call / tool_call_update
 //	session/request_permission （agent→client 请求）ask 审批桥：client 回 outcome
 //	session/cancel         （通知，client→agent）取消当前 turn
-//	session/load           **未实现**（agentCapabilities.loadSession=false 如实声明）
+//
+// # 能力声明按后端实际能力动态给
+//
+// initialize 的 agentCapabilities.loadSession = **后端是否实现了 sessionLoader**
+// （可选接口，type assertion 探测）——不是无条件 true。后端没实现 → 宣称 false，
+// session/load 回 -32000（能力缺失）：宣称 true 却回不了 = 骗客户端（客户端会真的去
+// session/load，然后拿到一个能力缺失的错）。
+//
+// # load 的诚实边界：历史**只回放给客户端** ≠「模型记住了」
+//
+// loader 的契约是"把折叠出的历史交回客户端"，**不**保证下一轮 prompt 自带这段历史。
+// 模型侧能不能续上取决于后端的 RunPrompt：**hub 的 RunPrompt 不带历史**（hub 每轮不带
+// 历史，历史只存在于事件流里）——故"load 之后模型接着此前对话往下说"在本实现里**不成立**；
+// 要让模型续跑得走 resume 式路径（把 fold 出的历史灌回 loop），那是 hub 侧的能力。
+//
+// # load 不阻塞读循环
+//
+// 载入（后端回放 + 折叠 + 一串 update）跑在 **goroutine** 上，不占唯一的入站读循环：
+// 否则别的 session 的 session/cancel 与审批应答会被一起堵住（取消无反应、审批悬到
+// 超时）。回放与响应在同一个 goroutine 里顺序写 → update 仍**先于** load 响应。
 //
 // sessionId 由 agent 分配（本实现 = hub 的 session ULID 原样，见 Backend.CreateSession）。
 //
@@ -36,12 +59,18 @@
 // 了什么"必须能一句话答完）：
 //
 //	① initialize 的能力协商结果（协议版本 / agent 名字与版本 / 能力布尔位）——无敏感数据；
-//	② session/new 的结果（sessionId = hub ULID）；
+//	② session/new 的结果（sessionId = hub ULID）；session/load 的结果（空对象 `{}`）+
+//	   回放通知（历史对话的 user_message_chunk / agent_message_chunk / tool_call（rawInput
+//	   经 redactJSON 脱敏）/ tool_call_update——与 prompt 期的 session/update 同一出口）；
 //	③ session/prompt 的结果（stopReason）或错误帧（-32603 + **脱敏后**的错误摘要）；
 //	④ session/update 通知：
 //	   - agent_message_chunk / agent_thought_chunk：**模型正文与思维链增量**（会离开本机）；
 //	   - tool_call / tool_call_update：工具名、tool_call_id、结果文本；工具参数经 redactJSON
 //	     脱敏（敏感键 + 值级凭据打码）后才进 rawInput；
+//
+//	（脱敏口径的边界：**键名遮蔽只在结构化面成立**——redactJSON 只处理合法 JSON（非 JSON
+//	的工具参数整体不转发），散文/命令里的凭据靠**值级**启发式兜。故 rawInput 是**参数
+//	摘要**，不是完整参数回放。）
 //	⑤ session/request_permission 请求：工具名 + 人读摘要 + 副作用等级 + 脱敏后的参数摘要
 //	   + 选项清单（allow-once / allow-always / reject-once）。
 //
@@ -121,5 +150,9 @@
 //   - **凭据变形认不出**：脱敏是启发式（键名 + 值级形状），base64 / 拼接 / 拆片的凭据
 //     认不出——故外发面是**参数摘要**而不是完整回放。（鉴权头的**值**定位按"词的个数"
 //     来，不靠 scheme 白名单：自定义 scheme 的头也遮得住值；参数化头
-//     `response=`/`Credential=`/`Signature=`/`token=` 的值另有一条规则遮。）
+//     `response=`/`Credential=`/`Signature=`/`token=` 的值另有一条规则遮；加固后另覆盖
+//     api-key 赋值、AWS AKIA 形态、PEM 私钥块、连接串口令段等模式。）
+//   - **脱敏不是安全边界**：这些启发式**尽力而为**，新型凭据形态拦不住（没见过的前缀、
+//     新编码、拆片变形都可能漏）；**真正防线是凭据不进日志/事件**（H15：凭据不经事件流 /
+//     日志外发，脱敏只是纵深防御里最后兜底的一层）。
 package acp
