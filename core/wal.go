@@ -3,7 +3,7 @@ package core
 import "encoding/json"
 
 // 本文件是 **WAL 预写日志**（v4-4-B）的词汇表与写面：kind 常量 + WalSink 接口 +
-// 五种记录的载荷形状。
+// 六种记录的载荷形状。
 //
 // # 为什么住在 core（而不是 core/loop 或 runtime）
 //
@@ -55,6 +55,17 @@ const (
 	// 故 loop 在 provider.Run 返错时写一条 turn.failed：对账时"begin 后跟 failed"= 正常失败
 	// （**不算在飞**），只有"begin 无 end 无 failed"才是崩溃残留。
 	KindWalTurnFailed = "turn.failed"
+
+	// KindWalTurnRetry provider 内部**重试发生时**（第 n 次尝试发起前，n ≥ 2）——
+	// 载荷 = turn / attempt / 上次失败的错误摘要 / 实测退避时长。
+	//
+	// 写点与其余 kind 同纪律：落在 X1 三段写路径**之外**——重试发生在 provider.Run
+	// **内部**，本来就不在 intent→completed/failed 窗口里（loop 的 emitFunc 收到
+	// provider.retry 事件时经 walAppend 落一条，见 core/loop/wal.go；provider 侧只发
+	// emit，不穿 WAL 句柄）。**纯观测**：不参与任何对账判定（Reconcile 不读它）、
+	// 不参与重试/预算判定；WAL 关（sink nil）时零行为变化。为什么值得记：崩溃时
+	// "当时正在退避重试"是现场的一部分（有 begin 无 end 的段里多一条证据）。
+	KindWalTurnRetry = "turn.retry"
 
 	// KindWalBlobPlan 外置 blob 的**计划**（tool_call_id、阈值；**写在 intent 之前**）。
 	//
@@ -141,6 +152,25 @@ type WalTurnFailedPayload struct {
 	Turn int `json:"turn"`
 	// Error 是失败摘要（**截断**过的错误文本：诊断用，不落全量栈）。
 	Error string `json:"error"`
+}
+
+// WalTurnRetryPayload 是 KindWalTurnRetry 的载荷：provider 内部一次**已发起的重试**。
+//
+// 与 core.RetryInfo（provider.retry 事件载荷）同源但**刻意不共用类型**：那个是进程内
+// emit 通道的形状（带 time.Duration），WAL 是落盘 NDJSON（毫秒整数更好读、不引
+// time 序列化差异）——口径一致、类型各自独立（同 WalTurnDeltaPayload 与
+// contracts.ModelDeltaPayload 的关系）。
+type WalTurnRetryPayload struct {
+	// Turn 轮次号（重试发生在哪一轮的 provider.Run 内部）。
+	Turn int `json:"turn"`
+	// Attempt 是即将发起的尝试序号（2 = 第一次重试；与 RetryInfo.Attempt 同源）。
+	Attempt int `json:"attempt"`
+	// Error 是上次失败的摘要（provider 侧已按 statusErrorOf 口径截断：不含我们设置的
+	// Authorization 头；响应体与请求 URL 原样截断进摘要——与 turn.failed 同口径，端点
+	// 若在响应体里回显凭据，风险同既有面，见 core/provider.go 的 RetryInfo.Error）。
+	Error string `json:"error"`
+	// BackoffMS 是这次重试前实际等待的毫秒数（实测；0 = 未等待 / 不明）。
+	BackoffMS int64 `json:"backoff_ms,omitempty"`
 }
 
 // WalBlobPlanPayload 是 KindWalBlobPlan 的载荷：外置 blob 的**计划**。

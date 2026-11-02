@@ -111,7 +111,8 @@ type Hub struct {
 	docs docStore
 	// wal 是 v4-4-B WAL 预写日志的目录管理器（runtime/store/walfile；nil = 未启用 =
 	// 零行为变化酸测试）。开了才建（Config.WalDir 非空）——per-session Writer 由它懒建，
-	// loop 经 walFor 拿到 sink（turn.begin / turn.delta / turn.end / turn.failed / blob.plan 五个写点）。
+	// loop 经 walFor 拿到 sink（turn.begin / turn.delta / turn.end / turn.failed /
+	// turn.retry / blob.plan 六个写点）。
 	// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面
 	//（见 host/wal.go）。
 	wal *walfile.Store
@@ -851,7 +852,8 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 		return loop.Result{}, errors.New("host: prompt 不能为空")
 	}
 	// W15 成本预算闸门（v4-4-B；**默认不设上限** = BudgetMaxTokens<=0 时 checkBudget 直接
-	// 返回 nil = 零行为变化）。**Run 前**检查：已累计 ≥ 上限 → 拒绝发起本轮（不再烧 token）。
+	// 返回 nil = 零行为变化）。**Run 前**检查（per-Run 层）：已累计 ≥ 上限 → 拒绝发起本轮
+	//（不再烧 token）。轮间另有 TurnBudget 钩子（缺口 5 第二件，见 loopFor 的装配）。
 	if berr := h.checkBudget(ctx, sessionID); berr != nil {
 		return loop.Result{}, berr
 	}
@@ -860,9 +862,24 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 		return loop.Result{}, err
 	}
 	res, err := lp.Run(ctx, prompt)
-	// W15：**Run 后**再查一次——本轮把累计推过了上限就告警（越界留痕；下一轮才被拒，
-	// 见 checkBudget 的诚实边界：这是 per-Run 粒度，不是 turn 内逐轮刹车）。
+	// W15：**Run 后**再查一次——本轮把累计推过了上限就告警（越界留痕；per-Run 层的
+	// 拒绝发生在**下一次** RunPrompt 入口；Run **内**的逐轮截断由 loop 的 TurnBudget
+	// 钩子负责，见 host/budget.go 的"两层检查"）。
 	h.warnIfOverBudget(ctx, sessionID)
+	// 逐轮预算闸门**真的截断了这一轮**（缺口 5 第二件）→ 单独告警一条。
+	//
+	// 为什么 warnIfOverBudget 不够：那条告警说的是"累计已越界"（成本观测面），而这里说的是
+	// "**这一轮没跑完**"——轮次被闸门挡在 provider.Run 之前（那一轮什么都没跑：没有
+	// context.assembled、没有 model.turn）。两者是不同的事实，审计上要能分辨"跑完了但
+	// 超了"与"被挡住了没跑"。
+	//
+	// ACP 面的映射：stopReason = max_turn_requests（ACP 枚举里没有"预算耗尽"这一档；取舍
+	// 见 runtime/acp/endpoint.go 的 turnsExhausted）——所以**宿主这一条 Warn 是日志侧
+	// 唯一能分出"轮数用尽"与"预算用尽"的地方**。
+	if res.TruncatedByBudget {
+		hubLog.Warn("host: 本轮被逐轮成本预算闸门截断（该轮未发起；已跑轮次的结果照常收口）",
+			"session_id", string(sessionID), "reason", res.TruncationReason)
+	}
 	// 跑完立刻把新事件并进投影 + 发现表：/api/context 与 /api/peers 不必等下一次请求的
 	// 增量扫描。
 	if _, cerr := h.proj.catchUp(ctx); cerr != nil {
@@ -1009,7 +1026,12 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		MaxTurns:        h.cfg.MaxTurns,
 		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位（G14；空 = 不传）
 		ContextBudget:   h.contextBudgetFor(strategyKind),
-		Store:           h.store, // goal ledger 生产者（J19/X6）与手动 checkpoint（X3）经它
+		// W15 逐轮预算制动（v4-4-B 缺口 5）：BudgetMaxTokens<=0 → nil 钩子（零查询、
+		// 零行为变化）；>0 → 每轮 provider.Run 前读一次累计成本（checkBudget 同款
+		// fail-open：查询失败不拒本轮，warn 留痕）。per-Run 的 checkBudget（RunPrompt
+		// 入口 / fork）保留——两层不冲突：Run 前拒 + 轮间拒。
+		TurnBudget: h.turnBudgetFor(sessionID),
+		Store:      h.store, // goal ledger 生产者（J19/X6）与手动 checkpoint（X3）经它
 		// 在线表注入（K14/K15）：主 agent 的 prompt 末尾恒带在线表；配置运行期可调。
 		// subagent 的 loop 不传这两项（nil = 不注入，K11：只有主 agent 参与水平可见性）。
 		OnlineTable:       h.onlineConfig,
@@ -1027,7 +1049,7 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		BlobMaxInline: h.cfg.BlobMaxInline,
 		// WAL 预写日志（v4-4-B；nil = 关 = 零行为变化）。h.wal 开了才非 nil
 		//（Config.WalDir 非空）；walFor 懒建 per-session Writer，开失败只告警不拒绝本轮
-		//（WAL 是尽力而为的补充面）。五个写点都在 X1 三段路径**之外**（见 core/loop/wal.go）。
+		//（WAL 是尽力而为的补充面）。六个写点都在 X1 三段路径**之外**（见 core/loop/wal.go）。
 		WalSink: h.walFor(sessionID),
 		// telemetry（L2/D19；nil = 关 = 零行为变化）。h.tel 开了才非 nil（Config.Telemetry=file）；
 		// 三个发点都在 X1 三段路径**之外**（见 core/loop/telemetry.go）。独立管道，不参与判定。

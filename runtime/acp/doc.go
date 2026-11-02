@@ -94,6 +94,11 @@
 // （MaxTurns=1 时两者都是 1 轮）——loop 用 Result.TruncatedByMaxTurns **显式**标出
 // 截断，端点按它判（见 turnsExhausted）。
 //
+// "被**预算闸门**截断"同理：loop 用 Result.TruncatedByBudget 显式标出（缺口 5 第二件；
+// W15 逐轮成本刹车）→ 端点同样映射成 **max_turn_requests**（ACP 的 stopReason 是闭合
+// 枚举，没有"预算耗尽"这一档；取舍与代价见 turnsExhausted 的注释——客户端分不出
+// "轮数用尽"与"预算用尽"，细分要改 ACP 契约，故本刀不加新枚举值）。
+//
 // # 增量与最终文本的对账（F5）
 //
 // 一轮结束时把**已桥出的增量**与后端给的**最终文本**对账：增量是最终文本的前缀 → 补发

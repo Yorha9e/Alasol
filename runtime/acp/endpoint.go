@@ -553,7 +553,8 @@ func (e *endpoint) runTurn(ctx context.Context, cancel context.CancelFunc, id js
 
 	stopReason := mapStopReason(ctx)
 	if stopReason == stopReasonEndTurn && e.turnsExhausted(res) {
-		// 轮数用尽（loop 被 MaxTurns 截断）→ max_turn_requests（F4：枚举内，且语义对）。
+		// 轮数用尽（loop 被 MaxTurns 截断）**或被预算闸门截断**（Result.TruncatedByBudget）
+		// → max_turn_requests（F4：枚举内，且语义对；映射取舍见 turnsExhausted 的注释）。
 		stopReason = stopReasonMaxTurnRequests
 	}
 	if err != nil && !turnCutShort(ctx, err) {
@@ -588,23 +589,44 @@ func turnCutShort(ctx context.Context, err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// turnsExhausted 判定"轮数用尽"（loop 被 MaxTurns 截断）。
+// turnsExhausted 判定"这轮被**上限**截断了"（轮数上限 MaxTurns，或**预算上限**）。
 //
-// 三档判据（N3，从权威到兜底）：
+// 四档判据（N3 + 缺口 5 第二件，从权威到兜底）：
 //
-//	① **权威**：Result.TruncatedByMaxTurns —— loop 亲自打的标记（真 hub 走这条）。
+//	① **权威（轮数）**：Result.TruncatedByMaxTurns —— loop 亲自打的标记（真 hub 走这条）。
+//	①' **权威（预算）**：Result.TruncatedByBudget —— 逐轮预算闸门拒绝了本轮（缺口 5 第二件；
+//	    W15 成本预算）。同样走权威路径：**不回落**旧口径。
 //	② 后端声明"我的结果带权威标记"（turnOutcomeAware）→ 到此为止：**不回落**旧口径
 //	   （否则"恰好用满上限但正常收敛"会被误报成 max_turn_requests）。
 //	③ 老/第三方/假后端只报轮数上限 → **回落旧口径**（"实际轮数 ≥ 上限即视为截断"）。
 //
+// # 映射取舍（budget → max_turn_requests，如实写明）
+//
+// ACP 的 stopReason 是**闭合枚举**（end_turn / max_tokens / max_turn_requests / refusal /
+// cancelled——见包 doc），**没有**"预算耗尽"这一档。故"被预算闸门截断"落到语义最近的
+// **max_turn_requests**：它的语义是"这轮请求撞上了上限、没能跑完"——预算上限正是"撞上
+// 了一个上限"，与轮数上限同族；max_tokens 是"输出 token 上限"（另一种额度，但语义更窄：
+// 它特指**输出**额度，而预算闸门管的是**累计 input+output**，用 max_tokens 会让客户端
+// 误以为"撞的是输出 token 上限"）。cancelled 留给**显式取消**，语义更远（不是被上限挡住，
+// 是人叫停的）。
+//
+// 取舍的代价（如实写明）：客户端**分不出**"轮数用尽"与"预算用尽"——两者都报
+// max_turn_requests。细分要改 ACP 契约（枚举外取值会让现成客户端解不出合法 stopReason，
+// 见包 doc 的 F4 口径），故本刀**不加新值**、只在日志与 Result.TruncationReason 里留
+// 足线索（hub 侧对 TruncatedByBudget 另有一条 Warn，见 host/hub.go 的 RunPrompt）。
+//
 // 诚实边界：③ 是**猜**（Turns ≥ 上限 分不清"正常收敛在最后一轮"与"被截断"）——只对
-// 没有权威标记的后端成立；能透传标记的后端一律走 ①。
+// 没有权威标记的后端成立；能透传标记的后端一律走 ①/①'。
 func (e *endpoint) turnsExhausted(res loop.Result) bool {
 	// ① 权威标记：loop 说"这轮被 MaxTurns 截断了"。
 	if res.TruncatedByMaxTurns {
 		return true
 	}
-	// ② 后端能给出权威标记 → 上面那句 false 就是"没被截断"，不再猜。
+	// ①' 权威标记：loop 说"这轮被**预算闸门**截断了"（缺口 5 第二件）。
+	if res.TruncatedByBudget {
+		return true
+	}
+	// ② 后端能给出权威标记 → 上面那两句 false 就是"没被截断"，不再猜。
 	if aware, ok := e.backend.(turnOutcomeAware); ok && aware.TurnOutcomeAuthoritative() {
 		return false
 	}

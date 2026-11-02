@@ -153,7 +153,12 @@ func (e *Embedder) Embed(ctx context.Context, text string) ([]float32, error) {
 
 	// 与 chat 共用的可重试传输层小重试（白名单/退避/Retry-After 口径见包 doc「重试」）；
 	// resp 非 nil = 拿到一个不再重试的 2xx 响应。
-	resp, err := e.p.doWithRetry(ctx, embeddingsPath, payload)
+	//
+	// **重试留痕边界（v4-4-B 缺口 5 挂账）**：第四个参数 emit 传 nil——Embedder 没有
+	// emit 通道（宿主 RAG 面的窄接口就是 Embed(ctx, text)，不带事件出口），所以 embed
+	// 路径的重试**不进 WAL**（chat 路径经 Run 的 emit → loop 的 turn.retry 才留痕）。
+	// 要给 embed 重试也留痕，得先给 Embedder 穿一条观测通道（那是另一笔）。
+	resp, err := e.p.doWithRetry(ctx, embeddingsPath, payload, nil)
 	if err != nil {
 		return nil, err
 	}

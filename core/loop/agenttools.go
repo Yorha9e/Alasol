@@ -482,6 +482,15 @@ func (l *Loop) emitAgentFailed(ctx context.Context, causation *contracts.Ulid, c
 
 // buildChildLoop 依据 child 的 AgentType 装配子 loop（同 Bus/Registry/Provider/SessionID/SessionEnv）。
 //
+// # 透传清单（哪些跟着子 agent 走，哪些**刻意不跟**）
+//
+//	透传：Provider / Bus / Registry / Policy / Approver / SessionID / SessionEnv /
+//	      MaxTurns（每层各自的上限）/ **TurnBudget**（逐轮预算闸门）/ ReasoningEffort /
+//	      BlobSink+BlobMaxInline（大 payload 外置）/ Agents（共享树）
+//	不跟：OnlineTable（只有主 agent 参与水平可见性）/ GoalLedger（账本由主 agent 写）/
+//	      **WalSink**（WAL 是 per-session 一个文件，父子同 session 且轮次号各自从 1 起
+//	      → 混在一起归属说不清；/btw 旁支有自己的 session，不受此限）
+//
 // W6-A（2026-10-31 拍板）：子 agent 的上下文策略**按其类型显式声明**装配——未声明 / append
 // → 追加式（ContextStrategy 留 nil），**不继承主 agent 的策略**；声明非 append → 经
 // Agents.ChildStrategy 钩子按 kind 造工厂（钩子拿到 child 节点 + 类型声明，能按子 agent
@@ -521,7 +530,20 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// 父 Run 的 ctx 同源（见 runSpawn：childLoop.Run(ctx, ...)）共同覆盖子任务：
 		// MaxTurns 管"子自己跑几轮"，ctx（对协议面 = Config.PromptRunTimeoutSec 的整轮预算）
 		// 管"整棵树共用的总时钟"——子 loop 同步跑在父的 Run ctx 里，父的 ctx 取消/超时即子的。
-		Agents: l.agents, // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
+		//
+		// **逐轮预算钩子也透传**（缺口 5 第二件）：子 agent 的每一轮 provider.Run 之前
+		// 同样要过预算闸门——不传 = 子 agent 的花费**不受逐轮刹车约束**（父的钩子只覆盖
+		// 父自己的轮次；子 loop 的轮次对父的钩子不可见）→ 多 agent 模式下预算闸门**半边
+		// 失效**。
+		//
+		// 闭包绑的是**同一个 session id**（l.sessionID——子 agent 与父同 session，K25 单流
+		// 多 agent）→ 查的是**同一份账**（该 session 的累计 token 成本）→ 语义成立：父子
+		// 花的都是这个 session 的钱，一份账一起算。钩子是**无状态闭包**（并发 Run 只读
+		// 共享），透传不破坏 Loop 的并发不变式。
+		//
+		// nil = 不查（默认：BudgetMaxTokens<=0 → 宿主连钩子都不建）→ 零行为变化（酸测试）。
+		TurnBudget: l.turnBudget,
+		Agents:     l.agents, // 共享树 + verifier（层级由类型可达性自然涌现，K20/K21）
 		// W6-A：子策略来自类型声明（未声明 = nil = 追加式），**不抄** l.ctxStrategy
 		// （不继承主 agent——子上下文独立）。
 		ContextStrategy: strategy,

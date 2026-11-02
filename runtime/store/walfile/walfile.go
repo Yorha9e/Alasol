@@ -17,7 +17,7 @@
 //	<dir>/<session_id>.wal        # NDJSON，一行一条 core.WalRecord（追加写）
 //
 // 与事件流同风格（一行一事实、可 tail、可 grep）；per-session 一个文件 → 单 session 的
-// WAL 可以单独 truncate / 删除而不影响别的 session（GC 粒度，见下面的挂账）。
+// WAL 可以单独 truncate / 删除而不影响别的 session（GC 粒度，见下面的 GC 一节）。
 //
 // # 写路径（Writer.Append）
 //
@@ -32,9 +32,11 @@
 //     进程死了数据还在，同机的下一个进程照样读得到。fsync 只对**机器掉电/OS 崩溃**有用。
 //   - **轮次边界 fsync**（turn.begin / turn.end / turn.failed，以及 Close）：每轮一两次，
 //     成本可忽略，换来"轮次边界在机器崩溃后也大概率在盘上"。
-//   - **blob.plan 不 fsync**（critic F1）：它是**逐工具调用**的（一条工具调用一条），
-//     拿它当边界等于在工具调用关键路径上插一次同步落盘；且它的内容是"预留"（体量未知），
-//     精度本来就有限。计划写在 intent **之前**（X1 三段窗口之外），不占关键窗口。
+//   - **blob.plan / turn.retry 不 fsync**（critic F1 同款口径）：blob.plan 是**逐工具调用**
+//     的（一条工具调用一条），拿它当边界等于在工具调用关键路径上插一次同步落盘；且它的
+//     内容是"预留"（体量未知），精度本来就有限。计划写在 intent **之前**（X1 三段窗口之外），
+//     不占关键窗口。turn.retry 是**逐次重试**的观测（429/5xx 才有），与 delta 同组只 write
+//     ——它既不是轮次边界，也不值得为一条留痕付 fsync。
 //
 // 代价（如实写明）：**机器掉电**时可能丢掉尾部若干条 delta（已 write 未 fsync 的那几条）。
 //
@@ -52,12 +54,33 @@
 //   - 别的实现/旧版本留下的 .tmp：本包**不主动清理**（不猜别人的文件是谁的），
 //     但 ReadSession 只认 `<session>.wal` 一个名字，残留文件不会被误当成 WAL 读。
 //
-// # GC / 截断：**挂账，未做**
+// # GC：**已落地**（缺口 5 第一件；`walfile.GC` + `alasol wal-gc`）
 //
-// 本包只提供 Truncate（截断成空文件）与 Remove（删整个 session 的 WAL）两个原语，
-// **不提供任何自动策略**：什么时候算"这个 session 的 WAL 没用了"（事件流已有 completed？
-// session 已归档？N 天前？）是产品决策，需要"孤儿 blob 清理"一起定（两者共用同一批对账
-// 键）。挂账见 11 施工计划 v4-4 行。
+// Truncate（截成空文件）与 Remove（删整个 session 的 WAL）两个原语之上，回收策略已落地：
+// `GC(dir, GCOptions{Retention, DryRun})`，**判据三条全过才删**，删除动作 = **Remove 整个
+// 文件**（GC 的目的是回收，不是留一个空壳——Truncate 仍是手工原语）：
+//
+//  1. **龄期**：文件 mtime 超 Retention。**Retention 必给**（<=0 → 库层直接报错）：
+//     龄期是运维决定，没有安全默认——删 WAL = 丢观察面（不丢事实但**不可逆**），
+//     "何时没用了"不该由库猜；
+//  2. **reconcile 干净**：该 session 的恢复报告里**两个"没走完"的信号**全空——
+//     `InFlightTurn == nil`（无在飞轮次）且 `OrphanBlobToolCalls` 空（无孤儿 blob 候选）。
+//     口径：**CorruptLines 不算脏**（半截行容忍是 reconcile 的设计）；reconcile **读失败**
+//     → 该文件跳过计入 Skipped（宁留不删）；**StaleBlobPlans（作废计划）不挡回收**——
+//     作废计划 = "**走完了但没外置**"（completed 落了但没 binary_ref），绝大多数是"结果
+//     不大"的正常收尾，不是崩溃上下文（把它当脏信号 = 回收面落空）；它只是信息性信号。
+//     空事实（Facts == nil）分不出 orphan/stale → **仍保守留**（口径不变）；
+//  3. **合法形态**：文件名是 `<合法 ULID>.wal`（Path 的命名口径）——外来文件/子目录
+//     一律不动。
+//
+// "何时没用了"的裁量仍在调用方手里：Retention 是显式运维参数，对账事实经
+// GCOptions.Facts 注入（nil = 空事实 → 有 blob.plan 的文件保守不删）。判据与孤儿 blob
+// 清理**共用同一批对账键**（reconcile 的信号）；单行 JSON 报告形态照 blobfs.GC
+// （DryRun 与真跑同一判据、删不掉 Skipped 不中止）。**删掉不丢事实**（上面"定位"一节）
+// 依旧成立——GC 回收的是观察面，不是事实源。
+//
+// **GC 删掉活 session 的 WAL = 观察面重置**（不是静默丢数据）：Writer 的写路径**自愈**
+// ——下一次写发现自己的文件没了就**重建新文件**再写（见下面 Writer 的一节）。
 //
 // # 关 = 零行为变化（酸测试）
 //
@@ -125,6 +148,30 @@ type walFile interface {
 // Writer 是一个 per-session 的 WAL 追加写入口（并发安全）。
 //
 // 一个 session 一个 Writer（一个文件）；多个 session 各持各的（ Store 负责分发与收口）。
+//
+// # 自愈：自己的文件没了 → 重建再写（critic F2）
+//
+// **写路径每次都 stat 一下自己的文件**（`ensureFile`）：文件不在了（被 GC 删了 / 被外部
+// 删了）就**重建新文件**再写。
+//
+// 为什么必须自愈（POSIX 的坑）：`unlink` 之后，**仍打开着的 fd 继续写进"死 inode"**——
+// 写成功、不报错，但那些字节**再也读不到**（目录里已经没有那个名字了）。GC 删掉一个
+// **活 session** 的 WAL（龄期到了 + 判据命中）就会踩到：后续每一条 WAL 记录都静默
+// 消失，崩溃恢复报告里**什么也没有**——"观察面静默丢失"比"没有观察面"更坏。
+//
+// 自愈之后：删掉活 session 的 WAL = **观察面重置**（不是静默丢数据）——WAL **不是事实源**
+// （事件流照常完整回放，见包 doc 的"定位"），下一次写重建一个新文件、从头记。
+//
+// 跨进程同款生效（CLI 的 `alasol wal-gc` 删了 hub 正在写的 WAL → hub 的 Writer 下次写
+// 重建新文件）。
+//
+// **代价（如实写明）**：每条记录多一次 `stat`（一次系统调用；delta 逐条写，故这是**每条
+// delta 一次**）。换来的是"观察面不会静默消失"。WAL 关（sink nil）时零成本——连 Writer
+// 都不建。
+//
+// **残留窗口（如实写明）**：stat 与 write 之间 GC 恰好把文件删了 → 那一条会写进死 inode
+// （**最多丢一条观察记录**；下一条写自愈时重建文件）。WAL **不是事实源**——事实在事件流
+// 里，少一条 delta 不影响事实。
 type Writer struct {
 	path string
 
@@ -227,7 +274,7 @@ func (w *Writer) Path() string { return w.path }
 //
 // 序列化失败 → 返错（调用方按尽力为之处理：一次 Warn，不阻断主流程）。
 // 轮次边界 kind（turn.begin / turn.end / turn.failed）额外 fsync（见包 doc 的取舍）；
-// 其余（turn.delta / blob.plan）只 write 不 fsync。
+// 其余（turn.delta / turn.retry / blob.plan）只 write 不 fsync。
 func (w *Writer) Append(kind string, payload any) error {
 	if w == nil {
 		return errors.New("walfile: Writer 为 nil")
@@ -251,6 +298,10 @@ func (w *Writer) Append(kind string, payload any) error {
 	if w.closed {
 		return fmt.Errorf("walfile: WAL 文件 %q 已关闭（不再接受追加）", w.path)
 	}
+	// 自愈：文件没了就重建（POSIX 上"unlink 后 fd 续写死 inode"那个坑的兜底）。
+	if err := w.ensureFile(); err != nil {
+		return err
+	}
 	if _, err := w.f.Write(line); err != nil {
 		return fmt.Errorf("walfile: 追加 %s 记录到 %q: %w", kind, w.path, err)
 	}
@@ -261,6 +312,33 @@ func (w *Writer) Append(kind string, payload any) error {
 			return fmt.Errorf("walfile: fsync %s 记录（已 write，机器掉电可能丢尾部）: %w", kind, err)
 		}
 	}
+	return nil
+}
+
+// ensureFile 自愈：**自己的文件没了** → 重建（重新 open 一个新文件）再写。
+//
+// 只对**真实文件面**生效（w.f 是 *os.File）：注入的记账假文件（sync_seam_test.go）不碰盘。
+//
+// 顺序讲究：**先 open 新的、成功了再关旧的**——open 失败时旧 fd 还在（虽然它指向死
+// inode，但至少不会把 Writer 置于"没有句柄"的状态；下一次 Append 还会再试一次自愈）。
+func (w *Writer) ensureFile() error {
+	if _, ok := w.f.(*os.File); !ok {
+		return nil // 不是真实文件面（测试注入的假文件）：不碰盘
+	}
+	if _, err := os.Stat(w.path); err == nil {
+		return nil // 文件在：正常写
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("walfile: 检查 WAL 文件 %q: %w", w.path, err)
+	}
+	// 文件没了（被 GC 删了 / 被外部删了）→ 重建（O_CREATE 建新的；权限同 newWriter）。
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("walfile: 重建 WAL 文件 %q（已被删除；GC 删掉活 session 的 WAL = 观察面重置）: %w", w.path, err)
+	}
+	old := w.f
+	w.f = f
+	// 旧 fd 在 POSIX 上指向"死 inode"（继续写进去的字节再也读不到）→ 关掉，别泄漏。
+	_ = old.Close()
 	return nil
 }
 
@@ -319,6 +397,7 @@ func (w *Writer) Close() error {
 // **blob.plan 不是边界**（critic F1）：计划写在 intent **之前**（X1 三段窗口之外），但它
 // 是**逐工具调用**发生的（一条工具调用一条）——拿它当 fsync 边界等于在工具调用关键路径
 // 上加一次同步落盘。计划的内容是"预留"（体量未知），精度本来就有限，不值得为它付 fsync。
+// **turn.retry 同理**（缺口 5 第二件）：逐次重试的观测，与 delta 同组只 write。
 func isBoundaryKind(kind string) bool {
 	switch kind {
 	case core.KindWalTurnBegin, core.KindWalTurnEnd, core.KindWalTurnFailed:
@@ -327,7 +406,8 @@ func isBoundaryKind(kind string) bool {
 	return false
 }
 
-// Truncate 把某 session 的 WAL 截成空文件（**原语，不自动调**：GC 策略挂账，见包 doc）。
+// Truncate 把某 session 的 WAL 截成空文件（**手工原语**：GC 不用它——回收走 Remove，
+// 见包 doc 的 GC 一节）。
 //
 // 文件不存在 → 幂等成功（"已经没了"就是目标状态）。在途 Writer 的 fd 仍有效
 // （O_APPEND + 截断 → 后续追加从 0 开始；调用方须自己保证此刻没有并发送入）。
@@ -342,8 +422,8 @@ func Truncate(dir string, sessionID contracts.Ulid) error {
 	return nil
 }
 
-// Remove 删掉某 session 的 WAL 文件（**原语，不自动调**：GC 策略挂账，见包 doc）。
-// 不存在 → 幂等成功。
+// Remove 删掉某 session 的 WAL 文件（**删除原语**：`GC` 的删除动作就是它，见包 doc 的
+// GC 一节）。不存在 → 幂等成功。
 func Remove(dir string, sessionID contracts.Ulid) error {
 	if !core.ValidUlid(sessionID) {
 		return fmt.Errorf("walfile: session id %q 不是合法 ULID", string(sessionID))

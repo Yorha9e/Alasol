@@ -74,6 +74,8 @@ func main() {
 		code = modelsMain(os.Args[2:])
 	case "wal":
 		code = walMain(os.Args[2:])
+	case "wal-gc":
+		code = walGCMain(os.Args[2:])
 	case "blob-gc":
 		code = blobGCMain(os.Args[2:])
 	case "eval":
@@ -113,6 +115,16 @@ func usage() {
                                         （上次崩在第几轮/跑的什么模型/吐过几段 delta/
                                         哪些 tool_call 的 blob 是孤儿候选）。**观察面，
                                         不写回事件流**；未配 [wal].dir = wal_exists=false
+  alasol wal-gc [flags]                 WAL 回收（读 [wal].dir）：按显式龄期删"已没用"的
+                                        session WAL（判据：mtime 超龄 + 对账干净——无在飞
+                                        轮次/孤儿候选 + 合法 <session>.wal 形态；作废
+                                        计划不算脏、可回收；Remove 整文件；删掉不丢
+                                        事实——活 session 被删 = 观察面重置，后续写
+                                        重建新文件）。-retention 必给（缺省 0 = 退出码
+                                        2，龄期不替你猜）；-wal-dir 显式指定（优先于
+                                        配置文件）；-dry-run 只报不删；不读事件库（空事实
+                                        → 有 blob.plan 的 WAL 保守不删）。单行 JSON 到
+                                        stdout；目录未配/不存在 = 退出码 2（不静默成功）
   alasol blob-gc [flags]                blob 外置仓库 GC（读 [blob].dir）：回收崩溃残留
                                         （.tmp / 孤儿目录）；-retention 默认 0 = 只安全
                                         两扫（不碰有引用的完整 blob），>0 才按 mtime 清扫

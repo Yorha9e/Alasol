@@ -331,6 +331,9 @@ func Reconcile(scan ScanResult, sessionID contracts.Ulid, facts Facts) Report {
 	planned := map[string]bool{}
 
 	for _, rec := range scan.Records {
+		// turn.retry（缺口 5 第二件）**不进对账**：它是 provider 内部重试的纯观测
+		//（不参与在飞判定——收口仍只认 end/failed 两态）。switch 无 default → 未知 kind
+		// 天然跳过，这里写明免得后人以为是漏了。
 		switch rec.Kind {
 		case core.KindWalTurnBegin:
 			var p core.WalTurnBeginPayload

@@ -312,7 +312,8 @@ func TestNewRejectsEmptyDir(t *testing.T) {
 	}
 }
 
-// TestTruncateAndRemoveIdempotent（F10）：两个 GC 原语幂等（不自动调——策略挂账）。
+// TestTruncateAndRemoveIdempotent（F10）：两个原语幂等（Truncate 手工用；Remove 是 GC
+// 的删除动作——见 gc.go 的 GC 一节）。
 func TestTruncateAndRemoveIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	sid := newSession(t)

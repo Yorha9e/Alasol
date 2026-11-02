@@ -1004,3 +1004,47 @@ func TestACP_TruncatedByMaxTurns_MaxTurnRequests(t *testing.T) {
 		t.Errorf("被 MaxTurns 截断应报 %q，得到 %q", stopReasonMaxTurnRequests, pr.StopReason)
 	}
 }
+
+// 缺口 5 第二件的 ACP 侧钉子（critic F4）：后端回 **TruncatedByBudget**（loop 被逐轮
+// 成本预算闸门截断）→ stopReason 必须是 **max_turn_requests**。
+//
+// 映射取舍（如实写明）：ACP 的 stopReason 是**闭合枚举**（end_turn / max_tokens /
+// max_turn_requests / refusal / cancelled），**没有**"预算耗尽"这一档 → 取语义最近的
+// max_turn_requests（"撞上了上限、没能跑完"）。不引入枚举外的新值（枚举外取值会让现成
+// ACP 客户端解不出合法 stopReason）。取舍与代价见 endpoint.go 的 turnsExhausted。
+//
+// 变异自证：把 turnsExhausted 里的 `res.TruncatedByBudget` 判定去掉 → 本用例红
+// （落回 end_turn）。
+func TestACP_TruncatedByBudget_MaxTurnRequests(t *testing.T) {
+	backend := newFakeBackend(t)
+	backend.onRun = func(ctx context.Context, sid contracts.Ulid, prompt string) (loop.Result, error) {
+		return loop.Result{
+			Text:              "预算闸门挡住了这一轮",
+			Turns:             2,
+			TruncatedByBudget: true,
+			TruncationReason:  "host: session X 已达成本预算上限（累计 600 tokens ≥ 上限 500）",
+		}, nil
+	}
+	client, cleanup := startACP(t, backend, nil, 5*time.Second)
+	defer cleanup()
+
+	_ = client.sendRequest("initialize", map[string]any{"protocolVersion": 1})
+	id1 := client.sendRequest("session/new", map[string]any{"cwd": t.TempDir()})
+	res, _ := client.waitForResult(id1, 2*time.Second)
+	var ns newSessionResult
+	json.Unmarshal(res, &ns)
+	id2 := client.sendRequest("session/prompt", map[string]any{"sessionId": ns.SessionID, "prompt": "hi"})
+	res, ok := client.waitForResult(id2, 5*time.Second)
+	if !ok {
+		t.Fatal("没收到 prompt 响应")
+	}
+	var pr promptResult
+	json.Unmarshal(res, &pr)
+	if pr.StopReason != stopReasonMaxTurnRequests {
+		t.Errorf("被预算闸门截断应报 %q，得到 %q", stopReasonMaxTurnRequests, pr.StopReason)
+	}
+	// 枚举纪律：产出值必须落在 ACP 的 stopReason 枚举内。
+	if !validStopReasons[pr.StopReason] {
+		t.Errorf("stopReason=%q 不在 ACP 枚举内", pr.StopReason)
+	}
+}

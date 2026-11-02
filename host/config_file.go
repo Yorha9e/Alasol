@@ -250,8 +250,9 @@ type DocumentsFileConfig struct {
 //   - **可丢弃 / 可截断 / 可 GC**：删掉整个目录不丢任何事实；恢复报告是**观察面不是写回面**
 //     （WAL 里的 delta 可供展示，绝不自动补进事件流）；
 //   - **写失败不阻断主流程**（尽力而为，一条 Warn 留痕）；
-//   - **没有别的开关**：fsync 策略（逐条不 fsync、轮次边界 fsync）与 GC 策略都是实现/
-//     产品决策，不给配置面开洞——GC/截断**挂账**未做（见 host.Config.WalDir 注释）。
+//   - **没有别的开关**：fsync 策略（逐条不 fsync、轮次边界 fsync）是实现决策，不给配置面
+//     开洞；GC 面走 `alasol wal-gc` 的 **-retention 显式龄期**（缺省即拒、不猜默认，
+//     见 host.Config.WalDir 的 GC 注记）。
 type WalFileConfig struct {
 	// Dir WAL 根目录（runtime/store/walfile 落地处；per-session 一个 `<session>.wal`）。
 	// 空 = 关 = 零行为变化。

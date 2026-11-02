@@ -1,12 +1,13 @@
 package loop_test
 
-// WAL 预写日志（v4-4-B）的 loop 层钉子：五个写点的序列 / 逐条 delta / 写失败不阻断 /
-// blob.plan 在 Put 之前 / 关 = 零行为变化。
+// WAL 预写日志（v4-4-B）的 loop 层钉子：写点的序列 / 逐条 delta / 写失败不阻断 /
+// blob.plan 在 Put 之前 / 关 = 零行为变化。（turn.retry 写点 = 缺口 5 第二件，
+// 见 wal_retry_test.go。）
 //
 // 口径（全文以 core/wal.go 与 core/loop/wal.go 为准）：
 //   - **WAL 不是事实源**（F5 不受影响）：事件流仍是唯一事实源，WAL 是崩溃恢复的补充面，
 //     可丢弃/可截断/可 GC；恢复报告是观察面不是写回面（loop 侧只负责**写**）。
-//   - 五个写点全在 X1 三段写路径**之外**（intent→completed/failed 的落盘序一字不动）。
+//   - 六个写点全在 X1 三段写路径**之外**（intent→completed/failed 的落盘序一字不动）。
 //   - **关 = 零行为变化**：WalSink 为 nil 时一个字节都不多写、行为逐事件等价（酸测试）。
 
 import (
@@ -591,7 +592,7 @@ func stripVolatile(v any) any {
 	}
 }
 
-// TestWALNilSinkNoPanic（F7）：WalSink 为 nil 时五个写点全是空操作（不 panic、不写东西）。
+// TestWALNilSinkNoPanic（F7）：WalSink 为 nil 时全部写点都是空操作（不 panic、不写东西）。
 //
 // 与 F6 的分工：F6 钉"事件流等价"，本用例钉"nil 安全"——nil sink 是默认路径，任何一处
 // 忘了判 nil 就是每次模型调用一次 panic。

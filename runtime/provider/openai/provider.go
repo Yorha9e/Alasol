@@ -59,6 +59,8 @@ const (
 	KindDone = core.KindDone
 	// KindError 失败（Text=错误文案）；返回前必发，发完照常返回 error。
 	KindError = core.KindError
+	// KindProviderRetry provider 内部重试发生时的观测事件（缺口 5 第二件；Retry=载荷）。
+	KindProviderRetry = core.KindProviderRetry
 )
 
 // Options 是 Provider / Embedder 的装配参数（零值可用：BaseURL 落默认值、无 APIKey、
@@ -186,7 +188,9 @@ func (p *Provider) Run(ctx context.Context, req core.ModelRequest, emit func(cor
 
 	// 可重试的传输层失败在这里小重试（M6/M7）；resp 非 nil = 拿到一个**不再重试**的
 	// 2xx 响应（非 2xx 一律在重试循环**内**成错——见 doWithRetry 的说明）。
-	resp, err := p.doWithRetry(ctx, chatCompletionsPath, payload)
+	// emit 一并传进去（v4-4-B 缺口 5）：每次重试发生时发一条 provider.retry 留痕
+	//（见 doWithRetry 内的说明；embeddings 路径没有 emit，传 nil，见 embed.go）。
+	resp, err := p.doWithRetry(ctx, chatCompletionsPath, payload, emit)
 	if err != nil {
 		return fail(emit, err)
 	}
@@ -292,15 +296,44 @@ var providerRetryPolicy = retry.Policy{
 // 尝试）——前一次的可重试失败不会被吞掉；而把 4xx 响应带出循环就永远只有最后那个错误。
 //
 // 返回的 resp 只在**成功**时非 nil（2xx）。
-func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte) (*http.Response, error) {
+//
+// # 重试留痕（v4-4-B 缺口 5，emit 通道）
+//
+// emit 非 nil 时，**每次重试发生时**（第一次失败后、第 n 次尝试发起前，n ≥ 2）发一条
+// core.KindProviderRetry 事件：Attempt = 即将发起的序号、Error = 上次失败的摘要
+// （retryErrorSummary：statusErrorOf 口径——1KB 截断；不含我们设置的 Authorization 头，
+// 但响应体原样截断进摘要——凭据口径的准确表述见 retryErrorSummary 的注释）、Backoff =
+// 实测等待（上次失败 → 本次尝试开始，含 core/retry 的退避/抖动/Retry-After 采信）。
+// **纯观测**：不改变重试节奏与最终结果（重试成功时 Result 与不留痕路径一字不差）。
+// chat 路径把 Run 的 emit 原样传入（loop 收到后转 WAL turn.retry）；embeddings 路径
+// 传 nil（Embedder 没有 emit 通道——embed 重试不进 WAL，挂账见 embed.go）。
+func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte, emit func(core.ProviderEvent)) (*http.Response, error) {
 	var resp *http.Response
+	// attempt / lastErr / lastFailAt 供重试留痕：fn 第 n 次进入时 n ≥ 2 即"上一次失败后
+	// 决定重试"，此刻发 provider.retry（时点 = 第二次尝试前，见上）。
+	attempt := 0
+	var lastErr error
+	var lastFailAt time.Time
 	err := retry.Do(ctx, providerRetryPolicy, func(rctx context.Context) error {
+		attempt++
+		if attempt >= 2 {
+			emitEvent(emit, core.ProviderEvent{
+				Kind: core.KindProviderRetry,
+				Retry: &core.RetryInfo{
+					Attempt: attempt,
+					Error:   retryErrorSummary(lastErr),
+					Backoff: time.Since(lastFailAt),
+				},
+			})
+		}
 		// 每次尝试都造一个**新**请求（新的 body 读取器）：共用一个 *http.Request 跨尝试
 		// 要靠 GetBody 回退，那是标准库给重定向用的内部机制，不适合在这里依赖。
 		// URL 走 endpointURL 拼接（保 base 的 query——见 list.go 的说明）。
 		httpReq, err := http.NewRequestWithContext(rctx, http.MethodPost, endpointURL(p.baseURL, path), bytes.NewReader(payload))
 		if err != nil {
-			return fmt.Errorf("openai: 构造 HTTP 请求失败：%w", err)
+			lastErr = fmt.Errorf("openai: 构造 HTTP 请求失败：%w", err)
+			lastFailAt = time.Now()
+			return lastErr
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		if p.stream {
@@ -316,9 +349,12 @@ func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte)
 		if err != nil {
 			// ctx 取消要能被 errors.Is 认出来：包一层但不吞掉原错误。
 			if ctxErr := rctx.Err(); ctxErr != nil {
-				return fmt.Errorf("openai: 请求中止（%w）", ctxErr)
+				lastErr = fmt.Errorf("openai: 请求中止（%w）", ctxErr)
+			} else {
+				lastErr = fmt.Errorf("openai: 请求失败：%w", err)
 			}
-			return fmt.Errorf("openai: 请求失败：%w", err)
+			lastFailAt = time.Now()
+			return lastErr
 		}
 		if r.StatusCode < 200 || r.StatusCode > 299 {
 			// 非 2xx：读一点 body 进错误文案（排空 + 关闭，让连接能复用），折成
@@ -326,6 +362,8 @@ func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte)
 			// 不可重试的（4xx 等请求侧错误）当场原样返回。
 			se := statusErrorOf(r)
 			drainClose(r.Body)
+			lastErr = se
+			lastFailAt = time.Now()
 			return se
 		}
 		resp = r
@@ -335,6 +373,25 @@ func (p *Provider) doWithRetry(ctx context.Context, path string, payload []byte)
 		return nil, err
 	}
 	return resp, nil
+}
+
+// retryErrorSummary 把一次失败折成**留痕用的错误摘要**（provider.retry 事件的
+// RetryInfo.Error）：statusErrorOf 同款口径——截断到 maxErrorBody（1KB）；*StatusError 的
+// 文案 = 状态行 + 截断后的响应体。
+//
+// **凭据口径（收窄后的准确表述）**：**不含我们设置的 Authorization 头**（凭据是我们自己
+// 加的请求头，从不进错误文案）；但**响应体原样截断进摘要**——端点若在响应体里回显凭据
+// （有些网关会把收到的 Authorization 头原样回在错误 JSON 里），那段会跟着进来（与
+// embed.go 的"凭据与错误文案"一节同口径、与 turn.failed 的 WAL 摘要同口径：既有面，
+// 不是本刀新引入的暴露面）。
+//
+// 为什么截断：错误体可能几十 KB（网关 5xx 页面），留痕是观测不是事实源——够认出
+// 是哪类错即可。nil 错误不该走到这里（只有失败才重试），防御性回退成空串。
+func retryErrorSummary(err error) string {
+	if err == nil {
+		return ""
+	}
+	return truncateString(err.Error(), maxErrorBody)
 }
 
 // retryableStatus 判定 HTTP 状态码是否值得 provider 级小重试（M7 拍板：模型 API

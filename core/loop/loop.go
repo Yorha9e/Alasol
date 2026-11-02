@@ -116,6 +116,24 @@ type Config struct {
 	// context.assembled 事件里 ContextSnapshot.tokens_budget 的占比分母（J21），
 	// v0 不据此做任何装配/压缩决策。
 	ContextBudget int64
+	// TurnBudget 是**逐轮**预算钩子（v4-4-B 缺口 5：把 per-Run 成本闸门接进轮间，
+	// host/budget.go 的挂账兑现）。每轮 provider.Run **之前**调用一次（与 turn.begin
+	// 写点同位置区间；顺序：先查预算 → 过了再写 turn.begin → provider.Run——被拒的那
+	// 一轮什么都没跑：没有 context.assembled、没有 model.turn、没有 turn.begin）。
+	//
+	// 返回 nil = 放行本轮；返回 error = 本轮**不发起**，Run 以"预算截断"收口——照
+	// MaxTurns 截断的口径：**Run 正常返回不报错**（Result.TruncatedByBudget = true +
+	// TruncationReason = 钩子的错误文案；已跑轮次的结果照常收口，Text = 最后一轮文本）。
+	//
+	// **nil = 不查**（默认，零行为变化、零查询）。与 Run 前的 per-Run 检查两层不冲突：
+	// Run 前拒 + 轮间拒（宿主 per-Run 的 checkBudget 保留，fork 路径仍只走那层）。
+	//
+	// **子 agent 也走**（缺口 5 第二件）：子 loop **透传**父的钩子（buildChildLoop）——
+	// 子 agent 的每一轮 provider.Run 之前同样过这道闸门。不传 = 子 agent 的花费不受
+	// 逐轮刹车约束（父的钩子只覆盖父自己的轮次）→ 多 agent 模式下闸门半边失效。
+	// 语义成立的前提：钩子闭包绑的 session id 对父子**是同一个**（父子同 session，
+	// K25 单流多 agent）→ 查的是同一份账。
+	TurnBudget func(ctx context.Context) error
 	// ReasoningEffort 思维链强度档位（G14；空 = **不传**给 provider）。
 	// 原样进每轮 core.ModelRequest.ReasoningEffort，由 provider 透传给端点
 	// （取值如 low/medium/high/xhigh；档位集随网关演进，loop 不校验）。
@@ -170,9 +188,11 @@ type Config struct {
 	// WalSink 是 WAL 预写日志的写面（v4-4-B；core.WalSink）。**nil = 关**（默认，
 	// 零行为变化酸测试）：一个文件都不建、一次追加都不做、行为与配置前逐事件等价。
 	//
-	// 非 nil 时 loop 在五个点写 WAL（都在 X1 三段写路径**之外**，落盘序一字不动）：
+	// 非 nil 时 loop 在六个点写 WAL（都在 X1 三段写路径**之外**，落盘序一字不动）：
 	// turn.begin（provider.Run 前）/ turn.delta（流式片段逐条）/ turn.end（model.turn
-	// 落盘后）/ turn.failed（provider 返错时）/ blob.plan（tool.call.intent **发布前**）。
+	// 落盘后）/ turn.failed（provider 返错时）/ turn.retry（provider 内部重试发生时，
+	// 缺口 5 第二件——经 emitFunc 收 provider.retry 转写，provider 侧不穿 WAL 句柄）/
+	// blob.plan（tool.call.intent **发布前**）。
 	// **WAL 不是事实源**（F5 不受影响）：事件流仍是唯一事实源，WAL 是可丢弃/可截断/可 GC
 	// 的崩溃恢复补充面，恢复报告是观察面不是写回面（见 core/loop/wal.go 与 core/wal.go 的
 	// 定位说明）。
@@ -239,12 +259,16 @@ type Loop struct {
 	blob          storage.Blob
 	blobMaxInline int64
 	// wal 支撑 WAL 预写日志（v4-4-B；nil = 关 = 零行为变化）。见 Config.WalSink 与
-	// wal.go 的五个写点。walWriter 只多一个 atomic 告警去重标记，不破坏"Loop 无可变状态
+	// wal.go 的六个写点。walWriter 只多一个 atomic 告警去重标记，不破坏"Loop 无可变状态
 	// → 可并发 Run"这条不变式（每轮历史/污点/spawn 缓存仍是 Run 的局部变量）。
 	wal *walWriter
 	// tel 支撑 telemetry 观测管道（L2/D19；nil = 关 = 零行为变化）。见 Config.TelemetrySink
 	// 与 telemetry.go 的三个发点。telWriter 只多一个 atomic 告警去重标记，同 walWriter 纪律。
 	tel *telWriter
+	// turnBudget 是逐轮预算钩子（v4-4-B 缺口 5；nil = 不查 = 零行为变化）。见
+	// Config.TurnBudget 与 RunWithHistory 轮次循环里的调用点。它是**无状态闭包**
+	//（宿主侧绑定 session id），并发 Run 只读共享，不破坏 Loop 的并发不变式。
+	turnBudget func(ctx context.Context) error
 }
 
 // Result 是一次 Run 的产出。
@@ -280,6 +304,21 @@ type Result struct {
 	//
 	// **additive 字段**（不改既有字段语义、不动 X1 三段写路径）：不设它 = false。
 	TruncatedByMaxTurns bool
+	// TruncatedByBudget 本次 Run 是否**被逐轮预算截断**（v4-4-B 缺口 5：某轮
+	// provider.Run 前的 TurnBudget 钩子拒绝发起本轮）。
+	//
+	// 口径与 TruncatedByMaxTurns 同款：true = Run **正常返回不报错**（护栏生效，已跑
+	// 轮次的结果照常收口，Text = 最后一轮的文本；被拒的那一轮**什么都没跑**——没有
+	// context.assembled、没有 model.turn、没有 turn.begin）；false = 没撞到预算
+	// （含 TurnBudget 未配置 = 默认）。
+	//
+	// **additive 字段**（不改既有字段语义、不动 X1 三段写路径）：不设它 = false。
+	TruncatedByBudget bool
+	// TruncationReason 是截断原因文本：TruncatedByBudget = true 时为 TurnBudget 钩子
+	// 返回的错误文案（宿主侧 = 预算闸门的超限说明，如"累计 X ≥ 上限 Y"），供调用方
+	// 直接展示；否则为空。MaxTurns 截断**不写**它（那条截断的原因是结构性的，见
+	// TruncatedByMaxTurns）。
+	TruncationReason string
 }
 
 // New 构造 Loop 并校验必填项。
@@ -352,6 +391,7 @@ func New(cfg Config) (*Loop, error) {
 		blobMaxInline:   cfg.BlobMaxInline,
 		wal:             newWalWriter(cfg.WalSink),
 		tel:             newTelWriter(cfg.TelemetrySink),
+		turnBudget:      cfg.TurnBudget,
 	}, nil
 }
 
@@ -496,6 +536,21 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 			res.Turns = turn - 1
 			res.Text = lastText
 			return res, err
+		}
+		// 逐轮预算制动（v4-4-B 缺口 5）：每轮 provider.Run **之前**查一次（与 turn.begin
+		// 写点同位置区间；顺序：先查预算 → 过了再写 turn.begin → provider.Run）。nil 钩子
+		// = 不查（默认，零行为变化）。超限 → 本轮**不发起**，照 MaxTurns 截断的口径收口：
+		// Run 正常返回（不是 error），TruncatedByBudget 显式标记 + TruncationReason 带上
+		// 钩子文案；已跑轮次的结果照常收口。事件流不为被拒的轮次新增任何事件（没有
+		// context.assembled / model.turn / turn.begin——这轮什么都没跑）。
+		if l.turnBudget != nil {
+			if berr := l.turnBudget(ctx); berr != nil {
+				res.Turns = turn - 1 // Turns = 实际发生的模型调用轮数（被拒的这轮不算）
+				res.Text = lastText
+				res.TruncatedByBudget = true
+				res.TruncationReason = berr.Error()
+				return res, nil
+			}
 		}
 		res.Turns = turn
 
@@ -915,6 +970,12 @@ func (l *Loop) emitFunc(ctx context.Context, turn int, runID contracts.Ulid) fun
 			// 预写口径：WAL 先、流事件后（WAL 是"正式写之前"的中间态）。
 			l.walTurnDelta(turn, ev)
 			l.publishModelDelta(ctx, turn, runID, ev)
+		case core.KindProviderRetry:
+			// 缺口 5 第二件：provider 重试留痕 → WAL turn.retry（写点在三段写路径
+			// **之外**——重试发生在 provider.Run 内部，本来就不在 intent→completed/
+			// failed 窗口里）。纯观测：不进事件流、不占 Result.Events、不改控制流；
+			// WAL 关（sink nil）→ walAppend 直接返回，零行为变化。
+			l.walTurnRetry(turn, ev.Retry)
 		}
 		// 其它 kind（toolcall.start/delta、done、error）：v0 不转发。工具调用的
 		// 事实已由 X1 三段写路径完整记录（intent/completed/failed），流式副本是冗余。

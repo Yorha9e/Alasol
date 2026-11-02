@@ -7,7 +7,7 @@ import (
 	"github.com/Yorha9e/alasol/core"
 )
 
-// 本文件是 WAL 预写日志（v4-4-B）在 loop 侧的挂接：五个写点 + 尽力而为包装。
+// 本文件是 WAL 预写日志（v4-4-B）在 loop 侧的挂接：六个写点 + 尽力而为包装。
 //
 // # 定位：WAL 不是事实源（F5 不受影响）
 //
@@ -21,12 +21,14 @@ import (
 //
 // # 不影响 X1（intent→completed/failed 的落盘序一字不动）
 //
-// 五个写点全部落在三段写路径**之外**：
+// 六个写点全部落在三段写路径**之外**：
 //
 //	turn.begin  → provider.Run **之前**（模型调用还不是事实）
 //	turn.delta  → emitFunc 里，与 model.delta 流事件同一个出口（durable=false，不入库）
 //	turn.end    → model.turn **durable 落盘之后**（见下面的顺序说明）
 //	turn.failed → provider.Run **返错**时（普通失败收口；不是崩溃）
+//	turn.retry  → emitFunc 收到 provider.retry 时（provider 内部重试发生时；重试在
+//	              provider.Run **内部**，本来就不在 intent→completed/failed 窗口里）
 //	blob.plan   → tool.call.intent **发布之前**（X1：先有计划再有窗口）
 //
 // 没有任何一个写点插进 intent→(completed|failed) 之间，也没有改变它们的落盘序。
@@ -63,7 +65,7 @@ type walWriter struct {
 
 // walAppend 追加一条 WAL 记录（nil = 关 = 零行为变化；失败 = 一次 Warn，不返回错误）。
 //
-// 不返回 error 是**有意的**：调用方（turn.begin/delta/end/failed/blob.plan 五个写点）没有
+// 不返回 error 是**有意的**：调用方（turn.begin/delta/end/failed/retry/blob.plan 六个写点）没有
 // "WAL 写失败该怎么办"的分支——它们一律继续主流程。把 error 返上去只会诱导调用方写
 // 出 `if err := l.walAppend(...); err != nil { ... }` 这种无处可去的错误处理。
 func (l *Loop) walAppend(kind string, payload any) {
@@ -168,6 +170,28 @@ func (l *Loop) walTurnFailed(turn int, err error) {
 	l.walAppend(core.KindWalTurnFailed, core.WalTurnFailedPayload{
 		Turn:  turn,
 		Error: walErrorSummary(err),
+	})
+}
+
+// walTurnRetry 记一条 provider 内部**重试**（turn.retry；缺口 5 第二件）。
+//
+// 写点：emitFunc 收到 core.KindProviderRetry 事件时（第 n 次尝试发起前，n ≥ 2）——
+// 重试发生在 provider.Run **内部**，本来就不在 intent→completed/failed 窗口里，故本写点
+// 天然在三段路径之外（X1 一字不动）。provider 侧只发 emit、**不穿 WAL 句柄**（挂账兑现
+// 的口径：跨层只走事件，不穿依赖）。
+//
+// **纯观测**：对账（Reconcile）不读它、不参与任何判定；它只是崩溃现场的一部分——
+// "有 begin 无 end"的段里若跟了 retry，说明当时正在退避重试。Retry 为 nil（别的 kind
+// 误入 / provider 没带载荷）时不写空记录（与 walTurnFailed 的 nil 防御同口径）。
+func (l *Loop) walTurnRetry(turn int, r *core.RetryInfo) {
+	if r == nil {
+		return // 没有载荷就没有留痕（不写空记录）
+	}
+	l.walAppend(core.KindWalTurnRetry, core.WalTurnRetryPayload{
+		Turn:      turn,
+		Attempt:   r.Attempt,
+		Error:     r.Error,
+		BackoffMS: r.Backoff.Milliseconds(),
 	})
 }
 

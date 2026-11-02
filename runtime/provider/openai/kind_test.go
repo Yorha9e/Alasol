@@ -26,6 +26,7 @@ func TestKindConstantsComeFromCore(t *testing.T) {
 		{"KindToolCallDelta", KindToolCallDelta, core.KindToolCallDelta},
 		{"KindDone", KindDone, core.KindDone},
 		{"KindError", KindError, core.KindError},
+		{"KindProviderRetry", KindProviderRetry, core.KindProviderRetry},
 	}
 	for _, tc := range cases {
 		if tc.got != tc.want {

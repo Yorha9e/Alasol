@@ -369,16 +369,21 @@ type Config struct {
 	// loop.Config.WalSink 恒 nil → 一个字节都不多写，行为与配置前**逐事件等价**（酸测试）。
 	//
 	// **WAL 不是事实源**（F5 不受影响）：事件流（core.Store）仍是唯一事实源，WAL 记录
-	// "正式写之前"的中间态（turn.begin / turn.delta / turn.end / turn.failed / blob.plan），崩溃后至少
+	// "正式写之前"的中间态（turn.begin / turn.delta / turn.end / turn.failed /
+	// turn.retry / blob.plan），崩溃后至少
 	// 知道"当时在干什么、吐过什么"。它**可丢弃 / 可截断 / 可 GC**（删掉整个目录不丢任何
 	// 事实），恢复报告是**观察面不是写回面**（delta 可供展示，绝不自动补进事件流）。
 	//
 	// 写失败**不阻断主流程**（尽力而为，一条 Warn 留痕）；fsync 策略 = 逐条不 fsync、
 	// 轮次边界 fsync（见 runtime/store/walfile 包 doc 的取舍说明）。
 	//
-	// **GC / 截断策略挂账**（未做）：什么时候算"这个 session 的 WAL 没用了"是产品决策，
-	// 需与孤儿 blob 清理一起定（两者共用同一批对账键）；walfile 只提供 Truncate/Remove
-	// 两个原语。挂账见 11 施工计划 v4-4 行。
+	// **GC 已落地**（缺口 5 第一件）：`walfile.GC` + `alasol wal-gc`——判据三条件全过才删
+	//（mtime 超**显式** Retention + reconcile **两个"没走完"信号全空**（在飞轮次 /
+	// 孤儿候选；**作废计划不算脏**——它 = "走完了但没外置"，不是崩溃上下文）+ 合法
+	// `<session>.wal` 形态），删除 = Remove 整文件。"何时没用了"由调用方的 Retention 拿捏
+	//（龄期必给、<=0 拒，不猜默认）；判据与孤儿 blob 清理共用同一批对账键。
+	// **活 session 的 WAL 被删 = 观察面重置**（Writer 写路径自愈：文件没了就重建新文件）。
+	// 见 walfile 包 doc 的 GC 一节。
 	WalDir string
 
 	// ---- v4-4-B W15 成本预算（可选闸门；**默认不设上限**）----
@@ -390,10 +395,12 @@ type Config struct {
 	//（fail-close：不再烧 token）；跑完再告警一次（越界时留痕）。负值 = 非法配置
 	//（启动即拒：负上限没有合理语义，静默当成 0 = 悄悄关掉用户以为开着的闸门）。
 	//
-	// **诚实边界（别读成别的）**：这是 **per-Run（= 一个 prompt 的全部 turn）粒度**的
-	// 检查点，**不是** turn 内的逐轮刹车——一轮跑到一半越界时，本轮会跑完（下一轮才被拒）。
-	// 逐轮刹车要把成本面接进 loop（loop.Config 加预算 + 每轮读累计），那是另一笔
-	//（挂账见 11 施工计划）。数据源是索引器的 cost_tokens 派生表（J21：usage 只进成本，
+	// **两层检查**（缺口 5 第二件兑现）：上面那条是 per-Run 层（RunPrompt 入口 /
+	// fork）；另有**轮间层**——hub 把 checkBudget 接进 loop.Config.TurnBudget，Run 内
+	// 每轮 provider.Run 之前再查一次：中途越界的 Run 在下一轮被截断（Result.
+	// TruncatedByBudget，Run 正常返回不报错）。钩子在 loop 装配期定格（与 Model/
+	// MaxTurns 同款：装配后改本值要重建 loop / 重启才生效）。<=0 时钩子为 nil =
+	// 零查询。数据源是索引器的 cost_tokens 派生表（J21：usage 只进成本，
 	// 绝不回填 context 快照/预算）。
 	BudgetMaxTokens int64
 }

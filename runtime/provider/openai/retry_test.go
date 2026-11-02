@@ -76,8 +76,10 @@ func TestRunRetries429ThenSucceeds(t *testing.T) {
 		t.Errorf("Text = %q", res.Text)
 	}
 	// 重试期间**不发** error 事件：UI 不该看到"抖了一下又好了"的红色闪烁。
-	if k := kinds(*evs); len(k) != 2 || k[0] != KindTextDelta || k[1] != KindDone {
-		t.Errorf("事件序列 = %v，期望 [text.delta done]（中途无 error）", k)
+	// 缺口 5 第二件：重试发生时多一条 provider.retry 留痕（在 text.delta **之前**——
+	// 重试发生在拿到响应体之前；纯观测，done/结果不受影响）。
+	if k := kinds(*evs); len(k) != 3 || k[0] != KindProviderRetry || k[1] != KindTextDelta || k[2] != KindDone {
+		t.Errorf("事件序列 = %v，期望 [provider.retry text.delta done]（中途无 error）", k)
 	}
 }
 
@@ -133,8 +135,10 @@ func TestRunRetries500ThenSucceedsStream(t *testing.T) {
 	if res.Text != "流" {
 		t.Errorf("Text = %q", res.Text)
 	}
-	if k := kinds(*evs); len(k) != 2 || k[0] != KindTextDelta || k[1] != KindDone {
-		t.Errorf("事件序列 = %v，期望 [text.delta done]（不双发 delta）", k)
+	// provider.retry 在 delta **之前**（重试发生在拿到响应体之前）；delta 仍只发一次
+	//（不双发）——留痕是纯观测，不改变流式序列的其余形状。
+	if k := kinds(*evs); len(k) != 3 || k[0] != KindProviderRetry || k[1] != KindTextDelta || k[2] != KindDone {
+		t.Errorf("事件序列 = %v，期望 [provider.retry text.delta done]（不双发 delta）", k)
 	}
 }
 
@@ -199,9 +203,11 @@ func TestRunRetries5xxUntilExhausted(t *testing.T) {
 	if elapsed > 5*time.Second {
 		t.Errorf("重试总耗时 %v，远超退避量级（指数退避失控？）", elapsed)
 	}
-	// 只有最终失败发一条 error 事件。
-	if k := kinds(*evs); len(k) != 1 || k[0] != KindError {
-		t.Errorf("事件 = %v，期望单条 error", k)
+	// 重试留痕（缺口 5 第二件）：两次重试各一条 provider.retry（attempt=2/3），最终失败
+	// 一条 error——error 仍只有最终那条（重试期间不发 error，UI 不闪烁）。
+	if k := kinds(*evs); len(k) != 3 ||
+		k[0] != KindProviderRetry || k[1] != KindProviderRetry || k[2] != KindError {
+		t.Errorf("事件 = %v，期望 [provider.retry provider.retry error]", k)
 	}
 }
 

@@ -621,8 +621,23 @@ func TestRunHTTPStatusErrors(t *testing.T) {
 			if c.body != "" && !strings.Contains(se.Error(), "bad request") && c.status == 400 {
 				t.Errorf("错误文案未带 body：%v", se)
 			}
-			if k := kinds(*evs); len(k) != 1 || k[0] != KindError {
-				t.Errorf("事件 = %v，期望单条 error", k)
+			// 重试留痕（缺口 5 第二件）：429/5xx 会重试到耗尽 → 每次重试一条
+			// provider.retry，最终一条 error；4xx 不重试 → 单条 error。
+			wantRetries := 0
+			if retryableStatus(c.status) {
+				wantRetries = providerMaxAttempts - 1
+			}
+			k := kinds(*evs)
+			if len(k) != wantRetries+1 {
+				t.Fatalf("事件 = %v，期望 %d 条 provider.retry + 1 条 error", k, wantRetries)
+			}
+			for i := 0; i < wantRetries; i++ {
+				if k[i] != KindProviderRetry {
+					t.Errorf("事件[%d] = %v，期望 provider.retry", i, k[i])
+				}
+			}
+			if k[len(k)-1] != KindError {
+				t.Errorf("事件 = %v，期望以 error 收尾", k)
 			}
 		})
 	}
