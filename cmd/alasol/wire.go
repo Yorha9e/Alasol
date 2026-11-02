@@ -80,6 +80,17 @@ type runnerOpts struct {
 	// **WAL 不是事实源**（F5 不受影响）：可丢弃/可截断/可 GC，恢复报告是观察面不是写回面。
 	WalDir string
 
+	// MultiAgent 是否装配 agent 树 + loop.Agents（缺口 8；TOML `[multi_agent]`，只走文件面，
+	// 与 serve 同口径）。**默认 false = 单 agent 模式零行为变化**：不建树、不传 Agents、
+	// 不建类型注册表、也不校验 agent_types（关 = 不建不校验，与 host.New 同口径）。
+	//
+	// run/resume 是独立进程**直连 loop**（无 hub）：MultiAgent 面 = 树 + Agents 接线两件，
+	// 没有 serve 的在线表注入 / fork 集合 / 发现表 Claim 等 hub 面（见 runnerAgentsEnv 注释）。
+	MultiAgent bool
+	// AgentTypes 是 TOML `[[agent_types]]` 折出的自定义类型（FileConfig.AgentTypeConfigs）。
+	// 仅 MultiAgent 开时装载校验；关时原样携带但不消费（= 不校验，零行为变化）。
+	AgentTypes []contracts.AgentType
+
 	// provider 覆盖（测试注入脚本 provider；nil = openai）
 	provider core.Provider
 	// approver 覆盖（测试注入；nil = 按 Approval 选）
@@ -128,6 +139,11 @@ func newRunner(opts runnerOpts) (*runner, error) {
 			Source: contracts.RuleSourceCli,
 		})
 	}
+	// 多 agent 策略规则（缺口 8）：MultiAgent 开时自动补 spawn/complete 的 allow 规则
+	//（与 host.New 同口径，见 multiagent.go 的 runnerMultiAgentPolicyRules）。为什么必须补：
+	// spawn/complete 是框架内部工具，用户 -allow 列表里通常没有 → 策略 deny → toolVisible
+	// 挡掉 → 模型根本派不出子 agent。关（默认）→ 不补 = 单 agent 模式零行为变化。
+	rules = append(rules, runnerMultiAgentPolicyRules(opts.MultiAgent)...)
 	eng := policy.New(rules...)
 
 	reg := registry.New(registry.NewPolicyAdjudicator(eng))
@@ -219,6 +235,33 @@ func newRunner(opts runnerOpts) (*runner, error) {
 	// run 的 session/agent id：装配时新造（CLI 单次回路，不续跑）。先取出来是因为
 	// WAL 的 per-session 文件要用它（下面 cfg 字面量里引用）。
 	sessionID, agentID := core.NewUlid(), core.NewUlid()
+
+	// 多 agent 环境（缺口 8）：MultiAgent 开 → 类型注册表 + agent 树（root = 本 run 的
+	// 主 agent id，WithRootID 保证 树 root ≡ cfg.AgentID 同源）+ loop.Agents；关（默认）
+	// → nil = 单 agent 模式零行为变化（不建树、不传 Agents、不校验 agent_types）。
+	//
+	// run 是独立进程直连 loop（无 hub）：与 serve 的差别 = 没有在线表注入、没有 fork 集合、
+	// 没有发现表 Claim、没有 loop/树缓存（树本进程一次性，退出即散）。树必须在工具注册
+	// **全部完成之后**建（此处 reg 已含 MCP 工具）：root 类型的 Tools 白名单要列当前注册表
+	// 全部工具，否则 MultiAgent 开会把 MCP 工具按 R5 类型过滤挡掉。
+	//
+	// ChildStrategy 挂账（见 runnerAgentsEnv 注释）：run/resume 的子 agent 策略钩子未接，
+	// 子 agent 用默认上下文策略。
+	agentsEnv, aerr := runnerAgentsEnv(opts.MultiAgent, opts.Model, opts.AgentTypes, agentID, reg)
+	if aerr != nil {
+		st.Close()
+		if sbEnv != nil {
+			_ = sbEnv.Close()
+		}
+		if mcpMgr != nil {
+			_ = mcpMgr.Close()
+		}
+		if walStore != nil {
+			_ = walStore.Close()
+		}
+		return nil, aerr
+	}
+
 	cfg := loop.Config{
 		Provider:        prov,
 		Bus:             b,
@@ -240,6 +283,9 @@ func newRunner(opts runnerOpts) (*runner, error) {
 		BlobMaxInline: opts.BlobMaxInline,
 		// WAL 预写日志（v4-4-B）——nil = 关 = 零行为变化（一个文件都不建）。
 		WalSink: runnerWalSink(walStore, sessionID),
+		// 多 agent 环境（缺口 8）——nil = 单 agent 模式（默认，零行为变化）。
+		// 非 nil = 树 + spawn/complete 接线（形态对照 host/hub.go loopFor 的 Agents 段）。
+		Agents: agentsEnv,
 	}
 	lp, err := loop.New(cfg)
 	if err != nil {
@@ -312,8 +358,9 @@ func registerBuiltinTools(reg *registry.Registry, opts runnerOpts) (*sandbox.Env
 		env = e
 		fsImpl, execImpl = e, e
 	case opts.Remote:
-		// RemoteExecutionEnv（v4-2-A）：只有 Exec 经 SSH 落地；Fs/Proc/Net 显式
-		// ErrUnsupported（预留位）——read/write 接到 remote env 会诚实报"未支持"。
+		// RemoteExecutionEnv（v4-2-A）：**Exec + Fs** 经 SSH 落地（Fs 是最小可用档：
+		// cat/stat/ls）；Proc/Net 显式 ErrUnsupported（预留位）——read/write 接到
+		// remote env 会经 ssh 通道读写**远端**文件。
 		renv, err := remote.New(remote.Config{Host: opts.RemoteHost})
 		if err != nil {
 			return nil, fmt.Errorf("装配 RemoteExecutionEnv: %w", err)

@@ -42,7 +42,7 @@ func runMain(args []string) int {
 			"开了能堵上 C:\\ProgramData 这类只授予 Users 写权限的目录；"+
 			"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去")
 	remoteEnabled := fs.Bool("remote", false,
-		"启用 RemoteExecutionEnv（v4-2-A，K8 第三档；默认关=走 local）。bash/exec 经系统 ssh 到 -remote-host 执行；read/write/proc/net 预留未支持。与 -sandbox 互斥；鉴权交系统 ssh")
+		"启用 RemoteExecutionEnv（v4-2-A，K8 第三档；默认关=走 local）。bash/exec 经系统 ssh 到 -remote-host 执行；read/write 经 ssh 落地（Fs）；proc/net 预留未支持。与 -sandbox 互斥；鉴权交系统 ssh")
 	remoteHost := fs.String("remote-host", "",
 		"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填")
 	_ = fs.Parse(args)
@@ -127,6 +127,14 @@ func runMain(args []string) int {
 		// WAL 预写日志（v4-4-B）：只走文件配置面（TOML `[wal]`）。dir 空 = 关 = 一个文件
 		// 都不建 = 零行为变化（酸测试）。崩溃恢复报告用 `alasol wal -session <id>` 看。
 		WalDir: strings.TrimSpace(fc.Wal.Dir),
+
+		// 多 agent 装配（缺口 8）：只走文件配置面（TOML `[multi_agent]` + `[[agent_types]]`，
+		// 与 blob/wal 同款不给 flag）。默认 false = 单 agent 模式零行为变化（不建树、
+		// 不传 Agents、不校验 agent_types）。AgentTypes 经 FileConfig 折成
+		// []contracts.AgentType（host/config_file.go 的 AgentTypeConfigs，只搬运不校验——
+		// 校验在 runnerAgentsEnv 的注册表装配期 fail-close）。
+		MultiAgent: fc.MultiAgent,
+		AgentTypes: fc.AgentTypeConfigs(),
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "装配失败:", err)

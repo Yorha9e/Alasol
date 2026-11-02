@@ -228,6 +228,43 @@ func resumeMain(args []string) int {
 		defer func() { _ = walStore.Close() }()
 	}
 
+	// 多 agent 环境（缺口 8）：**只在 -continue（续跑）这条路径上**装配。
+	//
+	// 装配内容：MultiAgent 开 → 类型注册表 + agent 树（root = 该 session 的真实主 agent，
+	// durable.PrimaryAgentID 口径，与续跑的 loop.AgentID 同源）+ loop.Agents；关（默认）
+	// → nil = 单 agent 模式零行为变化（不建树、不传 Agents、不校验 agent_types）。
+	//
+	// 为什么**挪进 -continue 分支**（T5-3）：**纯恢复**（不带 -continue）压根不建 agent
+	// 树、不派生子 agent——它只回放工具调用 + 落结果事件（这里的 loop 是 durable.Replayer，
+	// 不是 agent 回路）。此时校验 agent_types = **用不到的能力拒绝启动**：同一份 TOML 在
+	// serve 能跑（host 装配）、在纯恢复里却起不来（装载期 fail-close）——这与"MultiAgent
+	// 关 = 不建不校验"是同一条纪律（不许用一个用不到的能力拒绝启动）。
+	//
+	// **两前端口径分叉**（如实记）：`-continue` 续跑 = run/resume 自己的装配面（直连
+	// loop，无 hub 面：没有在线表注入 / fork 集合 / 发现表 Claim / loop·树缓存）；serve =
+	// host 装配面（hub）。同一份 TOML 在两边的**能力面不同**：serve 有 hub 的
+	// ChildStrategy 钩子（tiered 子策略可用），run/resume **没接**（见 runnerAgentsEnv
+	// 的"ChildStrategy 挂账"与本文件里的点名 Warn）。
+	//
+	// ChildStrategy 挂账（见 runnerAgentsEnv 注释）：run/resume 的子 agent 策略钩子未接，
+	// 子 agent 用默认上下文策略。
+	var agentsEnv *loop.Agents
+	if strings.TrimSpace(*continuePrompt) != "" {
+		env, aerr := runnerAgentsEnv(fc.MultiAgent, modelName, fc.AgentTypeConfigs(), agentID, reg)
+		if aerr != nil {
+			fmt.Fprintln(os.Stderr, "装配多 agent 环境:", aerr)
+			return 1
+		}
+		agentsEnv = env
+	}
+
+	// 多 agent 策略规则（缺口 8）：MultiAgent 开时补 spawn/complete 的 allow（与 host.New
+	// 同口径，见 multiagent.go 的 runnerMultiAgentPolicyRules）。resume 的策略引擎默认
+	// 空（重放不重跑策略链 M9——此引擎不被 Replay 用到，只约束 -continue 续跑路径的工具
+	// 可见性/执行判定）：关（默认）→ policy.New() 逐字不变 = 零行为变化；开 → 补两条
+	// allow，否则 spawn 被 fail-close deny 挡掉、续跑路径派不出子 agent（接线即死）。
+	policyRules := runnerMultiAgentPolicyRules(fc.MultiAgent)
+
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	//
 	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
@@ -235,7 +272,7 @@ func resumeMain(args []string) int {
 		Provider:        prov,
 		Bus:             bus.New(st),
 		Registry:        reg,
-		Policy:          policy.New(), // 重放不重跑策略链（M9：T0 已授权）；此引擎不被 Replay 用到
+		Policy:          policy.New(policyRules...), // 重放不重跑策略链（M9：T0 已授权）；此引擎不被 Replay 用到
 		SessionID:       sid,
 		AgentID:         agentID, // 真实主 agent（续跑事件的归属）
 		Model:           modelName,
@@ -248,6 +285,9 @@ func resumeMain(args []string) int {
 		// WAL 预写日志（v4-4-B）——nil = 关 = 零行为变化。续跑那一轮的 loop 与 run/serve
 		// 同口径记 WAL（turn.begin/delta/end/failed + blob.plan）。
 		WalSink: runnerWalSink(walStore, sid),
+		// 多 agent 环境（缺口 8）——nil = 单 agent 模式（默认，零行为变化）。
+		// 非 nil = 树 + spawn/complete 接线（形态对照 host/hub.go loopFor 的 Agents 段）。
+		Agents: agentsEnv,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "构造 resume loop:", err)
