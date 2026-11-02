@@ -359,10 +359,11 @@ func New(cfg Config) (*Hub, error) {
 		hubLog.Info("host: 已启用 SandboxedExecutionEnv",
 			"backend", env.BackendName(), "allowed_roots", env.AllowedRoots())
 	case cfg.Remote:
-		// RemoteExecutionEnv（v4-2-A，K8 第三档）：只有 Exec 经 SSH 落地；Fs/Proc/Net
-		// 显式 ErrUnsupported（预留位）——所以 read/write 也接到 remote env，会诚实报
-		// "未支持"（换 env 不动工具代码；要挂后续在 remote 包里实现即可）。鉴权交系统
-		// ssh，此处不传任何凭据（H18）。
+		// RemoteExecutionEnv（v4-2-A，K8 第三档）：**Exec + Fs** 经 SSH 落地（Fs 是
+		// 最小可用档：cat/stat/ls）；Proc/Net 显式 ErrUnsupported（预留位）——所以
+		// read/write 也接到 remote env，会经 ssh 通道读写**远端**文件（换 env 不动工具
+		// 代码；要挂 Proc/Net 在 remote 包里实现即可）。鉴权交系统 ssh，此处不传任何
+		// 凭据（H18）。
 		env, serr := remote.New(remote.Config{Host: cfg.RemoteHost})
 		if serr != nil {
 			_ = st.Close()
@@ -370,7 +371,7 @@ func New(cfg Config) (*Hub, error) {
 		}
 		fsCap, execCap = env, env
 		hubLog.Info("host: 已启用 RemoteExecutionEnv（SSH）",
-			"host", env.Host(), "note", "仅 Exec 经 SSH；Fs/Proc/Net 预留 ErrUnsupported")
+			"host", env.Host(), "note", "Exec+Fs 经 SSH；Proc/Net 预留 ErrUnsupported")
 	}
 	execs := map[string]core.ToolExecutor{
 		"read":  tools.NewRead(fsCap),

@@ -169,12 +169,12 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 				"代价是用 overlapped I/O 写文件的程序（Go/.NET/Rust/Node）会写不进去"),
 
 		// 远端 SSH（v4-2-A，K8 第三档）：执行面经**系统 ssh** 到远端机器。默认关（走 local）。
-		// 与 -sandbox 互斥（host.Config.validate 拒双开）。诚实边界：只有 bash/exec 经 SSH；
-		// read/write/proc/net 预留未支持（remote env 显式 ErrUnsupported）。鉴权交系统 ssh
-		//（密钥/agent/config），不在此收任何凭据（H18）。
+		// 与 -sandbox 互斥（host.Config.validate 拒双开）。诚实边界：bash/exec 与 read/write
+		//（Fs 最小可用档：cat/stat/ls）经 SSH；proc/net 预留未支持（remote env 显式
+		// ErrUnsupported）。鉴权交系统 ssh（密钥/agent/config），不在此收任何凭据（H18）。
 		remote: fs.Bool("remote", false,
 			"启用 RemoteExecutionEnv（v4-2-A，K8 第三档；默认关=走 local）。"+
-				"bash/exec 经系统 ssh 到 -remote-host 指定的远端执行；read/write/proc/net 预留未支持。"+
+				"bash/exec 与 read/write 经系统 ssh 到 -remote-host 指定的远端执行；proc/net 预留未支持。"+
 				"与 -sandbox 互斥；鉴权交系统 ssh（不收凭据）"),
 		remoteHost: fs.String("remote-host", "",
 			"ssh 目标（user@host 或 ~/.ssh/config 别名）。-remote 启用时必填"),

@@ -162,12 +162,41 @@
 // （user@host 或 ~/.ssh/config 别名）与可选的额外 ssh 选项（如 -p 端口）。我们只做 SSH
 // 适配层、**不做自研鉴权**（N5 的 token scope/降权视图体系不做）。
 //
-// # 预留位：Fs / Proc / Net 显式 ErrUnsupported
+// # 能力面落地状态：Exec + Fs 经 SSH；Proc / Net 仍预留
 //
-// v4-2-A 只落地 **Exec 经 SSH**。其余三个能力面（FSCapability / ProcCapability /
-// NetCapability）返回**显式 ErrUnsupported**——这是诚实的"预留位"，留后续：
+// **Exec**（v4-2-A）与 **Fs**（最小可用档）经 ssh exec 通道落地——Fs **零新依赖**
+// （不引 sftp 库，复用同一条系统 ssh 执行缝，见 fs.go）：
 //
-//   - 不假装支持（返回空成功比报错更危险——调用方会以为远端文件被读到了）；
-//   - 也不静默直通本地（远端 ssh 会话里"本地 http"语义混乱，且违背"换 env 不动逻辑"的
-//     可预期性）。要挂时在各自方法里去掉 ErrUnsupported、经 ssh 实现即可。
+//   - ReadFile → `ssh host env -i 'PATH=…' 'cat' '--' 'path'`（stdout 原样字节返回，二进制安全）；
+//   - WriteFile → `ssh host env -i 'PATH=…' 'cat' > 'path'`（内容走 **ssh stdin 管道**，不进 argv）；
+//   - Stat → `ssh host env -i 'PATH=…' 'stat' '-c' '%s|%Y|%F' '--' 'path'`（**GNU stat 口径**）；
+//   - ListDir → `ssh host env -i 'PATH=…' 'ls' '-1A' '--' 'path'`（逐行拆名字）。
+//
+// **Fs 的四条命令也走 `env -i`**（与 Run 同款**整份替换** + **远端侧 PATH**）：远端
+// shell 继承来的环境（远端机器上的凭据等）在 Fs 命令里**不可见**；且
+// **Config.DefaultRemotePATH 对 Fs 同样生效**（见 fs.go 的 fsRemoteCmd）。
+//
+// 路径一律经 shQuote 单引号安全引用（内嵌单引号转成 `'\”`）——与 Run 同款，
+// 注入面封死（env_test.go 有路径含空格/单引号/分号/`$(...)` 的钉子）。
+//
+// **Fs 的诚实边界（最小可用档）**：
+//
+//   - **GNU stat 口径**：只认 `stat -c` 的 `大小|mtime秒|类型` 形状；非 GNU
+//     （BSD/macOS 的 `stat -f`）明确报"远端 stat 非 GNU 口径"，不瞎解析；
+//   - **stat 不跟随符号链接**（GNU stat 无 -L）：报的是**链接本身**的大小/mtime/类型，
+//     **不是目标**——**行为不改**（加 -L 会把语义换成"报目标"）；
+//   - **文件名含换行会被 ListDir 错拆**（`ls -1A` 一行一个名字的拆法天然如此）；
+//   - **ListDir 的排序依远端 ls 的 locale**（`ls -1A` 按 locale 排序——**顺序不是
+//     契约**，可能与本地 os.ReadDir 的字节序不同）；
+//   - ReadFile 受单次执行 32MB 捕获上限（**超出静默截断到 32MB、不报错**，与 Exec 同口径）；
+//   - WriteFile 是 `cat >` 直接截断写，**非原子**（同 local/sandbox 的已知边界）；
+//   - **路径里嵌着的秘密拦不住**：凭据扫描只认**整值**命中——路径里嵌着秘密
+//     （`/data/sk-abc123.txt`）仍会进 ssh argv **且**被错误文案回显：**别把秘密放进路径**；
+//   - `~` 不展开（单引号引用），远端路径请用绝对路径（同 Exec）。
+//
+// **Proc / Net 仍显式 ErrUnsupported**（预留位，v4-2-A 起口径不变）：
+//
+//   - 不假装支持（返回空成功比报错更危险——调用方会以为能力真的发生了）；
+//   - 也不静默直通本地（远端 ssh 会话里"本地出站网络/本地进程"语义混乱，且违背
+//     "换 env 不动逻辑"的可预期性）。要挂时在各自方法里去掉 ErrUnsupported、经 ssh 实现即可。
 package remote

@@ -488,6 +488,44 @@ func TestLoopbackDifferentPortRejected(t *testing.T) {
 		t.Fatalf("状态码 = %v，want 403", resp)
 	}
 }
+
+// TestLoopbackCrossAddressRejected（堵洞收紧）：Origin=[::1]:port 打到绑在 127.0.0.1
+// 的 hub → 403 origin_rejected。
+//
+// httptest.NewServer 绑 127.0.0.1:<port>（请求的本地地址就是它）。三件套是三个不同的
+// 本机地址、同端口可各自 bind——旧口径（只比 Origin 与 Host 的拼写）会放行 Origin=[::1]，
+// 新口径把真实监听地址（http.LocalAddrContextKey）注入判据后 [::1] 与 127.0.0.1
+// 不互认 → 拒。
+func TestLoopbackCrossAddressRejected(t *testing.T) {
+	b, closeHub := newHub(t)
+	defer closeHub()
+	srv := newWSServer(t, transport.NewServer(b))
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split host: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL(srv), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://[::1]:" + port}},
+	})
+	if err == nil {
+		conn.CloseNow()
+		t.Fatal("Origin=[::1]:port 打到 127.0.0.1 应被拒（堵洞收紧：不同 loopback 地址不互认）")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("状态码 = %v，want 403（err=%v）", resp, err)
+	}
+	defer resp.Body.Close()
+	var te contracts.TransportError
+	if jerr := json.NewDecoder(resp.Body).Decode(&te); jerr != nil {
+		t.Fatalf("错误体不是 JSON: %v", jerr)
+	}
+	if te.Code != transport.CodeOriginRejected {
+		t.Fatalf("错误码 = %q，want %q（403 文案口径不变）", te.Code, transport.CodeOriginRejected)
+	}
+}
 func TestUnknownKindGetsErrorReply(t *testing.T) {
 	b, closeHub := newHub(t)
 	defer closeHub()

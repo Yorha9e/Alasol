@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -410,6 +411,11 @@ func TestHelperProcess(t *testing.T) {
 		os.Exit(255) // 远端命令自己退出 255：stderr 无 ssh 特征
 	case "exit42":
 		os.Exit(42)
+	case "cat-stdin":
+		// 把 stdin 原样搬到 stdout（二进制往返的"假远端出口"）——
+		// 验证生产路径 osExec 的 stdin 管道逐字节送达。
+		_, _ = io.Copy(os.Stdout, os.Stdin)
+		os.Exit(0)
 	case "sleep":
 		time.Sleep(60 * time.Second)
 		os.Exit(0)
@@ -424,7 +430,7 @@ func helperArgs() []string { return []string{"-test.run=^TestHelperProcess$"} }
 // TestOsExecExitCodePassthrough 验证生产路径的**退出码透传**：非零退出不是 error。
 func TestOsExecExitCodePassthrough(t *testing.T) {
 	t.Setenv(fakeSSHEnvVar, "exit42")
-	res, err := osExec(context.Background(), os.Args[0], helperArgs())
+	res, err := osExec(context.Background(), os.Args[0], helperArgs(), nil)
 	if err != nil {
 		t.Fatalf("非零退出不该是 error：%v", err)
 	}
@@ -436,7 +442,7 @@ func TestOsExecExitCodePassthrough(t *testing.T) {
 // TestOsExecStartFailure 验证起不来（ssh 不在 PATH）→ 明确 error。
 func TestOsExecStartFailure(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-binary-here")
-	_, err := osExec(context.Background(), missing, nil)
+	_, err := osExec(context.Background(), missing, nil, nil)
 	if err == nil {
 		t.Fatal("起不来应该是 error")
 	}
@@ -455,7 +461,7 @@ func TestOsExecContextCancel(t *testing.T) {
 		cancel()
 	}()
 	start := time.Now()
-	_, err := osExec(ctx, os.Args[0], helperArgs())
+	_, err := osExec(ctx, os.Args[0], helperArgs(), nil)
 	if err == nil {
 		t.Fatal("取消后应返回 error")
 	}
@@ -471,7 +477,7 @@ func TestOsExecContextCancel(t *testing.T) {
 // → 返回可 errors.Is 判的 ErrSSHTransport，错误里带 stderr 片段。
 func TestOsExecSSHTransportFailure255(t *testing.T) {
 	t.Setenv(fakeSSHEnvVar, "exit255")
-	res, err := osExec(context.Background(), os.Args[0], helperArgs())
+	res, err := osExec(context.Background(), os.Args[0], helperArgs(), nil)
 	if err == nil {
 		t.Fatal("ssh 传输失败应返回 error（不能与远端命令退出 255 混为一谈）")
 	}
@@ -490,11 +496,153 @@ func TestOsExecSSHTransportFailure255(t *testing.T) {
 // （stderr 无 ssh 特征）→ 仍按退出码透出，**不**误报成"没连上"。
 func TestOsExecRemoteExit255Passthrough(t *testing.T) {
 	t.Setenv(fakeSSHEnvVar, "exit255-plain")
-	res, err := osExec(context.Background(), os.Args[0], helperArgs())
+	res, err := osExec(context.Background(), os.Args[0], helperArgs(), nil)
 	if err != nil {
 		t.Fatalf("远端命令退出 255 不该是 error：%v", err)
 	}
 	if res.ExitCode != 255 {
 		t.Errorf("ExitCode = %d，want 255", res.ExitCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fs 的内部件：GNU stat 解析、非 GNU 判定、stdin 执行面
+// ---------------------------------------------------------------------------
+
+// TestParseGNUStat 直接单测生产 parseGNUStat：GNU 形状 → 字段对；坏形状 →
+// 明文错误（含"非 GNU 口径"提示）+ 零值 FileInfo，**不瞎猜**。
+// 破坏生产解析（变异自证②）会让这里与外部 TestRemoteStatBadShapeFailsClosed 同时红。
+func TestParseGNUStat(t *testing.T) {
+	good := []struct {
+		in   string
+		want core.FileInfo
+	}{
+		{"1234|1700000000|regular file\n",
+			core.FileInfo{Size: 1234, ModTime: time.Unix(1700000000, 0)}},
+		{"4096|0|directory\n",
+			core.FileInfo{Size: 4096, IsDir: true, ModTime: time.Unix(0, 0)}},
+		{"0|-86400|regular file", // epoch 前 mtime（负秒）；无尾换行
+			core.FileInfo{Size: 0, ModTime: time.Unix(-86400, 0)}},
+		{"10|1712345678|symbolic link\n",
+			core.FileInfo{Size: 10, ModTime: time.Unix(1712345678, 0)}},
+	}
+	for _, c := range good {
+		got, err := parseGNUStat([]byte(c.in))
+		if err != nil {
+			t.Errorf("parseGNUStat(%q): %v", c.in, err)
+			continue
+		}
+		if got.Size != c.want.Size || got.IsDir != c.want.IsDir || !got.ModTime.Equal(c.want.ModTime) {
+			t.Errorf("parseGNUStat(%q) = {Size:%d IsDir:%v ModTime:%v}，want {Size:%d IsDir:%v ModTime:%v}",
+				c.in, got.Size, got.IsDir, got.ModTime,
+				c.want.Size, c.want.IsDir, c.want.ModTime)
+		}
+	}
+	bad := []string{
+		"",
+		"42",
+		"1|2",
+		"1|2|directory|extra",
+		"abc|def|ghi",
+		"x|y|z",
+		"1|notanumber|directory",
+		"1234|1700000000|",
+		"total 123\n1|2|directory", // 混入换行
+		"1|2|directory\r",          // 回车不许静默吞
+	}
+	for _, in := range bad {
+		fi, err := parseGNUStat([]byte(in))
+		if err == nil {
+			t.Errorf("parseGNUStat(%q) 应报错（坏形状不瞎猜），得到 %+v", in, fi)
+			continue
+		}
+		if !strings.Contains(err.Error(), "非 GNU 口径") {
+			t.Errorf("parseGNUStat(%q) 错误应点明非 GNU 口径提示：%v", in, err)
+		}
+		if fi != (core.FileInfo{}) {
+			t.Errorf("parseGNUStat(%q) 出错时应返回零值 FileInfo，得到 %+v", in, fi)
+		}
+	}
+}
+
+// TestLooksLikeNonGNUStat 钉死"非 GNU stat"的判据：BSD 的 illegal option 命中；
+// 通用 stat 报错 / 别的命令的报错**不**误判（保守判据，同 classifySSHExit 哲学）。
+func TestLooksLikeNonGNUStat(t *testing.T) {
+	yes := []string{
+		"stat: illegal option -- c",
+		"stat: invalid option -- 'c'",
+		"stat: unrecognized option '--foo'",
+		"stat: unknown option",
+	}
+	for _, s := range yes {
+		if !looksLikeNonGNUStat([]byte(s)) {
+			t.Errorf("应判为非 GNU stat 的报错：%q", s)
+		}
+	}
+	no := []string{
+		"",
+		"stat: cannot statx '/p': No such file or directory",
+		"sh: stat: not found",
+		"bash: stat: command not found",
+		"cat: /etc/shadow: Permission denied",
+		"ls: invalid option -- 'z'", // 不是 stat 的报错
+	}
+	for _, s := range no {
+		if looksLikeNonGNUStat([]byte(s)) {
+			t.Errorf("不该判为非 GNU stat 的报错：%q", s)
+		}
+	}
+}
+
+// TestOsExecStdinBinaryRoundTrip 钉死**生产路径** osExec 的 stdin 管道：
+// helper 进程把 stdin 原样搬到 stdout（假远端出口）→ 逐字节往返。
+// 这是 WriteFile"内容经 ssh stdin 送达"在 os/exec 层的直接证据（不经 ssh）。
+func TestOsExecStdinBinaryRoundTrip(t *testing.T) {
+	t.Setenv(fakeSSHEnvVar, "cat-stdin")
+	data := []byte{0x00, 0x01, 0x7f, 0x80, 0xff, '\r', '\n', 'h', 'i', 0x00}
+	res, err := osExec(context.Background(), os.Args[0], helperArgs(), data)
+	if err != nil {
+		t.Fatalf("osExec(stdin): %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d，stderr=%s", res.ExitCode, res.Stderr)
+	}
+	if string(res.Stdout) != string(data) { // 字节相等（string 比较不改字节）
+		t.Errorf("stdin 未逐字节送达：got=%v want=%v", res.Stdout, data)
+	}
+	// 空 stdin：不灌字节 → 子进程读到 EOF → 空输出（与窄面行为一致）。
+	res2, err := osExec(context.Background(), os.Args[0], helperArgs(), nil)
+	if err != nil {
+		t.Fatalf("osExec(nil stdin): %v", err)
+	}
+	if len(res2.Stdout) != 0 {
+		t.Errorf("空 stdin 应产出空 stdout，得到 %v", res2.Stdout)
+	}
+}
+
+// TestNoStdinExecFailClose 钉死窄面→宽面的适配口径：空 stdin 委托窄面；
+// 非空 stdin **fail-close**（不委托、不静默丢字节）。
+func TestNoStdinExecFailClose(t *testing.T) {
+	calls := 0
+	narrow := func(context.Context, string, []string) (core.ExecResult, error) {
+		calls++
+		return core.ExecResult{ExitCode: 0}, nil
+	}
+	wide := noStdinExec(narrow)
+	if _, err := wide(context.Background(), "ssh", []string{"h", "cmd"}, nil); err != nil {
+		t.Fatalf("空 stdin 应委托窄面：%v", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls = %d，want 1", calls)
+	}
+	_, err := wide(context.Background(), "ssh", []string{"h", "cmd"}, []byte("payload"))
+	if err == nil {
+		t.Fatal("非空 stdin 经窄面应 fail-close 报错")
+	}
+	if !strings.Contains(err.Error(), "stdin") {
+		t.Errorf("错误应点名 stdin：%v", err)
+	}
+	if calls != 1 {
+		t.Errorf("fail-close 不该委托窄面（calls = %d，want 1）", calls)
 	}
 }

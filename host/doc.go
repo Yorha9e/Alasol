@@ -215,8 +215,9 @@
 // # 远端执行环境（RemoteExecutionEnv，K8 第三档）
 //
 // 装配侧还有一个 opt-in：`-remote`（与 `-sandbox` 互斥）把**工具执行环境**换成
-// runtime/cap/remote 的 RemoteExecutionEnv——bash/exec 经系统 ssh 到 `-remote-host`
-// 执行；Fs/Proc/Net 三个能力面 v4-2-A 显式 ErrUnsupported（预留位，见该包 doc）。
+// runtime/cap/remote 的 RemoteExecutionEnv——bash/exec 与 read/write（Fs 最小可用档：
+// cat/stat/ls）经系统 ssh 到 `-remote-host` 执行；Proc/Net 两个能力面 v4-2-A 显式
+// ErrUnsupported（预留位，见该包 doc）。
 // 这与上面的"SSH 端口转发"是**两回事**：前者是"客户端连 hub 的面"，后者是"hub 把工具
 // 命令送到远端机器执行"；鉴权都交系统 ssh，我们都不收凭据（H18）。
 //

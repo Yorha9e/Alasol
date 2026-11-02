@@ -77,10 +77,11 @@ func (h *Hub) serveSessionAgents(w http.ResponseWriter, r *http.Request) {
 	// ③ 都不是 → 404（不放任野 session id 探活状态）。
 	if !h.agentTreeExists(sid) && !h.hostsSession(sid) {
 		// 文案不断言成因（终查 F2）：可能是别的进程建的/被重启失管，也可能是 /btw fork
-		// 的 session（fork 不装配 agent 树——已知覆盖面缺口，挂账 v4）。只陈述事实判据。
+		// 的 session（fork 的 agent 树**随 RunBtw 生命周期**——用完即弃，跑完这一轮就
+		// 回收了，见 host/fork.go 的 dropForkAgentTree）。只陈述事实判据。
 		writeJSONError(w, http.StatusNotFound, "unknown_session",
 			fmt.Sprintf("session %s 既没有 agent 树、也不由本进程托管（agent 树是进程内活状态；"+
-				"一库一 hub 是预期拓扑；注意 fork session 不装配 agent 树）", sid))
+				"一库一 hub 是预期拓扑；注意 fork session 的 agent 树随 RunBtw 生命周期，用完即弃）", sid))
 		return
 	}
 	nodes := h.agentTreeSnapshot(sid)

@@ -112,7 +112,8 @@ var ErrSSHTransport = errors.New("remote: ssh 传输层失败（连接/鉴权/�
 // log 是本包的告警出口（ssh 退出码歧义等）。用 slog，可被宿主接管。
 var log = slog.Default()
 
-// ExecFunc 抽象"起一条本地命令并同步等待"——这是本包**唯一的执行注入点**。
+// ExecFunc 抽象"起一条本地命令并同步等待"——这是本包**无 stdin** 的执行注入点
+// （Run / ReadFile / Stat / ListDir 走它；它们不需要往子进程里灌字节）。
 //
 // 为什么抽它：remote env 只起**一种**本地命令（系统 ssh），但测试必须能在**不真连 SSH**
 // 的前提下验证"ssh 命令行怎么拼"。抽成函数面后：
@@ -122,7 +123,38 @@ var log = slog.Default()
 //
 // 与 sandbox 用 Backend **接口**注入的理由不同：这里只有一个方法、无需多态一族，
 // 一个函数面更轻；sandbox 那边是"一整族进程/文件约束"需要接口多态。
+//
+// 需要把字节灌进子进程（WriteFile 的文件内容走 ssh stdin）时用**宽面** ExecStdinFunc
+// （见其说明）——它是本函数的超集；两个配置口（Config.Exec / Config.ExecStdin）
+// 在 New 里接成**一个**内部执行缝（见 Env.exec 与 noStdinExec）。
 type ExecFunc func(ctx context.Context, name string, args []string) (core.ExecResult, error)
+
+// ExecStdinFunc 抽象"起一条本地命令、可选灌入 stdin、同步等待"——**带 stdin 的宽面**
+// 执行注入点（Config.ExecStdin；WriteFile 用它把文件内容送进 ssh 的 stdin 管道）。
+//
+// 为什么 stdin 必须走独立的管道而不是命令行参数（两条硬理由，与 ErrCredentialEnv 同源）：
+//
+//   - **argv 装不下也看不见**：文件内容可能很大、可能含 NUL / 非法 UTF-8——命令行参数
+//     是 C 字符串（NUL 截断）且会原样落进**两端的进程表**（ps / /proc/<pid>/cmdline）；
+//   - 二进制安全：stdin 是字节管道，cat 原样落盘，不经任何文本转换。
+//
+// stdin 为空（nil / 长度 0）= 不灌任何字节（与 ExecFunc 行为一致，子进程读到 EOF）。
+type ExecStdinFunc func(ctx context.Context, name string, args []string, stdin []byte) (core.ExecResult, error)
+
+// noStdinExec 把**窄面** ExecFunc 适配成宽面 ExecStdinFunc（New 的接线件之一）。
+//
+// stdin 为空 → 直接委托（与 ExecFunc 逐字节同行为）；stdin **非空** → **fail-close
+// 报错**，绝不静默丢字节：静默丢会让 WriteFile"成功"写出空文件/旧内容——
+// 假成功比报错危险得多。要送内容就配 Config.ExecStdin（宽面）。
+func noStdinExec(f ExecFunc) ExecStdinFunc {
+	return func(ctx context.Context, name string, args []string, stdin []byte) (core.ExecResult, error) {
+		if len(stdin) > 0 {
+			return core.ExecResult{}, fmt.Errorf(
+				"remote: 注入的执行面（Config.Exec）不支持 stdin，文件内容送不过去（WriteFile 请配 Config.ExecStdin）")
+		}
+		return f(ctx, name, args)
+	}
+}
 
 // buildRemoteCommand 把 ExecSpec 拼成**一条**远端 shell 命令行（POSIX 安全引用）。
 //
@@ -373,6 +405,9 @@ func classifySSHExit(res core.ExecResult) error {
 
 // osExec 是生产实现：os/exec 起系统 ssh（不经本地 shell、参数数组传递）。
 //
+// stdin 非空 → 接一条 bytes.Reader 进子进程（WriteFile 的内容经 ssh 的 stdin 管道
+// 送达，二进制安全、不落 argv）；空 → 不灌（同窄面 ExecFunc 的行为，读到 EOF）。
+//
 // ctx 结束 → 杀掉 ssh 进程（Cancel 回调；ssh 是否把信号转发给远端由系统 ssh 决定，
 // v4-2-A 不深究——本地这条 ssh 一定被收掉；**远端命令可能仍在跑**，这是 SSH 的
 // 已知语义，doc 里写明了）。非零退出码不是 error（ExitCode 带上），
@@ -380,11 +415,14 @@ func classifySSHExit(res core.ExecResult) error {
 //
 // 唯一例外：**exit 255 且 stderr 首行命中 ssh 自身的强特征** → 返回 ErrSSHTransport
 // （"根本没连上"与"远端跑挂了"必须分得开，见 ErrSSHTransport 与 classifySSHExit）。
-func osExec(ctx context.Context, name string, args []string) (core.ExecResult, error) {
+func osExec(ctx context.Context, name string, args []string, stdin []byte) (core.ExecResult, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr cappedBuffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	hideWindow(cmd) // Windows：不弹控制台窗口（陷阱 5）
 	cmd.Cancel = func() error {
 		if cmd.Process != nil {
@@ -464,11 +502,24 @@ func asExitError(err error) bool {
 }
 
 // cappedBuffer 是带上限的输出缓冲（防无限输出吃光内存）。同 local / sandbox。
+//
+// # 截断口径：**静默截断到上限**（不报错、不短写）
+//
+// 超过上限的部分**丢掉**（dropped 计数），**不报错**——调用方拿到的是**截断后**的
+// 前 maxCapturedOutput 字节。**绝不短写**（见 Write）。
 type cappedBuffer struct {
 	buf     bytes.Buffer
 	dropped int
 }
 
+// Write 收一段输出，**静默截断**到上限。
+//
+// ⚠ **不短写**（p2-1 修复）：超限的那一段被截掉后，本方法返回**原长度**（不是写入
+// 长度）、err=nil——**假装全收下**。理由：io.Copy 的契约是"n < len(p) 且 err == nil"
+// 即短写 → io.Copy 返回 **ErrShortWrite**；os/exec 的拷贝 goroutine 会把它当成
+// **真错误**回给 cmd.Wait() → osExec 判成硬错（"等待 ssh 结束失败: short write"）。
+// 于是"输出超限"这件事的行为**随管道分块边界摆动**：有时静默截断、有时报错。
+// 统一成"静默截断到上限"（room<=0 分支与截断分支同口径），行为不再摇摆。
 func (b *cappedBuffer) Write(p []byte) (int, error) {
 	room := maxCapturedOutput - b.buf.Len()
 	if room <= 0 {
@@ -476,8 +527,11 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 		return len(p), nil // 假装全收下，避免 io.Copy 报 short write
 	}
 	if len(p) > room {
+		// 截断到上限：**不短写**（返回**原长度** len(p)，不是截断后的长度）——
+		// 短写会让 io.Copy 报 ErrShortWrite，整次执行被判成硬错（见上面的说明）。
 		b.dropped += len(p) - room
-		p = p[:room]
+		_, _ = b.buf.Write(p[:room])
+		return len(p), nil
 	}
 	return b.buf.Write(p)
 }

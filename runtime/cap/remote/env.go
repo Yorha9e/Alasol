@@ -10,11 +10,14 @@ import (
 	"github.com/Yorha9e/alasol/core"
 )
 
-// ErrUnsupported 是 remote env 对"预留位"能力（Fs / Proc / Net）的统一返回（v4-2-A）。
+// ErrUnsupported 是 remote env 对**仍处预留位**能力面（Proc / Net）的统一返回。
 //
-// 诚实报"未支持"，不假装成功、不静默直通本地——调用方（read/write 工具、Proc 管理、
-// 出站网络）会把这个错如实呈现给上层。要挂后续时在各自方法里实现即可。
-var ErrUnsupported = errors.New("remote: 该能力面为预留位，尚未实现（v4-2-A 只落地 Exec 经 SSH；Fs/Proc/Net 留后续）")
+// 诚实报"未支持"，不假装成功、不静默直通本地——调用方（Proc 管理、出站网络）
+// 会把这个错如实呈现给上层。要挂后续时在各自方法里实现即可。
+//
+// Fs **不再**走它：ReadFile/WriteFile/Stat/ListDir 已经 ssh exec 通道落地
+// （最小可用档，见 fs.go 与包 doc 的"能力面落地状态"一节）。
+var ErrUnsupported = errors.New("remote: 该能力面为预留位，尚未实现（Proc/Net 留后续；Exec 与 Fs 已经 ssh exec 落地）")
 
 // ErrCredentialEnv 是"远端路径不传凭据"的哨兵错误（H12/H19）。
 //
@@ -39,17 +42,21 @@ var ErrCredentialEnv = errors.New("remote: 远端路径不传凭据（H12/H19）
 //	env := remote.New(remote.Config{Host: "user@harness"})
 //	tools.NewRead(env); tools.NewWrite(env); tools.NewBash(env) // 工具代码零改动
 //
-// 但只有 **Exec** 真的经 SSH 落地；Fs / Proc / Net 显式 ErrUnsupported（预留位，见 doc）。
+// 但只有 **Exec** 与 **Fs** 真的经 SSH 落地（Fs 是最小可用档：cat/stat/ls，见 fs.go）；
+// Proc / Net 显式 ErrUnsupported（预留位，见 doc）。
 //
-// 并发安全：Env 自身只有只读字段；每次 Run 经注入的 ExecFunc 起一条独立的 ssh 进程，
-// 互不共享可变状态——多个 Run 可并发跑（真实并发度由远端与 ssh 决定，本包不额外限流）。
+// 并发安全：Env 自身只有只读字段；每次执行经注入的执行缝起一条独立的 ssh 进程，
+// 互不共享可变状态——多个 Run/Fs 调用可并发跑（真实并发度由远端与 ssh 决定，本包不额外限流）。
 type Env struct {
 	host    string
 	sshArgs []string
 	// remotePATH 是给远端命令的 PATH（`env -i` 之后远端唯一的 PATH 来源）。
 	// 默认 defaultRemotePATH；可经 Config.DefaultRemotePATH 覆盖。
 	remotePATH string
-	exec       ExecFunc
+	// exec 是 Env **唯一的内部执行缝**（带 stdin 的宽面，见 ExecStdinFunc）。
+	// Config.Exec（窄面）与 Config.ExecStdin（宽面）在 New 里接成这一个缝——
+	// Run/ReadFile/Stat/ListDir 以空 stdin 走它，WriteFile 以文件内容走它。
+	exec ExecStdinFunc
 }
 
 // 编译期断言：Env 必须满足 core 的四个能力接口（K8：换实现不动调用方）。
@@ -90,9 +97,20 @@ type Config struct {
 	// defaultRemotePATH。macOS/homebrew 的机器需要覆盖成含 `/opt/homebrew/bin` 的值
 	// （否则远端 brew 装的命令 127）。见包 doc 的"产品面口径"一节。
 	DefaultRemotePATH string
-	// Exec 是执行注入点（nil = 生产默认 os/exec 起系统 ssh；测试传假 ssh）。
+	// Exec 是**无 stdin** 的执行注入点（nil = 生产默认 os/exec 起系统 ssh；测试传假 ssh）。
 	// 见 ExecFunc 的说明——这是"不真连 SSH 也能测命令行拼接"的关键。
+	//
+	// WriteFile 的文件内容走 **stdin 管道**，窄面送不了 → 需要 Config.ExecStdin（宽面）。
+	// 两者只给一个时另一个从它退化而来（见 New 的接线口径；只给本项时 WriteFile 对
+	// **非空 data** fail-close 报错，不静默丢字节）。同时给时**以 ExecStdin 为准**
+	// （它是本项的超集）。
 	Exec ExecFunc
+	// ExecStdin 是**带 stdin** 的执行注入点（nil = 生产默认 os/exec 起系统 ssh 并接
+	// stdin 管道；测试传假 ssh）。见 ExecStdinFunc 的说明。
+	//
+	// 为什么单独一个口：WriteFile 必须把文件内容经 **ssh 的 stdin 管道**送达——
+	// 内容不进 argv（argv 落两端进程表，见 ErrCredentialEnv 的纪律）、二进制安全。
+	ExecStdin ExecStdinFunc
 }
 
 // New 构造远端 SSH 执行环境。Host 必填（空 → 报错，fail-close）。
@@ -114,9 +132,18 @@ func New(cfg Config) (*Env, error) {
 	if strings.ContainsAny(host, " \t\r\n") {
 		return nil, fmt.Errorf("remote: Config.Host 不能含空白（ssh 目标只能是 user@host 或 ~/.ssh/config 别名）")
 	}
-	exec := cfg.Exec
+	// 执行缝接线（两个配置口 → 一个内部缝，Env.exec）：
+	//   - 都不给 → 生产 osExec（os/exec 起系统 ssh，带 stdin 管道）；
+	//   - 只给 Exec（窄面）→ 宽面由它适配（stdin 非空 fail-close，见 noStdinExec）；
+	//   - 只给 ExecStdin（宽面）→ 它就是全部（窄面操作以空 stdin 走它）；
+	//   - 都给 → 以 ExecStdin 为准（它是 Exec 的超集）。
+	exec := cfg.ExecStdin
 	if exec == nil {
-		exec = osExec // 生产默认：os/exec 起系统 ssh
+		if cfg.Exec != nil {
+			exec = noStdinExec(cfg.Exec)
+		} else {
+			exec = osExec // 生产默认：os/exec 起系统 ssh
+		}
 	}
 	remotePATH := strings.TrimSpace(cfg.DefaultRemotePATH)
 	if remotePATH == "" {
@@ -182,10 +209,25 @@ func (e *Env) Run(ctx context.Context, spec core.ExecSpec) (core.ExecResult, err
 	if err != nil {
 		return core.ExecResult{}, err
 	}
+	return e.sshRun(ctx, remoteCmd, nil)
+}
+
+// sshRun 是"把一条**已拼好的远端命令行**交给系统 ssh"的执行下半段——
+// Run 与 Fs（fs.go）**共用**它，拼装口径不分叉：
+//
+//	ssh argv = mergeSSHOptions(sshArgs)… + host + remoteCmd（远端命令是单个参数）
+//
+// → 注入的执行缝（stdin 非空走宽面，如 WriteFile 的内容；空走同一缝的无 stdin 路径）
+//   - → classifySSHExit：exit 255 的歧义在此收口（见 ErrSSHTransport）。
+//
+// 为什么单独抽出来：Fs 的四条命令（cat/stat/ls 与 `cat > path`）远端命令行形状
+// 与 Exec 不同（WriteFile 还要灌 stdin），但"怎么起 ssh、怎么判传输失败"必须与
+// Run 逐字节同款——K8 的"换 env 语义可预期"在这里同样成立。
+func (e *Env) sshRun(ctx context.Context, remoteCmd string, stdin []byte) (core.ExecResult, error) {
 	args := make([]string, 0, len(e.sshArgs)+len(defaultSSHOptionValues)*2+2)
 	args = append(args, mergeSSHOptions(e.sshArgs)...)
 	args = append(args, e.host, remoteCmd)
-	res, err := e.exec(ctx, sshBin, args)
+	res, err := e.exec(ctx, sshBin, args, stdin)
 	if err != nil {
 		return res, err
 	}
@@ -246,22 +288,8 @@ func isCredentialArg(a string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// 预留位能力面（v4-2-A 显式未支持；见 doc 的"预留位"一节）
+// 能力面：Fs 见 fs.go（经 ssh exec 落地）；Proc / Net 仍为预留位（见 doc）
 // ---------------------------------------------------------------------------
-
-// ReadFile implements core.FSCapability（预留位：ErrUnsupported）。
-func (e *Env) ReadFile(context.Context, string) ([]byte, error) { return nil, ErrUnsupported }
-
-// WriteFile implements core.FSCapability（预留位：ErrUnsupported）。
-func (e *Env) WriteFile(context.Context, string, []byte) error { return ErrUnsupported }
-
-// Stat implements core.FSCapability（预留位：ErrUnsupported）。
-func (e *Env) Stat(context.Context, string) (core.FileInfo, error) {
-	return core.FileInfo{}, ErrUnsupported
-}
-
-// ListDir implements core.FSCapability（预留位：ErrUnsupported）。
-func (e *Env) ListDir(context.Context, string) ([]string, error) { return nil, ErrUnsupported }
 
 // Do implements core.NetCapability（预留位：ErrUnsupported）。
 //

@@ -38,6 +38,7 @@ import (
 type fakeSSH struct {
 	mu     sync.Mutex
 	calls  [][]string // 每次 [name, args...]
+	stdin  []byte     // 最近一次收到的 stdin（WriteFile 的内容面）
 	result core.ExecResult
 	err    error
 	shell  string
@@ -49,8 +50,16 @@ type fakeSSH struct {
 }
 
 func (f *fakeSSH) run(ctx context.Context, name string, args []string) (core.ExecResult, error) {
+	return f.runStdin(ctx, name, args, nil)
+}
+
+// runStdin 是**带 stdin** 的注入面（Config.ExecStdin）：记录 argv **与 stdin**，
+// 其余行为与 run 相同（hook / 本机 shell / 罐头结果）。Fs 的 WriteFile 走它——
+// 文件内容必须经 stdin 管道送达（不进 argv）。
+func (f *fakeSSH) runStdin(ctx context.Context, name string, args []string, stdin []byte) (core.ExecResult, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, append([]string{name}, args...))
+	f.stdin = append([]byte(nil), stdin...)
 	shell, hook, dir, extra := f.shell, f.hook, f.shellDir, f.shellExtraEnv
 	f.mu.Unlock()
 
@@ -58,9 +67,16 @@ func (f *fakeSSH) run(ctx context.Context, name string, args []string) (core.Exe
 		return hook(ctx, name, args)
 	}
 	if shell != "" {
-		return runViaShell(shell, args[len(args)-1], dir, extra) // 远端命令是最后一个参数
+		return runViaShell(shell, args[len(args)-1], dir, extra, stdin) // 远端命令是最后一个参数
 	}
 	return f.result, f.err
+}
+
+// lastStdin 返回最近一次调用收到的 stdin（副本）。
+func (f *fakeSSH) lastStdin() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]byte(nil), f.stdin...)
 }
 
 func (f *fakeSSH) lastCall() []string {
@@ -90,14 +106,18 @@ func (f *fakeSSH) callCount() int {
 // runViaShell 用本机 sh -c 跑一条 POSIX 远端命令（酸测试里模拟远端执行）。
 //
 // dir 非空 = 用它当工作目录（"远端"的 cwd）；extraEnv 是"远端 shell"额外继承的
-// 环境变量（模拟远端机器上 export 在 profile 里的东西）。
-func runViaShell(sh, remoteCmd, dir string, extraEnv []string) (core.ExecResult, error) {
+// 环境变量（模拟远端机器上 export 在 profile 里的东西）；stdin 非空 = 灌给这条
+// 命令（WriteFile 的 `cat >` 从这里吃到文件内容——模拟 ssh 的 stdin 管道）。
+func runViaShell(sh, remoteCmd, dir string, extraEnv []string, stdin []byte) (core.ExecResult, error) {
 	cmd := exec.Command(sh, "-c", remoteCmd)
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	if len(stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -130,6 +150,18 @@ func shPath() string {
 func newRemoteEnv(t *testing.T, fake *fakeSSH) *remote.Env {
 	t.Helper()
 	env, err := remote.New(remote.Config{Host: "user@harness", Exec: fake.run})
+	if err != nil {
+		t.Fatalf("remote.New: %v", err)
+	}
+	return env
+}
+
+// newRemoteEnvStdin 构造注入了**宽面执行缝**（Config.ExecStdin）的 env——
+// WriteFile 的文件内容要经 stdin 送达，必须注入宽面；其余操作（Run/Read/Stat/List）
+// 以空 stdin 走同一条缝（New 的接线：宽面是超集，只给它时全部经它）。
+func newRemoteEnvStdin(t *testing.T, fake *fakeSSH) *remote.Env {
+	t.Helper()
+	env, err := remote.New(remote.Config{Host: "user@harness", ExecStdin: fake.runStdin})
 	if err != nil {
 		t.Fatalf("remote.New: %v", err)
 	}
@@ -744,14 +776,16 @@ func TestRemoteContextAlreadyDone(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 预留位：Fs / Proc / Net 显式 ErrUnsupported
+// 预留位：Proc / Net 显式 ErrUnsupported（Fs 已落地，见下方 Fs 能力面一节）
 // ---------------------------------------------------------------------------
 
-// TestRemoteUnsupportedFaces 验证 Fs/Proc/Net 显式 ErrUnsupported（诚实报未支持）。
+// TestRemoteProcNetStillUnsupportedFaces 验证 Proc / Net **仍**显式 ErrUnsupported
+// （防回归：Fs 落地后这两个面必须继续诚实报未支持），且 Fs 四方法**不再**撞上
+// 预留位哨兵（已落地——哪怕执行缝是空壳罐头，也不该返回 ErrUnsupported）。
 //
 // 断言两件事：错误**说清了是预留位**（人可读），且**可 errors.Is 判**
 // （remote.ErrUnsupported 是导出哨兵——调用方要按能力面分流时用得上）。
-func TestRemoteUnsupportedFaces(t *testing.T) {
+func TestRemoteProcNetStillUnsupportedFaces(t *testing.T) {
 	env := newRemoteEnv(t, &fakeSSH{})
 	ctx := context.Background()
 	check := func(name string, err error) {
@@ -766,17 +800,516 @@ func TestRemoteUnsupportedFaces(t *testing.T) {
 			t.Errorf("%s 应可 errors.Is(err, remote.ErrUnsupported)：%v", name, err)
 		}
 	}
-	_, e := env.ReadFile(ctx, "/x")
-	check("ReadFile", e)
-	check("WriteFile", env.WriteFile(ctx, "/x", nil))
-	_, e = env.Stat(ctx, "/x")
-	check("Stat", e)
-	_, e = env.ListDir(ctx, "/x")
-	check("ListDir", e)
-	_, e = env.Do(ctx, nil)
+	_, e := env.Do(ctx, nil)
 	check("Do", e)
 	_, e = env.Start(ctx, core.ExecSpec{Name: "x"})
 	check("Start", e)
+
+	// Fs 四方法：预留位哨兵**一票否决**（出现即 Fs被错误地打回了预留位）。
+	fake := &fakeSSH{}
+	envFS := newRemoteEnvStdin(t, fake)
+	if _, err := envFS.ReadFile(ctx, "/x"); errors.Is(err, remote.ErrUnsupported) {
+		t.Errorf("ReadFile 不该再是预留位：%v", err)
+	}
+	if err := envFS.WriteFile(ctx, "/x", nil); errors.Is(err, remote.ErrUnsupported) {
+		t.Errorf("WriteFile 不该再是预留位：%v", err)
+	}
+	if _, err := envFS.Stat(ctx, "/x"); errors.Is(err, remote.ErrUnsupported) {
+		t.Errorf("Stat 不该再是预留位：%v", err)
+	}
+	if _, err := envFS.ListDir(ctx, "/x"); errors.Is(err, remote.ErrUnsupported) {
+		t.Errorf("ListDir 不该再是预留位：%v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fs 能力面（经 ssh exec：cat / stat / ls；不真连 ssh，断命令行与错误映射）
+// ---------------------------------------------------------------------------
+
+// fsCallCase 描述一个 Fs 方法：怎么调、期望的远端命令行、以及该命令行被远端
+// shell 解析后的 argv（注入钉子：元字符逃出单引号就会多出字段）。
+type fsCallCase struct {
+	name      string
+	call      func(env *remote.Env, path string) error
+	remoteCmd func(path string) string
+	wantArgv  func(path string) []string
+}
+
+// fsEnvPrefixProbe 是 Fs 四条命令的 **env 前缀**期望形态（外部测试包的契约镜像）：
+// `env -i 'PATH=/usr/bin:/bin'`——与 Run 同款（整份替换 + 远端侧 PATH）。
+//
+// 远端侧 PATH 的值取包内默认（defaultRemotePATH="/usr/bin:/bin"）；DefaultRemotePATH
+// 覆盖对 Fs 同样生效——那条由 TestRemoteFsUsesEnvIAndRemotePATH 单独钉（链路钉子）。
+const fsEnvPrefixProbe = "env -i 'PATH=/usr/bin:/bin'"
+
+// fsCallCases 四方法各一档（全部经 newRemoteEnvStdin 注入的执行缝——宽面是
+// 超集，空 stdin 的操作也走它）。
+func fsCallCases() []fsCallCase {
+	return []fsCallCase{
+		{
+			name: "ReadFile",
+			call: func(env *remote.Env, p string) error {
+				_, err := env.ReadFile(context.Background(), p)
+				return err
+			},
+			remoteCmd: func(p string) string {
+				return fsEnvPrefixProbe + " 'cat' '--' " + shQuoteProbe(p)
+			},
+			wantArgv: func(p string) []string {
+				return []string{"env", "-i", "PATH=/usr/bin:/bin", "cat", "--", p}
+			},
+		},
+		{
+			name: "WriteFile",
+			call: func(env *remote.Env, p string) error {
+				return env.WriteFile(context.Background(), p, []byte("payload"))
+			},
+			remoteCmd: func(p string) string {
+				return fsEnvPrefixProbe + " 'cat' > " + shQuoteProbe(p)
+			},
+			wantArgv: func(p string) []string {
+				return []string{"env", "-i", "PATH=/usr/bin:/bin", "cat", ">", p}
+			},
+		},
+		{
+			name: "Stat",
+			call: func(env *remote.Env, p string) error {
+				_, err := env.Stat(context.Background(), p)
+				return err
+			},
+			remoteCmd: func(p string) string {
+				return fsEnvPrefixProbe + " 'stat' '-c' '%s|%Y|%F' '--' " + shQuoteProbe(p)
+			},
+			wantArgv: func(p string) []string {
+				return []string{"env", "-i", "PATH=/usr/bin:/bin", "stat", "-c", "%s|%Y|%F", "--", p}
+			},
+		},
+		{
+			name: "ListDir",
+			call: func(env *remote.Env, p string) error {
+				_, err := env.ListDir(context.Background(), p)
+				return err
+			},
+			remoteCmd: func(p string) string {
+				return fsEnvPrefixProbe + " 'ls' '-1A' '--' " + shQuoteProbe(p)
+			},
+			wantArgv: func(p string) []string {
+				return []string{"env", "-i", "PATH=/usr/bin:/bin", "ls", "-1A", "--", p}
+			},
+		},
+	}
+}
+
+// fsPathMatrix 是路径转义矩阵：空格 / 单引号 / 分号 / $(...) / 反引号 / 注入串 /
+// 前导 '-'（靠 `--` 挡成文件名而不是选项）。
+//
+// ⚠ 含**真以 '-' 开头的相对路径**（`-rf` 这类）：它们**整个**就是选项的样子——
+// `--` 分隔符必须让远端命令把它们当**文件名**（相对路径基准 = 远端 shell 的 cwd，
+// 同 Exec 的 Dir 语义差），而不是当选项解析（那才是真正的注入面）。
+func fsPathMatrix() []string {
+	return []string{
+		"/data/plain.txt",
+		"/data/with space.txt",
+		"/data/it's.txt",
+		"/data/a; touch PWNED.txt",
+		"/data/$(id).txt",
+		"/data/`id`.txt",
+		`/data/x'; touch PWNED; echo '`,
+		"/data/-leading-dash.txt",
+		// —— 真以 '-' 开头的相对路径（整个路径就是选项的样子）——
+		"-rf",
+		"--",
+		"-",
+		"-rf/child.txt",
+	}
+}
+
+// TestRemoteFsCommandLineQuoting 钉死四方法的命令行拼装 + 路径转义矩阵：
+//
+//   - 远端命令行逐字节等于黄金样例（shQuoteProbe 镜像 shQuote 的期望字节）；
+//   - 且被"远端 shell"解析后**恰好**是期望 argv——路径里的 空格/单引号/分号/
+//     $(...)/反引号 若逃出单引号，会切成额外字段（shellFields 多字段即红）。
+//
+// 这就是"路径含单引号/空格/分号的命令行拼装"钉子（变异自证①的红灯所在）。
+func TestRemoteFsCommandLineQuoting(t *testing.T) {
+	for _, fc := range fsCallCases() {
+		t.Run(fc.name, func(t *testing.T) {
+			fake := &fakeSSH{} // 罐头 exit 0：本测试只关心命令行
+			env := newRemoteEnvStdin(t, fake)
+			for _, p := range fsPathMatrix() {
+				fake.mu.Lock()
+				fake.calls = nil
+				fake.mu.Unlock()
+				_ = fc.call(env, p) // 解析类错误（Stat 空罐头）不影响命令行断言
+				got := fake.remoteCmdOf()
+				if want := fc.remoteCmd(p); got != want {
+					t.Errorf("path=%q 远端命令行 =\n  %q\nwant\n  %q", p, got, want)
+				}
+				if fields := shellFields(got); !reflect.DeepEqual(fields, fc.wantArgv(p)) {
+					t.Errorf("path=%q 被远端 shell 解析成 %q，want %q（转义失效？）", p, fields, fc.wantArgv(p))
+				}
+			}
+		})
+	}
+}
+
+// TestRemoteFsReadFileBinaryPassthrough 钉死 ReadFile 的**二进制安全**：
+// stdout 原样字节返回（NUL / 0xff / CRLF 逐字节透传，不经文本转换）。
+func TestRemoteFsReadFileBinaryPassthrough(t *testing.T) {
+	payload := []byte{0x00, 0x01, 0x7f, 0x80, 0xff, '\r', '\n', 'h', 'i', 0x00}
+	fake := &fakeSSH{result: core.ExecResult{ExitCode: 0, Stdout: append([]byte(nil), payload...)}}
+	env := newRemoteEnvStdin(t, fake)
+	got, err := env.ReadFile(context.Background(), "/bin/data.bin")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("字节不逐字节相等（发生了文本转换/截断？）：got=%v want=%v", got, payload)
+	}
+}
+
+// TestRemoteFsWriteFileStdinBinary 钉死 WriteFile 的内容**走 ssh stdin 管道**：
+//
+//   - stdin 逐字节等于 data（含 NUL/0xff/CRLF 的二进制）；
+//   - 内容**不落 argv**（远端命令行是固定形状 env -i 'PATH=…' 'cat' > '<path>'，无 payload 痕迹）。
+func TestRemoteFsWriteFileStdinBinary(t *testing.T) {
+	data := []byte{0x00, 0xff, 0xfe, '\r', '\n', 'p', 'w', 0x00}
+	fake := &fakeSSH{}
+	env := newRemoteEnvStdin(t, fake)
+	if err := env.WriteFile(context.Background(), "/data/out.bin", data); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if got := fake.lastStdin(); !bytes.Equal(got, data) {
+		t.Errorf("stdin = %v，want %v（内容没走 stdin 管道？）", got, data)
+	}
+	want := fsEnvPrefixProbe + " 'cat' > '/data/out.bin'"
+	if got := fake.remoteCmdOf(); got != want {
+		t.Errorf("远端命令行 = %q，want %q", got, want)
+	}
+	// argv 里不许出现 payload 的特征字节（"pw"）——内容落 argv = 两端进程表公开。
+	if joined := strings.Join(fake.lastCall(), ""); strings.Contains(joined, "pw") {
+		t.Errorf("文件内容落进了 ssh argv：%q", joined)
+	}
+}
+
+// TestRemoteFsExitCodeError 钉死 Fs 的错误口径：远端非 0 退出 → 明文错误
+// （退出码 + 截断 stderr + path），且不误判成传输失败（FSCapability 没有
+// ExitCode 可带——与 Exec 的"非零不是 error"不同档）。
+func TestRemoteFsExitCodeError(t *testing.T) {
+	fake := &fakeSSH{result: core.ExecResult{
+		ExitCode: 1,
+		Stderr:   []byte("cat: /x: No such file or directory\n"),
+	}}
+	env := newRemoteEnvStdin(t, fake)
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"ReadFile", func() error { _, err := env.ReadFile(ctx, "/x"); return err }},
+		{"WriteFile", func() error { return env.WriteFile(ctx, "/x", []byte("d")) }},
+		{"Stat", func() error { _, err := env.Stat(ctx, "/x"); return err }},
+		{"ListDir", func() error { _, err := env.ListDir(ctx, "/x"); return err }},
+	}
+	for _, c := range cases {
+		err := c.call()
+		if err == nil {
+			t.Errorf("%s: 远端 exit 1 应报错", c.name)
+			continue
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "退出码 1") {
+			t.Errorf("%s: 错误应含退出码：%v", c.name, err)
+		}
+		if !strings.Contains(msg, "No such file or directory") {
+			t.Errorf("%s: 错误应含截断 stderr：%v", c.name, err)
+		}
+		if !strings.Contains(msg, "/x") {
+			t.Errorf("%s: 错误应含 path：%v", c.name, err)
+		}
+		if errors.Is(err, remote.ErrSSHTransport) {
+			t.Errorf("%s: 退出码 1 不是传输失败：%v", c.name, err)
+		}
+	}
+}
+
+// TestRemoteFsSSHTransport255 钉死 Fs 的传输失败映射与 Exec 同款：
+// exit 255 + stderr 首行 ssh 强特征 → errors.Is(err, remote.ErrSSHTransport)。
+func TestRemoteFsSSHTransport255(t *testing.T) {
+	fake := &fakeSSH{result: core.ExecResult{
+		ExitCode: 255,
+		Stderr:   []byte("ssh: connect to host harness port 22: Connection refused\n"),
+	}}
+	env := newRemoteEnvStdin(t, fake)
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		call func() error
+	}{
+		{"ReadFile", func() error { _, err := env.ReadFile(ctx, "/x"); return err }},
+		{"WriteFile", func() error { return env.WriteFile(ctx, "/x", []byte("d")) }},
+		{"Stat", func() error { _, err := env.Stat(ctx, "/x"); return err }},
+		{"ListDir", func() error { _, err := env.ListDir(ctx, "/x"); return err }},
+	}
+	for _, c := range cases {
+		err := c.call()
+		if err == nil {
+			t.Errorf("%s: ssh 传输失败应报错", c.name)
+			continue
+		}
+		if !errors.Is(err, remote.ErrSSHTransport) {
+			t.Errorf("%s: 应可 errors.Is(err, remote.ErrSSHTransport)：%v", c.name, err)
+		}
+		if !strings.Contains(err.Error(), "Connection refused") {
+			t.Errorf("%s: 错误应带 stderr 片段：%v", c.name, err)
+		}
+	}
+}
+
+// TestRemoteStatGNUShape 钉死 Stat 的 GNU 形状解析 → core.FileInfo 字段对
+// （Size / IsDir / ModTime 逐字段）。
+func TestRemoteStatGNUShape(t *testing.T) {
+	cases := []struct {
+		name   string
+		stdout string
+		want   core.FileInfo
+	}{
+		{"普通文件", "1234|1700000000|regular file\n",
+			core.FileInfo{Size: 1234, ModTime: time.Unix(1700000000, 0)}},
+		{"目录", "4096|0|directory\n",
+			core.FileInfo{Size: 4096, IsDir: true, ModTime: time.Unix(0, 0)}},
+		{"符号链接", "10|1712345678|symbolic link\n",
+			core.FileInfo{Size: 10, ModTime: time.Unix(1712345678, 0)}},
+		{"空普通文件（GNU %F 措辞带空格）", "0|1712345678|regular empty file\n",
+			core.FileInfo{Size: 0, ModTime: time.Unix(1712345678, 0)}},
+		{"epoch 前 mtime（负秒）", "0|-86400|regular file\n",
+			core.FileInfo{Size: 0, ModTime: time.Unix(-86400, 0)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeSSH{result: core.ExecResult{ExitCode: 0, Stdout: []byte(c.stdout)}}
+			env := newRemoteEnvStdin(t, fake)
+			fi, err := env.Stat(context.Background(), "/p")
+			if err != nil {
+				t.Fatalf("Stat(%q): %v", c.stdout, err)
+			}
+			if fi.Size != c.want.Size || fi.IsDir != c.want.IsDir || !fi.ModTime.Equal(c.want.ModTime) {
+				t.Errorf("FileInfo = {Size:%d IsDir:%v ModTime:%v}，want {Size:%d IsDir:%v ModTime:%v}",
+					fi.Size, fi.IsDir, fi.ModTime, c.want.Size, c.want.IsDir, c.want.ModTime)
+			}
+		})
+	}
+}
+
+// TestRemoteStatBadShapeFailsClosed 钉死 Stat 的**坏形状不瞎猜**：任何不是
+// '大小|mtime秒|类型' 三段（或段内非整数 / 空类型 / 混入换行回车）的输出 →
+// 明文错误（含"非 GNU 口径"提示）+ 零值 FileInfo。变异自证②的红灯所在。
+func TestRemoteStatBadShapeFailsClosed(t *testing.T) {
+	bad := []string{
+		"",
+		"42",
+		"1|2",
+		"1|2|directory|extra",
+		"abc|def|ghi",
+		"notnumber|1700000000|directory",
+		"1234|notanumber|directory",
+		"1|1700000000|",
+		"total 123\n1|2|directory", // 首行不是数据（别的工具混进 stdout）
+		"1|2|directory\r",          // CRLF 形态不许静默吞成 IsDir=false
+	}
+	for _, out := range bad {
+		fake := &fakeSSH{result: core.ExecResult{ExitCode: 0, Stdout: []byte(out)}}
+		env := newRemoteEnvStdin(t, fake)
+		fi, err := env.Stat(context.Background(), "/p")
+		if err == nil {
+			t.Errorf("stdout=%q 应报错（不瞎解析），得到 %+v", out, fi)
+			continue
+		}
+		if !strings.Contains(err.Error(), "非 GNU 口径") {
+			t.Errorf("stdout=%q 错误应点明非 GNU 口径提示：%v", out, err)
+		}
+		if fi != (core.FileInfo{}) {
+			t.Errorf("stdout=%q 出错时应返回零值 FileInfo，得到 %+v", out, fi)
+		}
+	}
+}
+
+// TestRemoteStatNonGNUStderr 钉死非 GNU 的**明确报错**：BSD/macOS 的 stat 不认
+// -c（"stat: illegal option"）→ "远端 stat 非 GNU 口径"；通用报错不误判。
+func TestRemoteStatNonGNUStderr(t *testing.T) {
+	fake := &fakeSSH{result: core.ExecResult{
+		ExitCode: 1,
+		Stderr:   []byte("stat: illegal option -- c\nusage: stat [-FLnqrs] [-f format] file ...\n"),
+	}}
+	env := newRemoteEnvStdin(t, fake)
+	_, err := env.Stat(context.Background(), "/p")
+	if err == nil {
+		t.Fatal("非 GNU stat 应报错")
+	}
+	if !strings.Contains(err.Error(), "远端 stat 非 GNU 口径") {
+		t.Errorf("错误应点名远端 stat 非 GNU 口径：%v", err)
+	}
+
+	// 通用报错（文件不存在）**不**误判成非 GNU——按普通退出码错误透出。
+	fake2 := &fakeSSH{result: core.ExecResult{
+		ExitCode: 1,
+		Stderr:   []byte("stat: cannot statx '/p': No such file or directory\n"),
+	}}
+	env2 := newRemoteEnvStdin(t, fake2)
+	_, err2 := env2.Stat(context.Background(), "/p")
+	if err2 == nil {
+		t.Fatal("stat 失败应报错")
+	}
+	if strings.Contains(err2.Error(), "非 GNU 口径") {
+		t.Errorf("普通 stat 失败不该被误判成非 GNU：%v", err2)
+	}
+	if !strings.Contains(err2.Error(), "退出码 1") {
+		t.Errorf("应按普通退出码错误透出：%v", err2)
+	}
+}
+
+// TestRemoteListDirLines 钉死 ListDir 的逐行拆分（含换行文件名的诚实边界）。
+func TestRemoteListDirLines(t *testing.T) {
+	cases := []struct {
+		name   string
+		stdout string
+		want   []string
+	}{
+		{"多行", "a.txt\nb dir\nc'd\n", []string{"a.txt", "b dir", "c'd"}},
+		{"空目录（零字节）", "", []string{}},
+		{"无尾换行", "only", []string{"only"}},
+		{"注入字符名字原样保留", "x'; touch PWNED; echo '\n$(id)\n",
+			[]string{"x'; touch PWNED; echo '", "$(id)"}},
+		// 诚实边界：文件名含换行**会错拆**（一行一个名字的口径天然如此）——
+		// 这条把已知边界固定下来，别让后人"修"成静默吞行。
+		{"换行文件名错拆（已知边界）", "a\nb\n", []string{"a", "b"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeSSH{result: core.ExecResult{ExitCode: 0, Stdout: []byte(c.stdout)}}
+			env := newRemoteEnvStdin(t, fake)
+			got, err := env.ListDir(context.Background(), "/d")
+			if err != nil {
+				t.Fatalf("ListDir: %v", err)
+			}
+			if !reflect.DeepEqual(got, c.want) {
+				t.Errorf("ListDir(%q) = %q，want %q", c.stdout, got, c.want)
+			}
+		})
+	}
+}
+
+// TestRemoteFsContextCanceled 钉死 Fs 的 ctx 口径与 Run 同款：已取消的 ctx
+// 直接报错、不碰 ssh。
+func TestRemoteFsContextCanceled(t *testing.T) {
+	fake := &fakeSSH{}
+	env := newRemoteEnvStdin(t, fake)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := env.ReadFile(ctx, "/x"); err == nil {
+		t.Error("已取消的 ctx 应报错（ReadFile）")
+	}
+	if err := env.WriteFile(ctx, "/x", []byte("d")); err == nil {
+		t.Error("已取消的 ctx 应报错（WriteFile）")
+	}
+	if fake.callCount() != 0 {
+		t.Error("已取消的 ctx 不该碰 ssh")
+	}
+}
+
+// TestRemoteFsWriteFileOnlyNarrowExecFailClose 钉死执行缝接线口径：只注入
+// **窄面** Config.Exec（无 stdin）时，WriteFile 对**非空 data** fail-close
+// 报错（绝不静默丢字节写出空文件）；空 data 不需要 stdin → 窄面照常可用。
+func TestRemoteFsWriteFileOnlyNarrowExecFailClose(t *testing.T) {
+	fake := &fakeSSH{}
+	env := newRemoteEnv(t, fake) // 只注入 Exec（窄面）
+	err := env.WriteFile(context.Background(), "/x", []byte("payload"))
+	if err == nil {
+		t.Fatal("窄面执行缝送不了非空内容，应 fail-close 报错")
+	}
+	if !strings.Contains(err.Error(), "stdin") {
+		t.Errorf("错误应点名 stdin/ExecStdin：%v", err)
+	}
+	if fake.callCount() != 0 {
+		t.Error("fail-close 不该起 ssh")
+	}
+	// 空 data：不需要 stdin 管道 → 窄面照常执行（远端 `cat >` 截断成空文件）。
+	if err := env.WriteFile(context.Background(), "/x", nil); err != nil {
+		t.Errorf("空 data 应可经窄面执行：%v", err)
+	}
+	if fake.callCount() != 1 {
+		t.Errorf("空 data 应真的起了 ssh 一次，实际 %d 次", fake.callCount())
+	}
+}
+
+// TestRemoteFsRoundTripRealShell 有 sh 才跑：把远端命令真交给本机 POSIX shell——
+// WriteFile 的 stdin 管道 + ReadFile 的字节透传 + ListDir 拆行一次串起来。
+// 文件名含空格/单引号/分号/`$(...)`：转义若失效，写读的名字对不上、或注入物
+// 在临时目录里落地（兜底断言：目录里**只**有那一个文件）。
+func TestRemoteFsRoundTripRealShell(t *testing.T) {
+	sh := shPath()
+	if sh == "" {
+		t.Skip("无 sh（Windows 裸环境）；命令行拼装由 TestRemoteFsCommandLineQuoting 钉住")
+	}
+	remoteCwd := t.TempDir()
+	fake := &fakeSSH{shell: sh, shellDir: remoteCwd}
+	env := newRemoteEnvStdin(t, fake)
+	name := `a b'c;$(id).txt` // 纯文件名（无路径分隔符）：POSIX 与 Windows 文件系统都收
+	data := []byte{0x00, 0xff, 0xfe, '\r', '\n', 'h', 'i', 0x00}
+
+	if err := env.WriteFile(context.Background(), name, data); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	got, err := env.ReadFile(context.Background(), name)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Errorf("二进制往返不等：got=%v want=%v", got, data)
+	}
+	names, err := env.ListDir(context.Background(), ".")
+	if err != nil {
+		t.Fatalf("ListDir: %v", err)
+	}
+	if !reflect.DeepEqual(names, []string{name}) {
+		t.Errorf("ListDir = %q，want %q", names, []string{name})
+	}
+	// 注入兜底：$(id) 若被展开、或 ; 拆出新命令，临时目录会多出条目/名字对不上。
+	if ents := dirEntries(t, remoteCwd); !reflect.DeepEqual(ents, []string{name}) {
+		t.Errorf("远端工作目录条目 = %q，want [%q]（转义/注入事故？）", ents, name)
+	}
+}
+
+// TestRemoteFsStatRealShell 有 sh 且"远端"模拟环境有 **GNU stat** 才跑：
+// 真解析 stat 输出 → FileInfo 字段对。非 GNU（BSD/macOS 的 stat 不认 -c）
+// → 探路失败即跳过——那正是"远端 stat 非 GNU 口径"的诚实边界。
+func TestRemoteFsStatRealShell(t *testing.T) {
+	sh := shPath()
+	if sh == "" {
+		t.Skip("无 sh（Windows 裸环境）；Stat 形状由 TestRemoteStatGNUShape 钉住")
+	}
+	remoteCwd := t.TempDir()
+	env := newRemoteEnvStdin(t, &fakeSSH{shell: sh, shellDir: remoteCwd})
+
+	fiDir, err := env.Stat(context.Background(), ".")
+	if err != nil {
+		t.Skipf("远端模拟环境无可用 GNU stat（非 GNU 口径边界）：%v", err)
+	}
+	if !fiDir.IsDir {
+		t.Errorf("Stat('.') 应是目录：%+v", fiDir)
+	}
+	want := []byte("hello remote stat")
+	if err := env.WriteFile(context.Background(), "f.bin", want); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	fi, err := env.Stat(context.Background(), "f.bin")
+	if err != nil {
+		t.Fatalf("Stat(f.bin): %v", err)
+	}
+	if fi.Size != int64(len(want)) || fi.IsDir {
+		t.Errorf("FileInfo = {Size:%d IsDir:%v}，want {Size:%d IsDir:false}",
+			fi.Size, fi.IsDir, len(want))
+	}
 }
 
 // TestRemoteNewRejectsEmptyHost 验证空 Host → fail-close 报错。

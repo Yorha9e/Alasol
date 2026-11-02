@@ -198,8 +198,9 @@ type Config struct {
 	// `-sandbox` flag 语义**（改枚举会让 `-sandbox` 失效/要迁移）——加一个并列 `-remote`
 	// flag 是最小侵入。
 	//
-	// 诚实边界（v4-2-A 只落地 Exec）：remote env 只把 **bash/exec** 经 SSH 送到远端；
-	// Fs/Proc/Net 三个能力面显式 ErrUnsupported（预留位，见 runtime/cap/remote 的 doc）。
+	// 诚实边界（v4-2-A 落地 Exec + Fs）：remote env 把 **bash/exec** 与 **read/write**
+	// （Fs 最小可用档：cat/stat/ls）经 SSH 送到远端；Proc/Net 两个能力面显式
+	// ErrUnsupported（预留位，见 runtime/cap/remote 的 doc）。
 	// 鉴权**交系统 ssh**（密钥/agent/config），本结构**不收任何凭据**（H18）。
 	Remote bool
 	// RemoteHost 是 ssh 目标（user@host 或 ~/.ssh/config 别名）。Remote 启用时必填。

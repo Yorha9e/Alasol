@@ -305,12 +305,21 @@ func subscribeAckFrom(f bus.Filter, replaced bool) contracts.SubscribeAck {
 
 // checkOrigin 实现 N5b 的 Origin 判据（见包 doc 的安全边界一节）。
 //
-// v4-2-A SSH 隧道兼容：在"Origin 与请求 Host 字符串相等"之外，新增 **loopback 互认**——
-// **规范写法** localhost / 127.0.0.1 / [::1] 互为同源（都是本机，无跨源风险；
-// 127/8 的其余成员**不放行**，见 isLoopbackHost 的收紧说明）。
-// 修的是 SSH -L 隧道后的一个真实割裂：页面从 http://localhost:<port> 加载
-// （Origin=localhost）而 WS/fetch 用了 127.0.0.1（Host=127.0.0.1）——两者都是
-// loopback、同端口，却因拼写不同被旧判据当跨源拒（403 origin_rejected）。
+// 两道判据，顺序如下：
+//
+//  1. **同源**：Origin host 与请求 Host 字符串相等（大小写不敏感）——**不变**；
+//  2. **loopback 互认**（v4-2-A，SSH 隧道兼容）：**三元比对**——除 Origin 与请求 Host
+//     外，还要比对**请求的本地地址**（net/http 每连接写进 http.LocalAddrContextKey
+//     的真实监听地址）。修的是 SSH -L 隧道后的一个真实割裂：页面从
+//     http://localhost:<port> 加载（Origin=localhost）而 WS/fetch 用了 127.0.0.1
+//     （Host=127.0.0.1）——同端口、都 loopback，却因拼写不同被字符串相等判据当跨源拒
+//     （403 origin_rejected）。本地地址拿不到 → 互认不生效（fail-close，只走同源）。
+//
+// ⚠ **scheme 不参与比对**（pre-existing）：同源与互认都只比 host:port，**不看**
+// Origin 的 scheme（http/https/ws/wss 一律同权）。残余边界见包 doc。
+//
+// 拒绝一律 403 + origin_rejected（文案见下方错误值，口径不变）。互认的完整规则与
+// 残余边界见 loopbackMutual 与包 doc。
 func checkOrigin(r *http.Request) error {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
@@ -324,27 +333,101 @@ func checkOrigin(r *http.Request) error {
 		return fmt.Errorf("Origin %q 不是带 host 的合法 URL", origin)
 	}
 	if sameOrigin(u.Host, r.Host) {
-		return nil // 同源（含 loopback 互认）：hub 自己的 Web UI / SSH 隧道后的本地访问
+		return nil // 同源（Origin host == 请求 Host 字符串相等）：不变
+	}
+	if loopbackMutual(u.Host, r) {
+		return nil // loopback 互认（三元比对，见 loopbackMutual）
 	}
 	return fmt.Errorf("Origin %q 与请求 Host %q 不同源（N5b：v0 只监听 loopback + 无 cookie，拒绝跨源页面）", u.Host, r.Host)
 }
 
-// sameOrigin 判据：字符串相等（含端口）即同源；否则 **loopback 互认**——
-// 两端都是**规范 loopback 写法**且**端口相同**才互认。
+// sameOrigin 同源判据：Origin host 与请求 Host **字符串相等**（含端口，大小写不敏感）。
 //
-// 为什么要求同端口：端口不同 = 浏览器视角的不同源。若无条件放行所有 loopback，
-// 就把"本机另一个端口上的恶意页面连 hub"这条重新打开了（那正是 Origin 校验要挡的）。
-// SSH 隧道场景两端本就是同一个转发端口，故同端口要求不影响修复目标。
+// 只有这一条；loopback **拼写差异**（Origin=localhost vs Host=127.0.0.1 这类）不归它管，
+// 走 loopbackMutual 的三元比对（v4-2-A 起注入真实监听地址，见下）。
 func sameOrigin(originHost, requestHost string) bool {
-	if strings.EqualFold(originHost, requestHost) {
-		return true
+	return strings.EqualFold(originHost, requestHost)
+}
+
+// loopbackMutual 实现 v4-2-A 的 loopback **互认**——三元比对：
+// Origin host ↔ 请求 Host ↔ **请求的本地地址**（真实监听地址）。
+//
+// # 为什么注入本地地址（堵洞）
+//
+// 旧口径只比 Origin 与请求 Host 的拼写：两者都属规范三件套（localhost / 127.0.0.1 /
+// [::1]）且同端口就互认。但三件套是**三个不同的本机地址**，同端口**可以各自 bind**
+// （绑 [::1]:port 不与 127.0.0.1:port 冲突）——绑在 [::1]:port 的恶意本地页面发
+// Origin=[::1]:port 给绑在 127.0.0.1:port 的 hub，旧口径照样放行。net/http 每条连接
+// 都把本地地址放在 http.LocalAddrContextKey 上，把它比进去后"不同 loopback 地址"
+// 不再互认。
+//
+// # 规则（只收紧不放松）
+//
+//   - 本地地址拿不到（无 key / 值不是 net.Addr / 拆不出 host:port）→ false
+//     （**fail-close**：互认不生效，只走同源）；
+//   - **同端口判据保留**：Origin 端口必须等于请求 Host 端口（隧道的转发端口——不是
+//     hub 的本地端口：ssh -L 下两者可以不同，故不拿本地端口参与比对）；
+//   - **请求 Host 的 host 也必须是规范三件套**（v4-2-A 复查：这一条是"只收紧不放松"
+//     的硬条件——**旧口径**里 isLoopbackHost(请求 Host) 就是硬条件；注入本地地址那轮
+//     把它漏掉了，等于**放松**了一格：Origin=localhost:<port> + Host=evil.example.com:<port>
+//     会被放行（200），旧口径是 403。**加回**后与旧口径一致）；
+//   - Origin host 必须是规范三件套（127/8 其余成员如 127.0.0.2 继续不放行）；
+//   - Origin host == 本地地址 host（精确匹配）→ 放行；
+//   - Origin host == "localhost" 且本地地址 host 是规范 loopback → 放行（隧道拼写兼容；
+//     localhost 保留放行——隧道 UX 是互认的存在理由，残余边界见包 doc）；
+//   - Origin host == "[::1]" **仅当**本地地址 host 是 [::1]，"127.0.0.1" 同理——
+//     **不同 loopback 地址不互认**（堵洞核心：除 localhost 拼写兼容外，三件套之间
+//     没有互认通路）。
+//
+// **scheme 不参与比对**（pre-existing）：Origin 的 scheme（http/https/ws/wss）**不看**——
+// 同源判定只比 host:port。残余边界见包 doc。
+func loopbackMutual(originHost string, r *http.Request) bool {
+	localHost, ok := requestLocalHost(r)
+	if !ok {
+		return false // 拿不到真实监听地址 → 互认不生效（fail-close，只走同源）
 	}
 	oHost, oPort := splitHostPort(originHost)
-	rHost, rPort := splitHostPort(requestHost)
+	oHost = strings.Trim(oHost, "[]") // 无端口的 [::1] 形态与本地地址的 ::1 对齐
+	rHost, rPort := splitHostPort(r.Host)
 	if oPort != rPort {
+		return false // 同端口判据保留
+	}
+	if !isLoopbackHost(rHost) {
+		// 请求 Host 不是规范 loopback → 互认**整体**不生效（与旧口径一致："只收紧不放松"）。
+		// 这也让"hub 绑非 loopback 地址"的口径确定：那时只有同源（Origin 与 Host 同字面量）
+		// 能过。见包 doc 的残余边界一节。
 		return false
 	}
-	return isLoopbackHost(oHost) && isLoopbackHost(rHost)
+	if !isLoopbackHost(oHost) {
+		return false // 只认规范三件套（127.0.0.2 等继续不放行）
+	}
+	if strings.EqualFold(oHost, localHost) {
+		return true // 精确匹配：Origin host 就是本连接的真实监听地址
+	}
+	// 隧道拼写兼容：Origin=localhost 而真实监听地址是规范 loopback 的另一种写法。
+	//（[::1] 与 127.0.0.1 之间不互认——除 localhost 外没有拼写通路。）
+	return strings.EqualFold(oHost, "localhost") && isLoopbackHost(localHost)
+}
+
+// requestLocalHost 取**请求的本地地址**（net/http 每连接写进 http.LocalAddrContextKey
+// 的真实监听地址，类型 net.Addr）的 host。
+//
+// 拿不到（key 缺省 / 值不是 net.Addr / 地址拆不出 host:port）→ false：
+// 调用方必须按 **fail-close** 处理——互认不生效，只走同源判据。
+func requestLocalHost(r *http.Request) (string, bool) {
+	v := r.Context().Value(http.LocalAddrContextKey)
+	if v == nil {
+		return "", false
+	}
+	a, isAddr := v.(net.Addr)
+	if !isAddr || a == nil {
+		return "", false
+	}
+	host, _, err := net.SplitHostPort(a.String())
+	if err != nil {
+		return "", false
+	}
+	return host, true
 }
 
 // splitHostPort 拆 host:port（无端口 → port 为空）。IPv6 字面量由 net 处理。
@@ -369,12 +452,14 @@ func splitHostPort(hostport string) (host, port string) {
 // 故收紧为**规范写法**三件套：SSH 隧道后浏览器真正会写的拼写就这三个
 // （localhost / 127.0.0.1 / [::1]），其余 127/8 成员一律不放行。
 //
-// ⚠ **诚实边界：这条互认是"隧道便利"，不是"安全边界"**（v4-2-A 复查 F4）。
-// 收紧到三件套**并没有**把"同机不同地址"这条边界建立起来：三件套里的
-// **127.0.0.1 vs ::1 vs localhost 本身就是不同的本机地址**，同端口**可以各自 bind**
-// （Linux/macOS 默认监听 127.0.0.1，但绑 [::1]:port 不与之冲突）——所以
-// **恶意本地页面仍可借这条互认驱动 hub**。要彻底堵，需要把"**实际监听地址**"注入
-// 判据（比对请求的 local addr，而不是只比对 Host 字符串）——**挂账**（另一刀的事）。
+// ⚠ **诚实边界（v4-2-A 复查 F4；实际监听地址已注入 loopbackMutual）**：
+// 三件套是**三个不同的本机地址**、同端口可以各自 bind——所以互认**不再只比 Host
+// 字符串**：真实监听地址已注入判据（loopbackMutual 比对 http.LocalAddrContextKey，
+// Origin=[::1] 打到绑 127.0.0.1 的 hub 已被拒）。**残余**：Origin=localhost 走隧道
+// 拼写兼容（放行是隧道 UX 的存在理由），而客户端 localhost 的 **DNS 解析序不可信**——
+// localhost 解析到 [::1]、恶意进程绑 [::1]:port 时 Origin=localhost 仍命中放行；
+// 彻底闭合需客户端解析可信，做不到。运维缓解 = hub 绑具体 IP 并用该 IP 访问
+// （见包 doc 的残余边界一节）。
 //
 // # 与 host 包那份 isLoopbackHost 的分工（**刻意不合并**）
 //

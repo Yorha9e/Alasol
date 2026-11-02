@@ -62,6 +62,11 @@ import (
 // （fork 集合，见 host/discovery.go 的 discoveryFeed.forks），presence/peers 面
 // **统一过滤**——"旁支不是一等会话"是一条口径，而不是"它恰好没 join gate、恰好
 // 没被激活"的副产物。
+//
+// **agent 树同理用完即弃**：旁支的 agent 树（MultiAgent 开时建）**只服务这一轮
+// RunBtw**，跑完即从 h.agentTrees 回收（见 dropForkAgentTree）——树是进程内活状态、
+// 不跨 Run 复用；留着就是每跑一次 /btw 泄漏一棵。**主 session 的树不删**（它要跨
+// Run 复用）。
 
 // KindBtwForked 是标记一次 /btw fork 的事件 kind（契约见 contracts.BtwForkedPayload）。
 //
@@ -234,6 +239,21 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	// 过滤（见 host/discovery.go 的 discoveryFeed.forks）。**不等事件流扫到**——刚造出
 	// 的旁支立刻就该被过滤掉。
 	h.markForkSession(forkSID)
+	// **回收 fork 的 agent 树**（用完即弃）：旁支是一次性执行线（结果只回给用户、不
+	// 回灌主上下文），它的 agent 树**只服务这一轮 RunBtw**——跑完就没用了。
+	//
+	// 为什么必须回收（泄漏修）：树登记在 h.agentTrees 里（进程内活状态），**永不回收**
+	// → 每跑一次 /btw 就**泄漏一棵**树（节点 + 类型快照 + summary 都在里面）。长期跑的
+	// hub（serve）上这就是无界的内存增长。
+	//
+	// 为什么"用完即弃"是对的：树是**活状态**（进程内、不持久化），fork session 本身
+	// 也不是一等会话（结果不回灌主上下文、presence/peers 面过滤掉它）；主 session 的树
+	// **不删**（它要跨 Run 复用——见 hub.go 的 agentTrees 注释）。fork 树没有跨 Run 的
+	// 生命周期：RunBtw 返回后这一条旁支就结束了（要接着跑得再 /btw 一次）。
+	//
+	// 时序：defer 落在**钩子触发之后**（钩子在 RunBtw 返回前触发，那时树还在——预埋
+	// 钩子要能观测树）；失败路径同样回收（defer 覆盖所有 return）。
+	defer h.dropForkAgentTree(forkSID)
 
 	// ③ 落一条 btw.forked（durable，归 fork session）——标记"本 session 是从 mainSessionID 分叉的
 	//    旁支"，可审计/可回放；落不下就不跑旁支（fail-close：不产一条没有归属标记的幽灵执行线）。
@@ -257,6 +277,10 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	//
 	//    **ContextStrategy 故意留空**：挂上的上下文策略会注入 ledger/rules 两张注入区
 	//    （v2-S1 tiered），那正是"fork 不带 ledger/gate"要防的事——旁支只带**对话历史**。
+	//    **TurnBudget 同样故意不接**：fork 是一次性旁支，W15 只走 RunBtw 入口那道
+	//    per-Run checkBudget，不挂逐轮刹车（loopFor 的 TurnBudget 是主 session 的逐轮
+	//    口径，fork 不跟）。两条不挂 + 树 root=forkAgent 是本文件的**刻意决定**，
+	//    不许顺手"补全"。
 	//
 	//    D4 大 payload 外置（v4-3-A，G2e）：旁支的 loop **同样挂 blob**（与主 session 同口径，
 	//    见 loopFor）——旁支的工具大输出同样不该进事件流。不挂 = "大输出不进事件流"这条规则
@@ -266,24 +290,15 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	//    v4-4-B WAL 预写日志：旁支的 loop **同样挂 WAL**（与 loopFor 同口径）——旁支崩了
 	//    也要能查"崩在第几轮、吐过什么"。挂的是**旁支自己 session** 的 WAL（per-session
 	//    文件：<forkSID>.wal）；未启用 WAL（WalDir 空）→ sink 为 nil = 零行为变化。
-	fl, err := loop.New(loop.Config{
-		Provider:        h.provider,
-		Bus:             h.bus,
-		Registry:        h.reg,
-		Policy:          h.engine,
-		Approver:        h.approver,
-		SessionID:       forkSID,
-		AgentID:         forkAgent,
-		Model:           h.cfg.Model,
-		System:          h.cfg.System,
-		MaxTurns:        h.cfg.MaxTurns,
-		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位与主 session 同源（G14）
-		ContextBudget:   h.contextBudgetFor(h.cfg.ContextStrategy),
-		BlobSink:        h.blob,
-		BlobMaxInline:   h.cfg.BlobMaxInline,
-		WalSink:         h.walFor(forkSID),
-		TelemetrySink:   h.telemetrySink(),
-	})
+	//
+	//    v3-S6-B 缺口 6：MultiAgent 开 → 旁支 loop **同样装配 loop.Agents**（fork session
+	//    **自己**的 agent 树，root = forkAgent——fork 是自己 session 的主 agent，不借主
+	//    session 的树；树是**进程内活状态、不持久化**，且**只活到本次 RunBtw 收口**
+	//    （用完即弃——见上面 defer h.dropForkAgentTree 的注释：旁支是一次性执行线，
+	//    树不跨 Run 复用，留着就是每 /btw 一次泄漏一棵）。关（默认）→ Agents 留 nil =
+	//    单 agent 零行为变化。
+	//    装配本体抽在 forkLoopConfig（只为可直接断言装配结果；字段与原先逐字节一致）。
+	fl, err := loop.New(h.forkLoopConfig(forkSID, forkAgent))
 	if err != nil {
 		btw := BtwResult{
 			SourceSessionID:  mainSessionID,
@@ -320,6 +335,66 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	return btw, runErr
 }
 
+// forkLoopConfig 造 /btw 旁支的 loop.Config（RunBtw ④ 装配段的逐字段本体；对照 hub.go
+// loopFor 的 loop.Config 装配）。
+//
+// 抽成方法只为**可测**（host/fork_agents_internal_test.go 直接断言装配结果）：MultiAgent 开
+// → Agents 非 nil 且树 root = forkAgent；关（默认）→ nil = 单 agent 零行为变化；
+// ContextStrategy / TurnBudget 恒不挂（RunBtw ④ 注释里的刻意决定）。字段与原先逐字段写在
+// RunBtw 里完全一致，行为零变化。
+//
+// 锁：agentTreeForLocked 要求**调用方持 h.mu**（见 hub.go 的注释）；RunBtw 全程不持锁
+// （预埋钩子都在锁外触发），故 MultiAgent 分支开一个**最小锁段**——只护 agentTrees 的
+// 取/建这一件事，建完立即放锁。childStrategyFactory 只读不可变依赖、返回闭包，锁外调
+// （与 loopFor 持锁调等价；闭包按并发契约安全）。
+//
+// **树的生命周期**：本方法建出来的树登记在 h.agentTrees[forkSID]，但**只活到本次
+// RunBtw 收口**（RunBtw 的 defer 把它删掉——旁支是一次性执行线，用完即弃；详见
+// RunBtw 里 dropForkAgentTree 的注释）。
+func (h *Hub) forkLoopConfig(forkSID, forkAgent contracts.Ulid) loop.Config {
+	// v3-S6-B 缺口 6（对照 loopFor 的 agentsEnv 装配）：MultiAgent 开 → fork session **自己**
+	// 的 agent 树（root = forkAgent——fork 是自己 session 的主 agent）+ loop.Agents
+	// {Tree, Verifier: nil, ChildStrategy}——旁支因此可 spawn/complete（策略面另有 New
+	// 自动补的 allow）、子 agent 与 fork 主 agent 同 session（K25 单流多 agent）。
+	//
+	// 树是**进程内活状态、不持久化**，且**用完即弃**（RunBtw 收口即删——旁支不是长会话，
+	// 树不跨 Run 复用；主 session 的树照旧跨 Run 复用，见 hub.go 的 agentTrees 注释）。
+	var agentsEnv *loop.Agents
+	if h.cfg.MultiAgent {
+		h.mu.Lock()
+		tree := h.agentTreeForLocked(forkSID, forkAgent)
+		h.mu.Unlock()
+		agentsEnv = &loop.Agents{
+			Tree: tree,
+			// Verifier：summary refs 核验器（K24/Q7）。宿主暂无生产实现 → nil（与 loopFor 同）。
+			Verifier: nil,
+			// W6-A 子策略钩子：绑 fork session（子 agent 与 fork 主 agent 同 session，K25）。
+			ChildStrategy: h.childStrategyFactory(forkSID),
+		}
+	}
+	return loop.Config{
+		Provider:        h.provider,
+		Bus:             h.bus,
+		Registry:        h.reg,
+		Policy:          h.engine,
+		Approver:        h.approver,
+		SessionID:       forkSID,
+		AgentID:         forkAgent,
+		Model:           h.cfg.Model,
+		System:          h.cfg.System,
+		MaxTurns:        h.cfg.MaxTurns,
+		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位与主 session 同源（G14）
+		ContextBudget:   h.contextBudgetFor(h.cfg.ContextStrategy),
+		// 多 agent 环境（v3-S6-B 缺口 6；nil = 单 agent 模式默认）。见上面的 agentsEnv 装配。
+		Agents:        agentsEnv,
+		BlobSink:      h.blob,
+		BlobMaxInline: h.cfg.BlobMaxInline,
+		WalSink:       h.walFor(forkSID),
+		TelemetrySink: h.telemetrySink(),
+		// TurnBudget / ContextStrategy **故意不传**（nil = 不挂）：见 RunBtw ④ 的刻意决定。
+	}
+}
+
 // publishBtwForked 经 bus 落一条 btw.forked durable 事件（合法写路径；归 fork session）。
 func (h *Hub) publishBtwForked(ctx context.Context, forkSID, forkAgent, mainSID contracts.Ulid, question string) error {
 	raw, err := json.Marshal(contracts.BtwForkedPayload{
@@ -353,6 +428,28 @@ func (h *Hub) fireBtwPromoteHook(res BtwResult) {
 	if fn != nil {
 		fn(res)
 	}
+}
+
+// dropForkAgentTree 回收 fork session 的 agent 树（用完即弃）。
+//
+// **为什么必须删**：树登记在 h.agentTrees（进程内活状态），**永不回收** → 每跑一次
+// /btw 就泄漏一棵（节点 + summary + 类型快照都在里面）；长期跑的 hub 上这是无界增长。
+//
+// **为什么删得安全**：树是**活状态**（进程内、不持久化），fork session 也不是一等会话
+// （结果只回给用户、不回灌主上下文；presence/peers 面过滤掉它）。旁支跑完这一轮就结束
+// 了——树没有跨 Run 的复用价值（要接着跑再 /btw 一次，那时会重建）。
+//
+// **不影响主 session 的树**：本函数只删 forkSID 这一条；主 session 的树照旧跨 Run 复用
+// （workflow 激活/停用只失效 loop、不失效树，见 hub.go 的 agentTrees 注释）。
+//
+// 幂等：树不存在（MultiAgent 关 / 建树失败）时是 no-op。
+func (h *Hub) dropForkAgentTree(forkSID contracts.Ulid) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	delete(h.agentTrees, forkSID)
+	h.mu.Unlock()
 }
 
 // SetBtwPromoteHook 设置"从 /btw 生成全新 session"的预埋钩子（K29：只埋点不实现）。
