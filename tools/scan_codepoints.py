@@ -76,7 +76,15 @@ def baseline_chars() -> set:
 def scan_text(path: str, text: str, known: set, findings: list) -> None:
     for lineno, line in enumerate(text.splitlines(), 1):
         for ch in line:
-            if ord(ch) < 0x80:
+            cp = ord(ch)
+            if cp < 0x80:
+                # ASCII 里的**控制字符**（NUL/裸控制符）是坏字节高发区（如反斜杠 x00 被当真
+                # NUL 写进文档）——tab 之外的可见控制字符一律报出来人工判。
+                if cp < 0x20 and ch != "	" or cp == 0x7F:
+                    findings.append((path, lineno, ch, hex(cp),
+                                     unicodedata.name(ch, "ASCII-CONTROL"),
+                                     "ASCII 控制字符混进文本（疑似坏转义）",
+                                     line.strip()[:120]))
                 continue
             reasons = []
             if not in_white_list(ch):

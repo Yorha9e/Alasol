@@ -52,7 +52,12 @@ package blobfs
 //
 // 中途出错 → 返回**已累计**的报告 + error（部分完成如实报，不假装跑完了）。
 // DryRun：一个不删，但 Removed* / FreedBytes 照实算（"会删什么"如实呈现）——
-// **DryRun 与真跑走同一套判据**（含锁内复核的等价版本），数字必须一致。
+// **DryRun 与真跑走同一套判据**（含锁内复核的等价版本），数字一致。
+//
+// **已知分叉（删失败场景，与 walfile GC 同款如实标注）**：DryRun 不真删 → **测不出
+// "删不掉"**；真跑删不掉的会计 **Skipped**（不计 Removed），而 DryRun 仍计 Removed。
+// 故"删不掉"发生的那一刻 dry.Removed 比真跑**多**（真跑把它记成 Skipped）——判据本身
+// 同源，分叉只来自"删除动作是否真的成功"这一执行事实。
 
 import (
 	"context"
@@ -279,7 +284,8 @@ func (s *Store) GC(ctx context.Context, opts GCOptions) (GCReport, error) {
 	//
 	// 年龄判据吃**快照**的目录 mtime（任何删除之前量的）；复核吃**内容证据**（不用目录
 	// mtime——扫 1 删 .tmp 会刷新所在目录的 mtime，用它判"在途写"会漏删孤儿，见
-	// orphanStillOrphan）。DryRun 与真跑走**同一套判据**（复核的等价版本），数字一致。
+	// orphanStillOrphan）。DryRun 与真跑走**同一套判据**（复核的等价版本）；删失败场景的
+	// 已知分叉见文件头（真跑 Skipped / dry Removed）。
 	for _, d := range dirs {
 		if err := ctx.Err(); err != nil {
 			return rep, err
