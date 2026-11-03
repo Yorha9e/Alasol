@@ -29,6 +29,8 @@ ALLOWED_SYMBOLS = set(
     #   愈 —— "自愈"（Writer 文件没了就重建；缺口 5 的 F2 口径）
     #   捏 —— "拿捏"（host/config.go 的 Retention 措辞）
     "愈捏"
+    # 流程图框线与分隔符（15 号文档的流程图 / 既有文档的行内分隔）：
+    "─│┌┐└┘├┤┬┴┼·"
 )
 
 RANGES = [
