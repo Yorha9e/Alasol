@@ -116,7 +116,7 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
   1. X1：intent→completed 跨长时间，但形状与落盘序不动；
   2. **resume/X4**：崩溃时 standby 中的工具是 in-flight——处置要能**重新挂起或如实收口**（不许当垃圾清掉协作状态）；
   3. WAL/reconcile：standby 不产生"在飞轮次"误报（它是工具不是轮次；核对账口径）。
-- **等待条件批次**：第一批 = `message` + `timeout`；`event`（等任意事件流条件）**第二批**（表达力强但解析面大）。
+- **等待条件批次**：第一批 = `message` + `timeout`（随 G-f 落）；`event`（等任意事件流条件）**第二批 = G-j**（表达力强但解析面大，单列缺口跟踪）。
 
 ## 5. 权限面（真缺口；安全语义开工前拍板）
 
@@ -135,6 +135,7 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
 | G-f | standby 工具（waiting 态 + message/timeout + 三交互点） | 2 |
 | G-e | config.tools 工具白名单修改 | 3 |
 | G-g | 权限面（config.policy）——开工前拍安全语义 | 3 |
+| G-j | standby 的 `event` 等待条件（等任意事件流条件的表达式与匹配） | 3（G-f 本体之后） |
 | G-h | 上下文面（context_strategy/注入区配置化） | 4 |
 | G-i | profile 机制（命名装配模板）+ 执行面（cwd/worktree/remote） | 4/后置 |
 
