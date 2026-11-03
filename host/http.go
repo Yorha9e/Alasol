@@ -37,7 +37,8 @@ var httpLog = slog.Default()
 //	GET /api/extensions          → [ExtensionView, ...]（扩展注册表全 kind 快照 + Health，只读；v4-5）
 //	POST /api/extensions/{name}/enable  → {"ok":true}（E3 能力裁决：200 / 403 缺能力 / 404 未注册 / 409 ErrStale）
 //	POST /api/extensions/{name}/disable → {"ok":true}（软停用幂等：200 / 404 未注册；停用即被 loop+MCP 两层门控拒）
-//	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12）
+//	GET /api/sessions            → [SessionRow, ...]（在线表，最多 MaxSessionRows 行；hostable 标"本进程可不可发 prompt"，G12；
+//	                               online/running/last_activity = G-a 在线三态，?online=true|false|1|0 过滤，缺省全库）
 //	POST /api/sessions           → {"session_id":…}（201；开新会话 = 本进程托管，不自动跑 prompt）
 //	GET /api/cost                → TokenTotalView（跨 session token 成本汇总，J21）
 //	GET /api/cost/{session_id}   → TokenCostView（单 session token 成本，按模型分组）
@@ -127,7 +128,7 @@ var httpLog = slog.Default()
 // 对话 / 审批（v3-S4，G1：兑现 transport 契约承诺的 command.submit / approval.*）：
 //
 //	POST /api/sessions                        → {"session_id":…}（201；开新会话的 REST 入口，v3-S5 ①）
-//	POST /api/sessions/{session_id}/prompt   → {"session_id":…,"status":"running"}（202；异步跑，结果经事件流）
+//	POST /api/sessions/{session_id}/prompt   → {"session_id":…,"status":"running"}（202；异步跑，结果经事件流。G-b 懒接管：未托管自动接管，Claim 冲突 409 host_conflict）
 //	POST /api/approvals/{request_id}/respond → {"request_id":…,"decision":…}（注入挂起的审批；无人应答 = deny，fail-close）
 //	GET  /api/approvals/pending              → [PendingApprovalView, ...]（G11：挂起审批枚举面；空表 → []）
 //
@@ -367,13 +368,45 @@ func (h *Hub) serveMonitor(w http.ResponseWriter, r *http.Request) {
 	writeJSONBody(w, http.StatusOK, m.View())
 }
 
-// serveSessions 服务 GET /api/sessions（在线表）。
+// serveSessions 服务 GET /api/sessions?online=（在线表）。
 //
 // 计数口径（A1）：在线表是 **agent session 面板**——hub 伪 session（hub.* 事件族）与
 // /btw 旁支 fork session **都不进表**。所以"事件流里有 N 条、表里 M 行"对不上是正常的
-// （表只列 agent session；伪 session 无 agent、旁支不是一等会话）。
+// （表只列 agent session；伪 session 无 agent、旁支不是一等会话）。fork 行在投影层
+// （projection.rows）已整族排除，本端点不再重复过滤。
+//
+// 查询参数（G-a 在线三态；**只增**，缺省行为与加参数前逐字节一致）：
+//
+//	online  可选。true|1 → 只留 online=true 的行（活跃：running ∨ 最后事件 ts 在活跃
+//	         窗口内）；false|0 → 只留 online=false 的行（托管但超窗 / 历史）；缺省 →
+//	         全库（不筛，历史表原样）。其它值 → 400 bad_online。
+//	         布尔解析口径与 /api/agentlink 的 subtree 参数同款（"1" || EqualFold "true"）。
+//	         **显式给了空值**（?online= 或 ?online）→ 同样 400 bad_online（P2-6）：
+//	         "给了参数但值非法"不该被当成"没给参数"（缺省才是全库）。
+//
+// 过滤发生在 Hub.Sessions **补列之后、截断之前**（P1-2）：online/running/last_activity
+// 先算好再筛（判定源是发现表，投影行只带值不判定），筛完才按 MaxSessionRows 截断——
+// 反过来（先截断再筛）会把排在上限外的在线 session 整段滤没。
 func (h *Hub) serveSessions(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.Sessions(r.Context())
+	// 先解析参数（非法值立刻 400，别白跑一轮扫描 + 索引器等待）。
+	raw := strings.TrimSpace(r.URL.Query().Get("online"))
+	_, has := r.URL.Query()["online"] // 显式给了没有？缺省与"给了空值"是两回事（P2-6）
+	var only *bool
+	switch {
+	case !has: // 缺省 = 全库（历史表），与加参数前的行为一致。
+	case raw == "1" || strings.EqualFold(raw, "true"):
+		v := true
+		only = &v
+	case raw == "0" || strings.EqualFold(raw, "false"):
+		v := false
+		only = &v
+	default:
+		writeJSONError(w, http.StatusBadRequest, "bad_online",
+			"online 只支持 true|false|1|0（得到 "+raw+"）")
+		return
+	}
+	// 过滤在补列之后、截断之前（见上）；口径与 Hub.Sessions 无过滤时逐字节等价。
+	rows, err := h.sessionsFiltered(r.Context(), only)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "sessions_failed", err.Error())
 		return
@@ -419,7 +452,7 @@ func (h *Hub) serveSessionCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	// 建 loop = 本进程托管（hostsSession 通过；不 Run，零 prompt、零模型调用）。
 	// 与 WS command.submit 新建路径最终汇到的 loopFor 同一处——同源同口径。
-	if _, err := h.loopFor(r.Context(), sid); err != nil {
+	if _, _, err := h.loopFor(r.Context(), sid); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "session_host_failed", err.Error())
 		return
 	}

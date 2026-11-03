@@ -18,42 +18,43 @@ import (
 
 // hubFlags 是 serve / chat 共有的装配参数（都走 host.Hub 这个唯一组合根）。
 type hubFlags struct {
-	dbPath            *string
-	addr              *string
-	model             *string
-	baseURL           *string
-	apiKeyEnv         *string
-	approval          *string
-	allow             *string
-	ask               *string
-	maxTurns          *int
-	contextBudget     *int64
-	system            *string
-	indexerBatch      *int
-	maxSessionRows    *int
-	cwd               *string
-	runID             *string
-	reasoningEffort   *string
-	onlineRows        *int
-	onlineLineTokens  *int
-	onlineLevel       *string
-	onlineWindow      *int
-	configPath        *string
-	monitorCPU        *float64
-	monitorMem        *float64
-	monitorGoroutines *int
-	monitorInterval   *int
-	contextStrategy   *string
-	contextWindow     *int64
-	contextL1Pct      *float64
-	contextL2Pct      *float64
-	graph             *bool
-	graphMaxNodes     *int
-	graphMaxEdges     *int
-	graphMaxDepth     *int
-	graphMaxResults   *int
-	graphCore         *string
-	graphEscalate     *int
+	dbPath               *string
+	addr                 *string
+	model                *string
+	baseURL              *string
+	apiKeyEnv            *string
+	approval             *string
+	allow                *string
+	ask                  *string
+	maxTurns             *int
+	contextBudget        *int64
+	system               *string
+	indexerBatch         *int
+	maxSessionRows       *int
+	cwd                  *string
+	runID                *string
+	reasoningEffort      *string
+	onlineRows           *int
+	onlineLineTokens     *int
+	onlineLevel          *string
+	onlineWindow         *int
+	onlineActivityWindow *string
+	configPath           *string
+	monitorCPU           *float64
+	monitorMem           *float64
+	monitorGoroutines    *int
+	monitorInterval      *int
+	contextStrategy      *string
+	contextWindow        *int64
+	contextL1Pct         *float64
+	contextL2Pct         *float64
+	graph                *bool
+	graphMaxNodes        *int
+	graphMaxEdges        *int
+	graphMaxDepth        *int
+	graphMaxResults      *int
+	graphCore            *string
+	graphEscalate        *int
 
 	// ---- v3-S4 协议面（G1/G3）----
 	// promptTimeout 是协议面发起的一轮对话的**整轮**上限（秒；0 = 框架默认 600）。
@@ -114,10 +115,12 @@ func registerHubFlags(fs *flag.FlagSet) *hubFlags {
 		reasoningEffort: fs.String("reasoning-effort", "",
 			"模型思维链强度档位（G14）：low|medium|high|xhigh（空=不传，端点用默认档）。"+
 				"经 provider 透传 reasoning_effort；思维链原文进 model.turn.reasoning / model.delta.reasoning"),
-		onlineRows:        fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
-		onlineLineTokens:  fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
-		onlineLevel:       fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
-		onlineWindow:      fs.Int("online-window", 0, "在线表 level=n 每行窗口行数（0=默认 5，K14）"),
+		onlineRows:       fs.Int("online-rows", 0, "在线表注入行数 N（0=默认 50，K15）"),
+		onlineLineTokens: fs.Int("online-line-tokens", 0, "在线表每行 summary 的 token 预算（0=默认 100，K15）"),
+		onlineLevel:      fs.String("online-level", "", "在线表暴露等级 summary|n|full（空=默认 summary，K14）"),
+		onlineWindow:     fs.Int("online-window", 0, "在线表 level=n 每行窗口行数（0=默认 5，K14）"),
+		onlineActivityWindow: fs.String("online-activity-window", "",
+			"活跃窗口 N（时长字符串如 15m；空=默认 15m，G-a：活跃 = running ∨ 最后事件 ts ≤ N，在线表注入与 peers 共用）"),
 		configPath:        fs.String("config", "", "用户级配置文件路径（TOML；空=平台默认位，H15：%APPDATA%\\alasol\\config.toml 或 XDG）"),
 		monitorCPU:        fs.Float64("monitor-cpu", 0, "hub CPU 监控阈值%（单核等价，可>100；0=默认，K9）"),
 		monitorMem:        fs.Float64("monitor-mem", 0, "hub 内存监控阈值 MB（0=默认，K9）"),

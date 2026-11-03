@@ -143,12 +143,10 @@ var ErrSessionNotFound = errors.New("acp: session 不存在")
 // # 诚实边界：历史**只回放给客户端** ≠「模型记住了」
 //
 // loader 的契约是"把折叠出的历史**交回客户端**"，它**不**保证下一轮 prompt 自带这段
-// 历史。模型侧能不能续上，取决于后端的 RunPrompt：**hub 的 RunPrompt 不带历史**
-// （hub 每一轮都不带历史——历史只存在于事件流里，靠 fold 重建，见 host/fork.go 的
-// "历史口径"）。故"load 之后模型接着此前的对话往下说"这件事**在本实现里不成立**：
-// 要让模型续跑，得走 **resume 式路径**（把 fold 出的历史灌回 loop 再跑一轮）——
-// 那是 hub 侧的能力，不是 ACP 端点能替代的（挂账：端点侧直连续跑需要给 Backend 加一条
-// "带历史跑一轮"的能力，超出本刀范围，不在本刀偷偷加）。
+// 历史。模型侧能不能续上，取决于后端的 RunPrompt：**hub 的 RunPrompt 现在每轮自己
+// fold 事件流带历史**（批次1 P1-3：多轮对话同源，见 host/fork.go 的"历史口径"）——
+// 故"load 之后模型接着此前的对话往下说"在 hub 后端**成立**（且**不依赖**客户端把历史
+// 再发回来）；本接口的价值是"把历史交回**客户端**"（让 UI 能重放/展示）。
 type sessionLoader interface {
 	// LoadSession 载入 sid 指向的既有会话，返回折叠出的对话历史（按 seq 升序 fold 的
 	// 结果；空会话返回空历史不报错——只要后端认得这个会话）。查无此会话 → ErrSessionNotFound。

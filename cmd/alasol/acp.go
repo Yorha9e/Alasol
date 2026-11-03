@@ -232,9 +232,10 @@ func (b *hubBackend) SubscribeEvents(sessionID contracts.Ulid) *bus.Subscription
 // # 诚实边界（模型侧不因此"记住"历史）
 //
 // 本方法只把历史**交回客户端**（端点据此以 session/update 回放）。下一轮 prompt 是否
-// 带这段历史由后端决定：**hub 的 RunPrompt 不带历史**（hub 每轮不带历史，历史只在
-// 事件流里）——要让模型续跑得走 resume 式路径（把 fold 出的历史灌回 loop），不在本刀
-// 范围（见 runtime/acp 的 sessionLoader 文档）。
+// 带这段历史由后端决定：**hub 的 RunPrompt 现在每轮自己 fold 事件流带历史**
+// （批次1 P1-3：多轮对话同源，与 fold / resume 同一套机制）——也就是说，模型侧的
+// 多轮上下文**不再**依赖本方法把历史交回客户端；本方法的价值是"把历史交回**客户端**"
+// （让 UI 能重放/展示），不是"让模型续跑"的唯一途径。
 func (b *hubBackend) LoadSession(ctx context.Context, sid contracts.Ulid) ([]core.Message, error) {
 	if b.store == nil {
 		// 没有回放面（读面没装配）→ 无从载入会话：按"查无此会话"回（不假装成功）。

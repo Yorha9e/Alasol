@@ -339,6 +339,9 @@ func resumeMain(args []string) int {
 		fmt.Fprintln(os.Stderr, "回放事件流失败:", err)
 		return 1
 	}
+	// 口径：**整场全景**（有意，不按 agent 视角过滤——见本函数的文档段"续跑折叠的是整场
+	// session 的对话"）。三种口径别混：resume = 整场全景、fork = 主对话（现状）、
+	// 主轮次 = 主 agent 视角（host.foldSessionHistory 按主 agent id 预过滤，F1）。
 	history := runtime.FoldConversation(events)
 	fmt.Fprintf(os.Stderr, "[resume] 续跑：已 fold 出 %d 条历史消息\n", len(history))
 	res, err := lp.RunWithHistory(ctx, history, *continuePrompt)

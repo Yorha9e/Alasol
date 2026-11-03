@@ -37,6 +37,11 @@ func TestOnlineTableSourceFiltersByGateAndExcludesSubagents(t *testing.T) {
 	defer st.Close()
 
 	disc := discovery.New()
+	// G-a（件 2）：otEv 夹具的 ts 写死 2026-10-28（已超默认 15m 活跃窗）——在线表对端
+	// 是按**活跃**（running ∨ 窗口内，core/discovery.visiblePeersLocked）过滤的，不放大
+	// 窗口对端会被判超窗滤掉（既有"gate 相交即可见"的断言就红）。远窗口夹具见
+	// sessions_online_test.go 的 farWindow（与 core 侧同款修法）。
+	disc.SetActivityWindow(farWindow)
 	feed := newDiscoveryFeed(st, disc)
 	src := &discoveryOnlineSource{table: disc, feed: feed}
 
@@ -89,9 +94,15 @@ func TestOnlineTableSourceFiltersByGateAndExcludesSubagents(t *testing.T) {
 	}
 
 	// C 结束后（deactivate）不影响 a（C 本就不可见）；b 结束后 a 只剩自己。
+	//
+	// G-a（件 2）：Deactivate 只撤"托管"（live），活跃判定看 running ∨ 窗口——上面把
+	// 窗口放大到 farWindow 后，b 单靠 deactivate 退不出在线表。按 core 侧同款修法
+	//（TestVisiblePeersHorizontalOnly）：窗口收到极小让全体落出活跃面；self 行恒在
+	//（OnlineRows 口径：self 不做活跃过滤），故 a 只剩自己。
 	disc.Deactivate(b)
+	disc.SetActivityWindow(nearWindow)
 	rows = src.OnlineRows(context.Background(), a)
 	if len(rows) != 1 || !rows[0].Self {
-		t.Fatalf("b 结束后 a 的在线表应只剩自己: %+v", rows)
+		t.Fatalf("b 落出活跃后 a 的在线表应只剩自己: %+v", rows)
 	}
 }

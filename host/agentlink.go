@@ -271,6 +271,13 @@ func (h *Hub) serveAgentlinkPresence(w http.ResponseWriter, r *http.Request) {
 //
 // session_id 是**调用方**（查询者）的 session（必须受本 hub 托管）：没有调用方身份就
 // 没有可见性过滤——任意客户端不得枚举任意 gate 的成员或任意 session 的 agent 树（F4）。
+//
+// # 跨 session 查 agent 时"不可见"的形状（G-a + P2-3）
+//
+//	**不活跃（超窗）的对端视同不可见** → 403 not_visible（与"本来就不可见"同形状）。
+//	为什么不是 200 空结果：G-a 之前"对端不可见"回的就是 403——不活跃不该换成一个
+//	更松的形状，否则客户端没法用同一个错误分支处理"这个对端我看不到"。
+//	（gate 查询面不同：那里的对端是**被过滤掉**（不进列表），self 行照列。）
 func (h *Hub) serveAgentlinkDiscover(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	caller, err := parseSessionID(q.Get("session_id"))

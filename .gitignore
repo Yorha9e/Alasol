@@ -7,3 +7,6 @@ tools/ts-consumer/.npmrc
 # build output
 dist/
 *.exe
+
+# tool-local config (kimi-code 的本地配置目录——机器本地，不入库)
+.kimi-code/

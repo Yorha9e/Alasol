@@ -78,6 +78,13 @@ func (l *Link) Presence(caller Identity, sessionID contracts.Ulid) (PresenceRepo
 			rep.Self = sessionPresenceOf(row, l.table.IsLive(sessionID))
 		}
 		for _, p := range l.table.VisiblePeers(sessionID) {
+			// G-a：对端按 **session 粒度**过滤——只保留 SessionActive 为真的行
+			//（活跃 = running ∨ 最后事件 ts 在窗口内，判定源是事件流、跨容器一致）。
+			// VisiblePeers 已是同一判定，这里是同口径双保险（Live 字段如实回报判定结果）。
+			active := l.table.SessionActive(contracts.Ulid(p.SessionID))
+			if !active {
+				continue
+			}
 			rep.Peers = append(rep.Peers, PeerPresence{
 				SessionID:   p.SessionID,
 				MainAgentID: p.MainAgentID,
@@ -85,7 +92,7 @@ func (l *Link) Presence(caller Identity, sessionID contracts.Ulid) (PresenceRepo
 				LastKind:    p.LastKind,
 				LastSeq:     p.LastSeq,
 				UpdatedAt:   p.UpdatedAt,
-				Live:        true, // VisiblePeers 只回存活对端（K12/G17b：成员关系是活的）
+				Live:        active, // 能进列表恒真（字段保留兼容）；G-a：进面 = 活跃
 			})
 		}
 		return rep, nil
@@ -105,7 +112,8 @@ func (l *Link) Presence(caller Identity, sessionID contracts.Ulid) (PresenceRepo
 	return rep, nil
 }
 
-// visiblePeerOf 取调用方的水平可见对端行（gate 相交 ∩ 存活；调用方必须是主 agent）。
+// visiblePeerOf 取调用方的水平可见对端行（gate 相交 ∩ 活跃——G-a：SessionActive，
+// 调用方必须是主 agent）。
 func (l *Link) visiblePeerOf(caller Identity, target contracts.Ulid) (discovery.PeerRow, bool) {
 	if l == nil || l.table == nil {
 		return discovery.PeerRow{}, false
@@ -156,10 +164,12 @@ func (l *Link) gateMemberPresence(caller Identity, r discovery.SessionRow) Sessi
 	})
 }
 
-// Online 返回**本进程存活**的 session 画像（K18 Presence 的"谁在线"）。
+// Online 返回**本进程存活且活跃**的 session 画像（K18 Presence 的"谁在线"）。
 //
-// 口径同 discovery.LiveSessions（G17b：活状态进程本地，无租约无心跳；崩溃重启后老成员
-// 全部失活，要由宿主重新激活）。不含对端交集信息——那是 Presence(sessionID) 的事。
+// 口径 = discovery.LiveSessions（G17b：托管，活状态进程本地）**∩ SessionActive**
+// （G-a：活跃 = running ∨ 最后事件 ts 在窗口内）——托管但超窗的历史 session 不列
+// （在线表三态：活跃 / 托管 / 历史，本清单给"托管且活跃"的那部分）。不含对端交集信息
+// ——那是 Presence(sessionID) 的事。
 func (l *Link) Online() []SessionPresence {
 	if l == nil || l.table == nil {
 		return []SessionPresence{}
@@ -167,6 +177,9 @@ func (l *Link) Online() []SessionPresence {
 	rows := l.table.LiveSessions()
 	out := make([]SessionPresence, 0, len(rows))
 	for _, r := range rows {
+		if !l.table.SessionActive(contracts.Ulid(r.SessionID)) {
+			continue // G-a：同口径过滤——托管但超窗的不进在线清单
+		}
 		out = append(out, sessionPresenceOf(r, true))
 	}
 	return out
@@ -233,13 +246,16 @@ type DiscoverResult struct {
 
 // Discover 按 gate / 按 agent 树查找（K18 Discover）。
 //
-//	gate 查询  → Sessions = 该 gate 的活跃成员（发现表 GateMembers，已叠 live 过滤）；
+//	gate 查询  → Sessions = 该 gate 的活跃成员（发现表 GateMembers，已叠 live 过滤，
+//	             再叠 G-a 活跃过滤：托管但超窗的历史 session 不列，self 行除外）；
 //	             **调用方必须与该 gate 相交**（否则 ErrNotVisible：不能枚举没加入的 gate）；
 //	             Agents 恒空（K11①：水平可见性的粒度是 session 主 agent，不列对端 agent）；
 //	agent 查询 → 同 session：Sessions = 该 agent 所在的 session（一行），
 //	             Agents = 该 agent（Subtree=false）或以它为根的子树（Subtree=true）；
 //	             跨 session：**只有可见对端的主 agent**能查，且只回它一行（不给子树、
 //	             不给对端 agent 树规模）——别 session 的 subagent 完全不可见（K11）。
+//	             **不活跃（超窗）的对端视同不可见**（G-a + P2-3）：回 ErrNotVisible，
+//	             与"不可见"同形状（不是 200 空结果）。
 //
 // 未知 gate / 未知 agent 不是错误：返回空结果（"查不到"是合法答案，只有查询条件本身
 // 不合法才是 ErrBadQuery）。
@@ -269,7 +285,13 @@ func (l *Link) Discover(q DiscoverQuery) (DiscoverResult, error) {
 		for _, r := range l.table.GateMembers(id) {
 			if contracts.Ulid(r.SessionID) == q.Caller.SessionID {
 				// 自己：完整画像（自己的 gate 列表与 agent 树规模不是泄漏面）。
+				// self 行不动（G-a 过滤只针对对端）。
 				res.Sessions = append(res.Sessions, sessionPresenceOf(r, true))
+				continue
+			}
+			// G-a：对端按 **session 粒度**过滤——只保留 SessionActive 为真的行
+			//（GateMembers 只滤 live/托管；托管但超窗的历史 session 不进在线面）。
+			if !l.table.SessionActive(contracts.Ulid(r.SessionID)) {
 				continue
 			}
 			// 对端：**对端视角**（#3）——只给与调用方相交的 gate，不泄漏对端的全部 gate
@@ -285,7 +307,7 @@ func (l *Link) Discover(q DiscoverQuery) (DiscoverResult, error) {
 		}
 		sid := contracts.Ulid(row.SessionID)
 		if sid == q.Caller.SessionID {
-			// 自己树内：完整投影（session 行 + agent 行 / 子树）。
+			// 自己树内：完整投影（session 行 + agent 行 / 子树）。self 行不动。
 			if srow, ok := l.table.Session(sid); ok {
 				res.Sessions = append(res.Sessions, sessionPresenceOf(srow, l.table.IsLive(sid)))
 			}
@@ -295,6 +317,16 @@ func (l *Link) Discover(q DiscoverQuery) (DiscoverResult, error) {
 				res.Agents = []AgentPresence{agentPresenceOf(row)}
 			}
 			return res, nil
+		}
+		// G-a：agent 行**跟随其所属 session**——session 粒度过滤：**不活跃（超窗）的
+		// 对端视同"不可见"**，与下面的 ErrNotVisible **同形状**（P2-3）。
+		//
+		// 为什么不是"空结果"：G-a 之前，"对端不可见"回的就是 ErrNotVisible（403）——
+		// 不活跃不该换成一个更松的形状（200 + 空），那会让"看不见"与"不在线"在协议面
+		// 变成两种语义（客户端没法用同一个错误分支处理"这个对端我看不到"）。
+		if !l.table.SessionActive(sid) {
+			return res, fmt.Errorf("%w: agent %s 属于 session %s，该 session 当前不活跃（超窗），不在调用方的可见面里（只允许可见对端的**主 agent**，K11）",
+				ErrNotVisible, q.AgentID, sid)
 		}
 		// 跨 session：只有可见对端的**主 agent**能查（K11① + 别 session 的 subagent
 		// 完全不可见）。只回它一行——不给它的子树、不给对端 agent 树规模。

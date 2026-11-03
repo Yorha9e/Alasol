@@ -70,12 +70,16 @@ func TestPresenceReportsSelfPeersAndLiveness(t *testing.T) {
 	if online = w.link.Online(); len(online) != 2 {
 		t.Fatalf("B 结束后在线 session = %d，want 2", len(online))
 	}
+	// G-a（在线三态）：Deactivate 只撤"托管"（live），活跃判定看 running ∨ 窗口——B 的
+	// 事件还新鲜，默认窗内仍活跃、仍进对端可见面。把窗口收到极小（全体超窗）→ 对端
+	// 不可见（self 行不动）。活跃维的正例 / running 短路见 online_window_test.go。
+	w.table.SetActivityWindow(nearWindow)
 	rep, err = w.link.Presence(self, w.sidA)
 	if err != nil {
 		t.Fatalf("Presence#2: %v", err)
 	}
 	if len(rep.Peers) != 0 {
-		t.Fatalf("B 结束后 A 的水平对端应为空（成员关系是活的），得到 %+v", rep.Peers)
+		t.Fatalf("超窗后 A 的水平对端应为空，得到 %+v", rep.Peers)
 	}
 	if _, ok := w.table.Session(w.sidB); !ok {
 		t.Fatalf("B 结束后仍应在发现表里（历史可审计）")

@@ -43,12 +43,14 @@ import (
 // 只是这些事件的 session_id/agent_id = fork 的 id，**不属于主 session 的对话历史**——
 // 写路径形状一字不动，归属可辨（独立 session）。
 //
-// # 历史口径：主轮次不带历史，/btw 带历史（且有上限）
+// # 历史口径：主轮次**每轮 fold 事件流带历史**（批次1 P1-3），/btw 带历史（且有上限）
 //
-// 主 session 的**每一轮**（RunPrompt → loop.Run）都是**不带历史**的——历史只存在于
-// 事件流里（靠 fold 重建），只在两处被"带回去"：resume 续跑、/btw 旁支。于是
-// /btw 旁支天然"比主会话记得多"：这正是它的用途（K29：旁支带上下文回答问题），
-// 但也意味着旁支带的可能是**原文**（主 session 早压缩过的上下文与之已经不一致），
+// 主 session 的**每一轮**（RunPrompt → RunWithHistory）都带**折叠出的历史**
+// （事件流 → FoldConversation，与 resume 续跑同源）——历史不再只躺在事件流里。
+// /btw 旁支折的是**同一份**历史（同源），差别只在旁支是独立 session、结果不回灌主
+// 上下文，且旁支那次请求**有界**（主轮次的历史上限归上下文面 G-h）。
+//
+// 旁支带的可能是**原文**（主 session 早压缩过的上下文与之已经不一致），
 // 一次长对话就能把整个历史塞进一次模型请求。故：
 //
 //  1. 折叠历史有**条数 + 字符数**上限（maxForkHistoryMessages / maxForkHistoryChars）；
@@ -140,10 +142,12 @@ func ParseBtwCommand(line string) (question string, isBtw bool) {
 
 // fork 折叠历史的**上限**（F7：旁支比主会话记得多，得有界）。
 //
-// 为什么要有界：主 session 的下一轮**不带**历史（历史只在事件流里），而 /btw 旁支把
-// 折叠出的历史整段带进模型请求——不设上限时，一次长对话就能把整个历史塞进一次请求
-// （token 与费用双爆），而且旁支带的是**原文**（主 session 早压缩过的上下文与之
-// 已经不一致）。
+// 为什么要有界：/btw 旁支把折叠出的历史整段带进**一次**模型请求——不设上限时，一次
+// 长对话就能把整个历史塞进一次请求（token 与费用双爆），而且旁支带的是**原文**
+// （主 session 早压缩过的上下文与之已经不一致）。
+//
+// （主轮次现在也每轮带历史了——批次1 P1-3——但主轮次的历史**没有上限**：上下文面
+// 归 G-h。旁支这条一次性请求的边界由这里兜着。）
 //
 // 两个上限各管一件事：条数管"轮次太多"，字符数管"单条太长"（一条超长工具结果就能
 // 顶掉整个额度）。
@@ -216,6 +220,11 @@ func (h *Hub) RunBtw(ctx context.Context, mainSessionID contracts.Ulid, question
 	// ① 上下文来源：主 session 的对话历史（事件流 → fold，与 resume 续跑同源）。
 	//    FoldConversation 只取 user.prompt/model.turn/tool.call.*——**天然不含** ledger/gate，
 	//    所以"不带 ledger/gate"在折叠这一步就成立（主 session 即便有账本/门禁也不进旁支）。
+	//
+	//    **口径：主对话**（现状，不改）——折**整场** session 的事件，不按 agent 视角过滤。
+	//    三种口径别混：resume = 整场全景（有意）、fork = 主对话（现状）、
+	//    **主轮次 = 主 agent 视角**（host.foldSessionHistory 按主 agent id 预过滤，F1）。
+	//    旁支是"问一句就答"的执行线，带整场是为了"它知道主会话聊过什么"。
 	events, err := runtime.ReplaySession(ctx, h.store, mainSessionID)
 	if err != nil {
 		return BtwResult{}, fmt.Errorf("host: /btw 回放主 session %s 失败: %w", mainSessionID, err)

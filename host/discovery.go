@@ -499,6 +499,17 @@ type GateView struct {
 // sessionID 为空 = 纯枚举（存在性 + 计数）。sessionID 非空但**不受本 hub 托管** → 不报错：
 // 枚举面是**读面**，不承担写面的托管校验（join/leave 才要求托管，见 ErrSessionNotHosted）。
 //
+// # 与 discover/presence 的口径**有意不同**（P2-2：别读成"漏过滤"）
+//
+//	gates 面          = **成员关系面**：谁在这个 gate 里、成员数、成员详情——按"托管
+//	                    (live)"口径（成员关系是活的，G17b），**不按 G-a 的活跃窗口过滤**。
+//	discover/presence = **活跃可见面**（K11 + G-a）：只列**活跃**对端（running ∨ 最后
+//	                    事件 ts 在活跃窗口内），托管但超窗的历史 session 不进在线面。
+//
+// 有意不同：gates 面答"成员关系是什么"（管理/审计视角），discover/presence 答"现在谁
+// 在线"（在线视角）。把两者并成一口径，会让"托管但超窗"的 session 从成员面消失——那是
+// 另一刀（口径统一）的取舍；本刀**保持现状**，只把差异写明。
+//
 // ⚠ **别把它读成"Joined 恒 false"**：发现表折的是**事件流**（共享库口径——同一事件库里
 // 可能还有别的进程写的 gate.joined/gate.left），不是"本进程托管的 session 名单"。所以一个
 // 不受本 hub 托管的 session **仍可能在网内**（Joined=true）：它可能是同库另一个进程

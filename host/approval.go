@@ -14,6 +14,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/discovery"
 	"github.com/Yorha9e/alasol/runtime/transport"
 )
 
@@ -38,17 +39,19 @@ import (
 // 的仍可能送达——客户端按 request_id 去重/幂等呈现；对已决 request_id 再应答，
 // 服务端回 404 no_pending_approval（不假成功）。
 //
-// # 托管口径（G2）：对话发起只对**本进程托管**的 session 有效
+// # 托管口径（G2 + G-b 懒接管）：对话发起以**本进程托管**为默认，未托管则懒接管
 //
 // 一个 session 的事件只由它的宿主进程 append（**G25 session 亲和写**：跨进程多写者会让
-// 全局 seq = 提交序 ≠ 因果序）。协议面若对**别的进程**托管的 session 起 prompt，就会在
-// 本进程**就地新建一个 loop**（host/hub.go 的 loopFor）→ 两个进程往同一个 session/agent
-// 写事件 → G25 破。所以：
+// 全局 seq = 提交序 ≠ 因果序）。协议面对**未托管**的 session 起 prompt，此前直接 404；
+// G-b 改为**懒接管**（host/takeover.go 的 ensureHosted）：先 Claim 再建 loop——原宿主
+// 失管（重启/崩溃）→ 接管成功照常跑 + hub.alert 留痕；另一活宿主持有 → Claim 冲突拒
+// （**唯一拒绝线**，G25 防双写）。所以：
 //
-//   - HTTP POST /api/sessions/{id}/prompt：session 必须由本进程托管（hostsSession），
-//     否则 404 unknown_session（与 /api/peers、/api/gates/join、/api/agentlink/* 同口径）；
+//   - HTTP POST /api/sessions/{id}/prompt：已托管 → 照常；未托管 → 懒接管（202 + 留痕）；
+//     Claim 冲突 → 409 host_conflict；接管技术故障 → 500 takeover_failed；
 //   - WS command.submit：**不带** session_id → 服务端新建一个 session（本进程即宿主）；
-//     **带** session_id → 同样要求本进程托管，否则回 kind=error（不受理、不假受理）。
+//     **带** session_id → 同一口径同一行为（同一个 ensureHosted：懒接管 / 冲突回
+//     kind=error，错误码 host_conflict 与 HTTP 409 一致，不假受理）。
 //   - HTTP POST /api/sessions（v3-S5 ①）：开新会话的 REST 入口——CreateSession 登记
 //     归属 + 本进程建 loop（托管），返回 session_id、**不自动跑 prompt**；与 command.submit
 //     不带 session_id 的新建路径**同源同口径**（同落 loopFor，本进程即宿主）。
@@ -400,6 +403,19 @@ func (h *Hub) runPromptAsync(sid contracts.Ulid, prompt string) {
 	hubLog.Info("host: 协议面 prompt 跑完", "session_id", string(sid), "turns", res.Turns)
 }
 
+// hubClosedForPrompt 报告 hub 是否已进入关闭（与 startPromptAsync **同一判据**：
+// h.mu 下读 h.closed）。
+//
+// 为什么 G-b 要把它前置到懒接管之前：已关闭时先接管会给一个本轮不会跑的 session
+// 建 loop + 落一条 hub.alert 留痕（留痕说"接管了"，实际马上 503 收场——无害但脏，
+// 复盘时会读出一次没发生过的接管）。前置只是**提前**拒绝；startPromptAsync 自己的
+// closed 检查照样保留（WaitGroup Add 与 Close 的并发串行靠它，不能被前置替代）。
+func (h *Hub) hubClosedForPrompt() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.closed
+}
+
 // startPromptAsync 登记并异步跑一轮协议面 prompt（HTTP / WS 两个面的共同入口）。
 //
 // 返回 false = hub 已关闭（不再受理新的协议面 prompt；调用方按 503/错误回）。
@@ -430,15 +446,20 @@ func (h *Hub) startPromptAsync(sid contracts.Ulid, prompt string) bool {
 // servePrompt 服务 POST /api/sessions/{session_id}/prompt（G1 对话发起）。
 //
 //	请求体：{"prompt":"…"}（空 = 400）
-//	202 → {"session_id":…,"status":"running"}（**异步**：受理即返回，结果经事件流回流）
+//	202 → {"session_id":…,"status":"running"}（**异步**：受理即返回，结果经事件流回流；
+//	      含 G-b 懒接管成功后的受理——接管本身同步完成，留痕已落库）
 //	400 → session_id 非法 / 体坏 / prompt 空
-//	404 → 该 session **不由本进程托管**（unknown_session；G2 口径 + G25 session 亲和写：
-//	      对别的进程托管的 session 起 prompt = 本进程就地新建 loop 双写同一 agent）
+//	409 → Claim 冲突（host_conflict；**唯一拒绝线**）：该 session 正由另一个 hub 托管，
+//	      拒绝接管（G25：一个 session 的事件只由其宿主进程 append）
+//	500 → 懒接管失败（takeover_failed）：loopFor 建 loop/装配等技术故障，err 文本带细节
+//	503 → hub 已关闭（hub_closed，不再受理）
 //
-// 托管口径（P2-2）：本端点是**托管型写面**，与 /api/peers、/api/gates/join、
-// /api/agentlink/* 同口径——只对**本进程托管**的 session 生效。协议面**开新会话**走
-// WS command.submit（不带 session_id → 服务端新建，本进程即宿主）或 POST /api/sessions
-// （v3-S5 ① REST 入口，同源同口径）。
+// 托管口径（P2-2 + G-b 懒接管，见 host/takeover.go）：本端点仍是**托管型写面**，但
+// 未托管不再 404——先过 ensureHosted（已托管 → 照常；未托管 → loopFor 懒接管：Claim
+// 成功 → 跑 + hub.alert 留痕，Claim 冲突 → 409 拒）。托管口径与 /api/peers、
+// /api/gates/join、/api/agentlink/* 仍同源（那些**读面**对野 session 照旧 404）。
+// 协议面**开新会话**走 WS command.submit（不带 session_id → 服务端新建，本进程即宿主）
+// 或 POST /api/sessions（v3-S5 ① REST 入口，同源同口径）。
 func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("session_id"))
 	if err != nil {
@@ -456,18 +477,33 @@ func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "empty_prompt", "prompt 不能为空（空 prompt 等于浪费一次模型调用）")
 		return
 	}
-	// 托管校验（G2 口径）：别的进程托管的 session 不在这儿跑——那会让两个进程往同一个
-	// session/agent 写事件（G25 破）。404 与 peers/gates/agentlink 同口径（unknown_session）。
-	// 文案带指引（G12）：一库一 hub 是预期拓扑，读面看得见但发不了 prompt 的 session
-	// 要"开新会话"继续，不是"修一修这个 id"。
-	if !h.hostsSession(sid) {
-		writeJSONError(w, http.StatusNotFound, "unknown_session",
-			fmt.Sprintf("session %s 不是本 hub 托管的 session（一库一 hub 是预期拓扑："+
-				"它由别的进程建/已被本进程重启失管；请 POST /api/sessions 开新会话继续）", sid))
+	// hub 已关闭 → 前置拒绝（在懒接管之前：别为一个不会跑的 session 建 loop + 留痕）。
+	// startPromptAsync 里的 closed 检查照样保留（Add/Close 并发串行靠它）。
+	if h.hubClosedForPrompt() {
+		writeJSONError(w, http.StatusServiceUnavailable, "hub_closed", "hub 正在关闭，不受理新的协议面 prompt")
+		return
+	}
+	// 托管门（G-b 懒接管）：已托管 → 照常（不留痕）；未托管 → loopFor 懒接管。
+	// Claim 冲突是**唯一**拒绝线（G25 防双写：一个 session 的事件只由其宿主进程 append）；
+	// 文案带指引（G12）：一库一 hub 是预期拓扑，冲突不是"修一修这个 id"，是换地方继续。
+	//
+	// ⚠ **窗口**（P2-5，现状接受，不修）：上面的 closed 检查与这里的 ensureHosted 之间
+	// 有一个竞态窗口——hub 在这两步之间关掉的话，接管**已经发生**（loop 建了、留痕落了），
+	// 但下面 startPromptAsync 会因 closed 拒收 → 503。于是"接管留痕"可能落在一个
+	// **没跑成**的 prompt 上。这是**有意接受**的：留痕的语义是"**接管**了"（托管权易主
+	// 这一事实），**不是**"这一轮受理了"——复盘时别把留痕读成"这一轮跑过"。
+	// （真要消掉这个窗口，得把"接管"与"受理"合成一步原子操作——那是另一刀的取舍。）
+	if err := h.ensureHosted(r.Context(), sid); err != nil {
+		if errors.Is(err, discovery.ErrHostConflict) {
+			writeJSONError(w, http.StatusConflict, "host_conflict", takeoverConflictText(sid, err))
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "takeover_failed",
+			fmt.Sprintf("懒接管 session %s 失败（G-b）: %v", sid, err))
 		return
 	}
 	if !h.startPromptAsync(sid, body.Prompt) {
-		// hub 已关闭（正在收尾）：不受理（受理了也不会真跑）。
+		// hub 在上面两步之间刚关（并发 Close）：不受理（受理了也不会真跑）。
 		writeJSONError(w, http.StatusServiceUnavailable, "hub_closed", "hub 正在关闭，不受理新的协议面 prompt")
 		return
 	}
@@ -561,11 +597,14 @@ var _ transport.InboundHandler = (*Hub)(nil)
 // 口径与 HTTP 面**同源**（G2/P3-3/P3-4）：
 //
 //   - command.submit：session_id 必须是合法 ULID（非法 → kind=error，**不假受理**）；
-//     显式给了 session_id → 还要本进程托管（否则 kind=error）；没给 → 服务端新建
-//     （本进程即宿主，这是协议面开新会话的入口）。
+//     显式给了 session_id → 与 HTTP prompt 面**同一个** ensureHosted（G-b 懒接管）：
+//     已托管 → 照常；未托管 → loopFor 懒接管（成功 → command.accepted + hub.alert 留痕）；
+//     Claim 冲突 → kind=error（错误帧 code=host_conflict，与 HTTP 409 同码同文案——
+//     **唯一拒绝线**，G25 防双写）；接管技术故障 → kind=error（错误经 transport 回帧）。
+//     没给 → 服务端新建（本进程即宿主，这是协议面开新会话的入口）。
 //   - approval.respond：decision 必须是 allow|deny（非法 → kind=error，且**不消费**
 //     挂起的审批——乱批不该吃掉等着人审的那一条）；没有挂起的审批 → kind=error。
-func (h *Hub) HandleInbound(_ context.Context, m contracts.TransportMessage) (*contracts.TransportMessage, error) {
+func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (*contracts.TransportMessage, error) {
 	switch m.Kind {
 	case transport.KindCommandSubmit:
 		var cs contracts.CommandSubmit
@@ -596,13 +635,35 @@ func (h *Hub) HandleInbound(_ context.Context, m contracts.TransportMessage) (*c
 		default:
 			sid = NewSession()
 		}
-		if explicit && !h.hostsSession(sid) {
-			// 托管校验（与 HTTP prompt 面同口径）：别的进程托管的 session 不在这儿跑
-			// （那会让两个进程往同一个 session/agent 写事件 → G25 破）。文案带指引
-			// （G12）：一库一 hub 是预期拓扑，要继续就开新会话，不是修这个 id。
-			return nil, fmt.Errorf(
-				"session %s 不是本 hub 托管的 session（一库一 hub 是预期拓扑：它由别的进程建/"+
-					"已被本进程重启失管）；要开新会话就别带 session_id（服务端新建）或 POST /api/sessions", sid)
+		if explicit {
+			// hub 已关闭 → 前置拒绝（与 HTTP 面同款：别为一个不会跑的 session 建 loop
+			// + 落 hub.alert 留痕）。startPromptAsync 自己的 closed 检查照样保留。
+			if h.hubClosedForPrompt() {
+				return nil, errors.New("hub 正在关闭，不受理新的协议面 prompt")
+			}
+			// 托管门（G-b 懒接管）：与 HTTP prompt 面**同一个** ensureHosted——已托管 →
+			// 照常（不留痕）；未托管 → loopFor 懒接管（成功 → hub.alert 留痕后照常受理）。
+			// Claim 冲突是**唯一**拒绝线（G25：一个 session 的事件只由其宿主进程 append）。
+			//
+			// ⚠ 同样的**窗口**（P2-5，现状接受）：closed 检查与这里之间 hub 若关掉，
+			// 接管留痕会落在一个**没跑成**的 prompt 上——留痕的语义是"接管了"，不是
+			// "这一轮受理了"（详见 servePrompt 的同款注释）。
+			if err := h.ensureHosted(ctx, sid); err != nil {
+				if errors.Is(err, discovery.ErrHostConflict) {
+					// 冲突按 WS 既有错误帧形状回（kind=error + TransportError，同源同码：
+					// code=host_conflict 与 HTTP 409 一致）。这里返回**消息**而不是 error，
+					// 是为了带上 host_conflict 码——transport 对 HandleInbound 返回的 error
+					// 统一回 bad_payload（既有风格），错误码会丢；帧形状本身不变，连接不关（D7）。
+					reply, merr := transport.NewErrorMessage(&m.ID, "host_conflict",
+						takeoverConflictText(sid, err))
+					if merr != nil {
+						return nil, merr
+					}
+					return &reply, nil
+				}
+				// 其余接管故障：按既有风格返回 error（transport 回 kind=error，bad_payload）。
+				return nil, fmt.Errorf("懒接管 session %s 失败（G-b）: %w", sid, err)
+			}
 		}
 		if !h.startPromptAsync(sid, cs.Prompt) {
 			// hub 已关闭（正在收尾）：不受理（受理了也不会真跑）。

@@ -161,6 +161,10 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		OnlineTableLineTokens: pickInt(*f.onlineLineTokens, fc.OnlineTable.LineTokens),
 		OnlineTableLevel:      firstNonEmptyStr(strings.TrimSpace(*f.onlineLevel), strings.TrimSpace(fc.OnlineTable.Level)),
 		OnlineTableWindow:     pickInt(*f.onlineWindow, fc.OnlineTable.Window),
+		// 活跃窗口 N（G-a）：显式 flag > 文件；空 = core.DefaultActivityWindow（15m）。
+		// 合法性由 host.Config.validate 收口（与 online-level 同款：搬运工不校验）。
+		OnlineTableActivityWindow: firstNonEmptyStr(
+			strings.TrimSpace(*f.onlineActivityWindow), strings.TrimSpace(fc.OnlineTable.ActivityWindow)),
 
 		// hub 监控阈值（K9）：显式 flag > env > 文件 > 框架默认（0=默认）。
 		MonitorCPUPercent:  pickFloat(*f.monitorCPU, envFloat("ALASOL_MONITOR_CPU_PERCENT"), fc.Monitor.CPUPercent),

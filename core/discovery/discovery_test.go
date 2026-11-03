@@ -292,6 +292,9 @@ func TestVisiblePeersHorizontalOnly(t *testing.T) {
 	subOfD := core.NewUlid()
 
 	tbl := New()
+	// G-a：mkEvent 夹具的 ts 写死在 2026-10-28（已超默认 15m 活跃窗）——显式放大窗口，
+	// 让"激活的对端可见"这组既有断言在活跃判定下继续成立（活跃 = running ∨ 窗口内）。
+	tbl.SetActivityWindow(farWindow)
 	applyAll(tbl,
 		// a：repo:X
 		mkEvent(t, "user.prompt", 1, a, ma, contracts.UserPromptPayload{Text: "a"}),
@@ -350,11 +353,16 @@ func TestVisiblePeersHorizontalOnly(t *testing.T) {
 			t.Fatal("自己不该出现在自己的对端里")
 		}
 	}
-	// 未激活的 session 不可见（成员关系是活的）。
+	// G-a（在线三态）：Deactivate 只撤"托管"（live），活跃判定看 running ∨ 窗口——
+	// 要让 d 退出对端可见面，得让它落出活跃（窗口收到极小，全体超窗）；b 本轮在跑
+	//（BeginRun 短路）→ 活跃，所以 a 的可见对端恰剩 b。
 	tbl.Deactivate(d)
+	tbl.SetActivityWindow(nearWindow)
+	tbl.BeginRun(b)
 	if got := tbl.VisiblePeers(a); len(got) != 1 || got[0].SessionID != string(b) {
-		t.Fatalf("d 结束后 a 的可见对端 = %+v", got)
+		t.Fatalf("d 落出活跃后 a 的可见对端 = %+v", got)
 	}
+	tbl.EndRun(b)
 	// 未知 session → 空（不是 nil，也不是 panic）。
 	if got := tbl.VisiblePeers(core.NewUlid()); len(got) != 0 {
 		t.Fatalf("未知 session 的可见对端应为空: %+v", got)
@@ -506,6 +514,10 @@ func TestResetAndReplayRebuilds(t *testing.T) {
 	if len(want.Sessions) != 2 || len(want.Agents) != 3 || len(want.Gates) != 1 || len(want.Joins) != 2 {
 		t.Fatalf("重建前快照形状不对: %+v", want)
 	}
+	// G-a：夹具 ts 写死在 2026-10-28（超默认 15m 活跃窗）——用 running 短路让重建前的
+	// 可见性断言成立。BeginRun 放在取快照**之后**：running 不进 Snapshot（进程本地），
+	// 崩溃前后两边都是 0 → 下面的 DeepEqual 比较不受影响。
+	before.BeginRun(b)
 	if len(before.VisiblePeers(a)) != 1 {
 		t.Fatal("重建前 a 该看得见 b")
 	}
@@ -533,11 +545,13 @@ func TestResetAndReplayRebuilds(t *testing.T) {
 	if len(after.JoinHistory()) != 2 {
 		t.Fatalf("重建后 join 历史丢了: %+v", after.JoinHistory())
 	}
-	// hub 重新激活 → 可见性恢复（resume 的路径）。
+	// hub 重新激活 → 恢复**托管**（resume 的路径）。G-a：托管 ≠ 活跃——对端可见面还
+	// 要 running ∨ 窗口内；夹具 ts 超默认窗，b 本轮在跑（BeginRun）即活跃 → 恢复可见。
 	after.Activate(a)
 	after.Activate(b)
+	after.BeginRun(b)
 	if peers := after.VisiblePeers(a); len(peers) != 1 || peers[0].SessionID != string(b) {
-		t.Fatalf("重新激活后该恢复可见: %+v", peers)
+		t.Fatalf("重新激活 + 本轮在跑后该恢复可见: %+v", peers)
 	}
 }
 

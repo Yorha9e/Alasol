@@ -25,6 +25,7 @@ import (
 	"github.com/Yorha9e/alasol/core/registry"
 	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/core/workflow"
+	"github.com/Yorha9e/alasol/runtime"
 	"github.com/Yorha9e/alasol/runtime/approver/terminal"
 	"github.com/Yorha9e/alasol/runtime/cap/local"
 	"github.com/Yorha9e/alasol/runtime/cap/remote"
@@ -189,7 +190,8 @@ type Hub struct {
 	specs map[contracts.Ulid]SessionSpec
 	// mainAgents：session → 主 agent id（loop 建成时登记；gate.joined 的 envelope 要用）。
 	mainAgents map[contracts.Ulid]contracts.Ulid
-	// autoGates：session → 自动 gate 是否已加入（**成功才记**，失败下次 Run 重试）。
+	// autoGates：session → 自动 gate 是否已加入（**成功才记**，失败下次 Run 重试——
+	// F2：重试是真的，loopFor 的**缓存命中路径**会补一次自愈 join，见 joinAutoGatesIfNeeded）。
 	autoGates map[contracts.Ulid]bool
 	// activeWorkflow：session → 激活的工作流能力包（W12：归属 session，不是 core 全局状态；
 	// v3-S3）。激活只把哲学文本拼进 system prompt（W3），不挂 = 该 session 无键 = 零行为变化。
@@ -655,6 +657,11 @@ func New(cfg Config) (*Hub, error) {
 		wal:               walStore,
 		tel:               telFile,
 	}
+	// G-a 活跃窗口单源同步（构造路径）：onlineTableConfig 的 activity_window 是唯一旋钮，
+	// 发现表的活跃判定（K11 peers / agentlink presence / GET /api/sessions）必须拿到同一个
+	// N——不同步的话，起动配置只影响在线表注入（K14/K15）一个面。运行期改配置走
+	// UpdateOnlineTable → 同一个 syncActivityWindow（两处一个方法，不给漂移留缝）。
+	h.syncActivityWindow()
 
 	// G1 协议审批器：恒建（廉价），Approval=="protocol" 时才成为 h.approver（否则保持
 	// cfg 指定的 terminal/deny-all/always-allow，不改既有默认）。HTTP/WS 的审批应答
@@ -845,6 +852,10 @@ func (h *Hub) waitPrompts(grace time.Duration) {
 // sessionID 为空 → 新建一个（返回的 Result 里拿不到新 id，调用方要 id 就用
 // NewSession() / CreateSession() 先取一个）。prompt 为空 → 拒绝（空 prompt 等于浪费一次
 // 模型调用）。sessionID 未登记归属 → 自动 gate 用 hub 级默认（Config.CWD / RunID）。
+//
+// **每轮带历史**（P1-3）：跑之前把本 session 的事件流 fold 成对话历史再喂给模型
+// （见 foldSessionHistory）——多轮对话同源，与 fork / resume 同一套机制。此前这里恒空
+// 历史（每轮失忆），协议面 / CLI chat / TUI / ACP 的多轮全断在同一处。
 func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt string) (loop.Result, error) {
 	if h == nil {
 		return loop.Result{}, errors.New("host: Hub 为 nil")
@@ -858,11 +869,25 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 	if berr := h.checkBudget(ctx, sessionID); berr != nil {
 		return loop.Result{}, berr
 	}
-	lp, err := h.loopFor(ctx, sessionID)
+	lp, _, err := h.loopFor(ctx, sessionID) // created 不用（留痕口径在 takeover.go 那边）
 	if err != nil {
 		return loop.Result{}, err
 	}
-	res, err := lp.Run(ctx, prompt)
+	// G-a 在线三态：**本轮在跑**标记（BeginRun/EndRun 配平，进程本地 running 计数）。
+	// 所有 prompt 路径（HTTP / WS / CLI）都过 RunPrompt，就这一处打点——放在 loopFor
+	// 成功之后：建 loop 失败 / 预算拒绝（checkBudget 在上面）都不算"在跑"。defer 保证
+	// 早退与 panic 也配平（EndRun 下限 0，重复调用无害）；running 短路让"刚起步还没落
+	// 事件"的轮次也算活跃（判定见 discovery.Table.SessionActive，四消费方同一处）。
+	h.disc.BeginRun(sessionID)
+	defer h.disc.EndRun(sessionID)
+	// P1-3：**每轮带历史**（多轮对话同源）——读本 session 的事件流 → FoldConversation 折成
+	// 对话历史 → RunWithHistory。fold 在 Run **之前**（本轮 prompt 还没进事件流，历史不含
+	// 本轮，不自含）。见 foldSessionHistory 的口径说明。
+	history, herr := h.foldSessionHistory(ctx, sessionID)
+	if herr != nil {
+		return loop.Result{}, herr
+	}
+	res, err := lp.RunWithHistory(ctx, history, prompt)
 	// W15：**Run 后**再查一次——本轮把累计推过了上限就告警（越界留痕；per-Run 层的
 	// 拒绝发生在**下一次** RunPrompt 入口；Run **内**的逐轮截断由 loop 的 TurnBudget
 	// 钩子负责，见 host/budget.go 的"两层检查"）。
@@ -910,27 +935,122 @@ func (h *Hub) RunPrompt(ctx context.Context, sessionID contracts.Ulid, prompt st
 	return res, err
 }
 
+// foldSessionHistory 折叠本 session 的对话历史（P1-3：每轮带历史，多轮对话同源）。
+//
+// 事件流是唯一事实源（F1）：user.prompt / model.turn / tool.call.* 折成
+// []core.Message（runtime.FoldConversation）——与 fork（host/fork.go 的 RunBtw）与
+// resume（cmd/alasol/resume.go）**同源同机制**。
+//
+// 为什么在 RunPrompt 里做（此前没有）：协议面 / CLI chat / TUI / ACP 的多轮对话**恒空
+// 历史**——lp.Run 就是 RunWithHistory(ctx, nil, prompt)，每轮都失忆。设计 §2 要求"每轮
+// 折叠事件流带历史（多轮对话同源）"，机制现成（FoldConversation + RunWithHistory）。
+//
+// 顺序：**在 lp.Run 之前**折——本轮 prompt 还没进事件流（user.prompt 是 Run 开始才落的
+// 旁路观测），折出来的历史不含本轮（不自含）。
+//
+// # 视角：**主 agent 视角**（F1）
+//
+// FoldConversation 的契约写着"调用方应按 agent_id 预过滤"——**本函数就是那个调用方**：
+// 一个 session 里可能混着**多个 agent** 的对话（MultiAgent 开时，子 agent 自己的
+// user.prompt / model.turn 也落在**同一个 session** 的事件流里，agent_id = 子 agent）。
+// 不过滤的话，子 agent 的产出会以 user/assistant 消息混进主 agent 的历史——主 agent
+// 下一轮会看到"没发生过的用户话"（子任务描述）与子 agent 的自述。
+//
+// 子 agent 的产出**本来就该经 spawn 工具回灌**：spawn 的 tool.call.completed 归**主
+// agent**（父 loop 发的意图与结果），里面带子 agent 的 summary——那才是主 agent 该看到
+// 的形态。所以过滤掉子 agent 自己的对话**不丢信息**。
+//
+// # 三种口径（别混）
+//
+//	resume（cmd/alasol/resume.go）= **整场全景**：不区分 agent 视角（有意：续跑是
+//	                               "把这场会话发生过的一切接上"）。
+//	fork（host/fork.go 的 RunBtw）  = **主对话**（现状：折整场）。
+//	主轮次（本函数）              = **主 agent 视角**（本刀：按主 agent id 预过滤）。
+//
+// # 不加截断上限（F4：设计如此）
+//
+// 主轮次历史**无上限**：默认 append 每轮带全量历史（token 随轮次线性涨、每轮 O(整场)
+// 回放）。要封顶请开 context-strategy=tiered（L1/L2 级联压缩），注入区配置化在 G-h。
+// fork 的 16 条 / 6000 字是**旁支专属**（一次性请求要有界），不套到主轮次。
+//
+// 回放失败 → 返回错误（fail-close，与 fork 同口径）：历史读不出来还照跑，等于悄悄把
+// 模型丢回"每轮失忆"的老路——那正是本刀要修的病，不该被一次读失败请回来。
+func (h *Hub) foldSessionHistory(ctx context.Context, sessionID contracts.Ulid) ([]core.Message, error) {
+	events, err := runtime.ReplaySession(ctx, h.store, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("host: 回放 session %s 的事件流（带历史）: %w", sessionID, err)
+	}
+	// 主 agent id：**loopFor 登记的那一个**（h.mainAgents[sid] ≡ 树 root ≡ loop.AgentID，
+	// 同一口径，不另造）。fold 发生在 loopFor 之后 → 一定登记好了；取不到 = 装配残缺
+	//（fail-close：没有视角就没有历史，宁可这一轮失败也别喂一份混视角的历史）。
+	mainAgent, ok := h.mainAgentOf(sessionID)
+	if !ok {
+		return nil, fmt.Errorf("host: 取 session %s 的主 agent id 失败（带历史需要它做视角过滤）", sessionID)
+	}
+	scoped := make([]contracts.Event, 0, len(events))
+	for i := range events {
+		if events[i].AgentID == mainAgent {
+			scoped = append(scoped, events[i])
+		}
+	}
+	return runtime.FoldConversation(scoped), nil
+}
+
 // loopFor 取（或建）某 session 的 Loop。
 //
 // 一个 session 一个 Loop：System/Model/AgentID 固定，历史由每次 Run 的局部变量带
 // （loop 无可变状态 → 同一 Loop 可并发 Run，见 loop 包 doc）。
 //
+// # 顺序：**先拿托管权、后发布**（P0-1）
+//
+//	① 进锁查缓存（命中 → 直接返回，created=false）
+//	② 锁内建 loop（**不发布**）
+//	③ 锁外 Claim（拿托管权；冲突 → 直接失败——**没发布就没什么可回滚**）
+//	④ 再进锁双检：别人已发布 → 丢弃自己那份、返回已发布的（created=false）
+//	⑤ 发布（created=true）
+//
+// 为什么必须这样（旧的四步不原子）：旧顺序是"建 loop → 先写进 h.loops → 再 Claim →
+// 冲突才回滚"。并发两个 POST /prompt 打到"别的 hub 托管"的 session 时，一个 409，
+// 另一个却从**缓存**拿到 loop → 202 并双写事件（G25 破：全局 seq 变成混排提交序），
+// 还落了一条假"接管成功"留痕。现在 Claim 失败 = **没有发布**，冲突方与缓存命中方
+// 都拿不到 loop → 一律 409（唯一拒绝线）。
+//
+// 同 hub 幂等：两个 goroutine 同时接管同一个 session，两次 Claim 都成功（同 hub id），
+// 双检保证只有一个 loop 被发布（另一个丢弃自己那份）——无害。
+//
 // 建成时顺做两件 K10/K12 的事：① 发现表 Claim（G25 跨进程托管注册：本进程持有该
 // session 并登记宿主 hub 标识——活状态无租约无心跳，G17b；冲突 fail-close 拒绝接管）；
-// ② 加入自动 gate（repo:/workflow:）。② 只在**首次**建成时做，且失败不记账（下次 Run
-// 重试）——加不上 gate 只会让该 session 暂不可见（fail-close：失败让可见性变小，不是
-// 变大），不该因此拒绝跑这一轮。
-func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop, error) {
+// ② 加入自动 gate（repo:/workflow:）。② 失败不记账（**下次 Run 重试**——F2：缓存命中
+// 路径会补一次自愈，见下面的 joinAutoGatesIfNeeded；注释里这句话现在是真的）——
+// 加不上 gate 只会让该 session 暂不可见（fail-close：失败让可见性变小，不是变大），
+// 不该因此拒绝跑这一轮。
+//
+// created = 本次调用**真正建成并发布**（true）/ 缓存命中 / 双检落败（false）。
+// 留痕口径用得上它（takeover.go：只有"真接管"才值得复盘留痕）。
+func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop, bool, error) {
 	if sessionID == "" {
-		return nil, errors.New("host: sessionID 必填（空 = 用 NewSession()/CreateSession() 先取一个）")
+		return nil, false, errors.New("host: sessionID 必填（空 = 用 NewSession()/CreateSession() 先取一个）")
 	}
 	h.mu.Lock()
 	if h.hubID == "" {
 		h.hubID = string(core.NewUlid()) // 字面量构造的 Hub（内部测试）兜底：Claim 需要非空宿主标识
 	}
 	if lp, ok := h.loops[sessionID]; ok {
+		// 缓存命中：**补一次自动 gate 自愈**（F2）——上一次 join 失败是不记账的（下次 Run
+		// 重试），而"下次 Run"走的就是这条缓存命中路径：不补的话那句注释是假话，失败的
+		// gate 永远补不上（该 session 一直"暂不可见"）。
+		//
+		// h.mu 下**只读 map**（autoGates / mainAgents / specs），join 在锁外做（它要发
+		// 事件、扫事件流——不能持 h.mu）。joinAutoGates 幂等（InGate / LeftGate 都幂等），
+		// 重复 join 不会多落事件。
+		autoDone := h.autoGates[sessionID]
+		agentID := h.mainAgents[sessionID]
+		spec := h.specs[sessionID]
 		h.mu.Unlock()
-		return lp, nil
+		if !autoDone {
+			h.joinAutoGatesIfNeeded(ctx, sessionID, agentID, spec)
+		}
+		return lp, false, nil // 缓存命中：不是本次建成（created=false）
 	}
 	// 主 agent id 的解析顺序（v3-S6-B F1 修）：**已登记 → 事件流 → 新造**。
 	//
@@ -995,7 +1115,7 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	strategy, err := h.contextStrategyFactory(sessionID, agentID, strategyKind)
 	if err != nil {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
+		return nil, false, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
 	}
 	// v3-S6-B：MultiAgent 开 → 每 session 一棵 agent 树（root=主 agent id，续跑复用）+ 把
 	// loop.Agents 接进 loop.Config（spawn/complete 对模型可见、子 agent 可派生、W6-A 子策略钩子）。
@@ -1058,9 +1178,10 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	})
 	if err != nil {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("host: 为 session %s 建 loop: %w", sessionID, err)
+		return nil, false, fmt.Errorf("host: 为 session %s 建 loop: %w", sessionID, err)
 	}
-	h.loops[sessionID] = lp
+	// ⚠ **这里不发布**（P0-1）：loop 建好但还没进 h.loops——托管权（Claim）拿到之后才发布。
+	// 提前发布 = 冲突方能从缓存里拿到一个"本 hub 没托管"的 loop → 双写事件（G25 破）。
 	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
 	autoDone := h.autoGates[sessionID]
 	hubID := h.hubID
@@ -1068,25 +1189,48 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 
 	// G25 跨进程托管注册（2026-11-01 v4-7）：session 创建/接管即在发现表登记宿主 hub
 	// 标识（进程标识）。**冲突 fail-close**：该 session 已登记给另一个 hub → 拒绝接管
-	// （回滚刚建的 loop；双宿主会各自 append 同一 session 的事件，破坏 session 亲和写）。
-	// 同 hub 重复 Claim 幂等（loop 重建 / 续跑都走这里）。
+	// （双宿主会各自 append 同一 session 的事件，破坏 session 亲和写）。
+	// 同 hub 重复 Claim 幂等（loop 重建 / 续跑 / 并发接管都走这里）。
+	//
+	// 冲突时**什么都不用回滚**（P0-1）：loop 还没发布（没进 h.loops），没有"半个托管态"
+	// 要清——直接失败即可（错误链带 ErrHostConflict → 调用方回 409 host_conflict）。
 	if cerr := h.disc.Claim(sessionID, hubID); cerr != nil {
-		h.mu.Lock()
-		delete(h.loops, sessionID)
+		return nil, false, fmt.Errorf("host: 托管登记失败（G25：拒绝接管，提示用户该 session 归属别的 hub）: %w", cerr)
+	}
+	// 双检（P0-1）：Claim 期间别的 goroutine 可能已经发布了这个 session 的 loop（同一 hub
+	// 的并发接管：两次 Claim 都幂等成功）。谁先发布谁算数——后来者**丢弃自己这份**
+	// （loop 无可变状态，丢掉只是白建一次，不留痕、不发布），返回已发布的那份。
+	h.mu.Lock()
+	if published, ok := h.loops[sessionID]; ok {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("host: 托管登记失败（G25：拒绝接管，提示用户该 session 归属别的 hub）: %w", cerr)
+		return published, false, nil // 双检落败：不是本次发布（created=false）
 	}
+	h.loops[sessionID] = lp
+	h.mu.Unlock()
+
 	if !autoDone {
-		if jerr := h.joinAutoGates(ctx, sessionID, agentID, spec); jerr != nil {
-			hubLog.Warn("host: 自动 gate 加入失败（该 session 暂不可见，下次 Run 重试）",
-				"session_id", string(sessionID), "err", jerr.Error())
-		} else {
-			h.mu.Lock()
-			h.autoGates[sessionID] = true
-			h.mu.Unlock()
-		}
+		h.joinAutoGatesIfNeeded(ctx, sessionID, agentID, spec)
 	}
-	return lp, nil
+	return lp, true, nil
+}
+
+// joinAutoGatesIfNeeded 在自动 gate **尚未加入**时补 join（K12），成功才记账（置
+// h.autoGates[sid]），失败只 warn **不记账**（下次 Run 重试——F2：缓存命中路径会再试，
+// 这句"下次 Run 重试"现在是真的）。
+//
+// 幂等：joinAutoGates 自身幂等（InGate → 已是成员就跳过；LeftGate → 曾显式离开就不
+// 自动复活），所以重复调用不会多落 gate.joined 事件。
+//
+// 调用方**不持 h.mu**（join 要发事件、扫事件流）。
+func (h *Hub) joinAutoGatesIfNeeded(ctx context.Context, sessionID, agentID contracts.Ulid, spec SessionSpec) {
+	if jerr := h.joinAutoGates(ctx, sessionID, agentID, spec); jerr != nil {
+		hubLog.Warn("host: 自动 gate 加入失败（该 session 暂不可见，下次 Run 重试）",
+			"session_id", string(sessionID), "err", jerr.Error())
+		return
+	}
+	h.mu.Lock()
+	h.autoGates[sessionID] = true
+	h.mu.Unlock()
 }
 
 // NewSession 生成一个新的 session id（调用方先拿 id 再 RunPrompt，便于 UI/CLI 展示）。
@@ -1216,7 +1360,27 @@ func (h *Hub) Bus() EventSource {
 }
 
 // Sessions 返回在线表（最新活跃在前，行数受 Config.MaxSessionRows 限制）。
+//
+// **无过滤**口径（公共面）：补列（hostable/host_hub/online/running/last_activity）→
+// 按 MaxSessionRows 截断（排序在投影层已完成：LastSeq 降序）。
 func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
+	return h.sessionsFiltered(ctx, nil)
+}
+
+// sessionsFiltered 是 Sessions 的**带过滤**内部变体（only = nil = 不过滤 = 与 Sessions
+// 逐字节等价）。
+//
+// # 顺序：过滤在截断**之前**（P1-2）
+//
+//	取行（**不限**）→ 补列 → 按 online 过滤 → 最后按 MaxSessionRows 截断
+//
+// 为什么：旧顺序是"投影层按 LastSeq 降序**先截断** → HTTP 层再按 ?online= 过滤"——
+// 排在 200 行外的**在线** session 被整段截掉，?online=true 回空表（critic 用
+// MaxSessionRows=1 复现：两条 session，seq 大的那条离线、在线的那条被截掉 → []）。
+// 过滤是"选子集"，必须在"取子集"**之前**做，否则选出来的是"被截断后剩下的子集"。
+//
+// 无过滤时本函数与旧行为等价（补列后截断，排序口径不变）。
+func (h *Hub) sessionsFiltered(ctx context.Context, only *bool) ([]SessionRow, error) {
 	if h == nil {
 		return nil, errors.New("host: Hub 为 nil")
 	}
@@ -1230,11 +1394,12 @@ func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("host: 读索引水位: %w", err)
 	}
-	rows := h.proj.rows(wm, h.cfg.MaxSessionRows)
-	// hostable（G12）：本进程托管 = 协议面可对它发 prompt（托管写面的判据 = h.loops
-	// 里有 loop）。投影不认识 h.loops，这一列在出口处补。一库一 hub 是预期拓扑（G25）：
-	// 共享库的读面按库投影（别的 hub 建的 session 也看得见——正确行为），但它们可读
-	// 不可发；GUI 按这列灰掉不可发行，而不是点下去吃 404 unknown_session。
+	// ⚠ **先不过限**（limit=0 = 不截断，见 projection.rows）：过滤要在截断之前（P1-2）。
+	rows := h.proj.rows(wm, 0)
+	// hostable（G12 + G-b）：本进程是否已托管该 session（判据 = h.loops 里有 loop）。
+	// 投影不认识 h.loops，这一列在出口处补。G-b 后协议面可对**任何**真 session 发
+	// prompt（未托管 = 点"继续"触发懒接管；Claim 冲突才 409 host_conflict），本列语义
+	// 收窄为"直发 / 需接管"的呈现辅助，不再是"可发/不可发"。一库一 hub 是预期拓扑（G25）。
 	// 一次 h.mu 取 loops 快照再逐行标（对齐 fork_internal_test 的快照写法）——不逐行
 	// hostsSession 反复抢锁。
 	//
@@ -1248,11 +1413,49 @@ func (h *Hub) Sessions(ctx context.Context) ([]SessionRow, error) {
 	}
 	hubID := h.hubID
 	h.mu.Unlock()
+	// G-a 在线三态（活跃 / 托管 / 历史）：online / running / last_activity 在出口处补——
+	// 与 hostable/host_hub 同款（投影不认识发现表，这一列在出口处补）。判定源是发现表：
+	// Online/Running 由 discovery 行现算（事件流 ts + 进程本地 running 计数，K14/K15 注入、
+	// K11 peers、agentlink presence、GET /api/sessions 四消费方同一处判定）；last_activity
+	// 与 updated_at 同源同值（都是最后事件 ts，见 projection.SessionRow 的字段注释）。
+	//
+	// 先把发现表扫平（与上面 proj.catchUp 同理：刚落库的事件要立刻反映到 online 判定；
+	// K14/K15 注入、K11 peers 都是"先扫平再读"，本出口同口径）。扫失败不致命——用当前表
+	// 判定（下次请求重试），与 OnlineRows 的告警口径一致（在线表晚一会刷新，不 500）。
+	if h.discFeed != nil {
+		if _, derr := h.discFeed.catchUp(ctx); derr != nil {
+			hubLog.Warn("host: Sessions 发现表 catch-up 失败（online 判定用当前表，下次请求重试）",
+				"err", derr.Error())
+		}
+	}
 	for i := range rows {
 		if hosted[contracts.Ulid(rows[i].SessionID)] {
 			rows[i].Hostable = true
 			rows[i].HostHub = hubID
 		}
+		// 发现表还没有该 session（事件未进发现表 / 只有非 durable 事件）→ 保持零值：
+		// online=false、running=false（"历史"态的默认答案）。last_activity 仍取投影的
+		// 最后事件 ts（与 updated_at 同源同值；无事件 = ""）。
+		if dr, ok := h.disc.Session(contracts.Ulid(rows[i].SessionID)); ok {
+			rows[i].Online = dr.Online
+			rows[i].Running = dr.Running
+		}
+		rows[i].LastActivity = rows[i].UpdatedAt
+	}
+	// 过滤（补列之后——判定源是发现表，投影行只带值不判定）：只留 online == *only 的行。
+	if only != nil {
+		kept := make([]SessionRow, 0, len(rows))
+		for i := range rows {
+			if rows[i].Online == *only {
+				kept = append(kept, rows[i])
+			}
+		}
+		rows = kept
+	}
+	// 截断**最后**做（过滤之后）：行数上限是"返回多少行"，不是"看多少行"——先截断再
+	// 过滤会把在线的行滤没（P1-2）。排序在投影层已完成（LastSeq 降序），截断保留最前的。
+	if limit := h.cfg.MaxSessionRows; limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }

@@ -6,6 +6,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -105,6 +106,14 @@ type Config struct {
 	OnlineTableLineTokens int
 	OnlineTableLevel      string
 	OnlineTableWindow     int
+	// OnlineTableActivityWindow 是 **G-a 活跃窗口**的起动值（活跃 = running ∨ 最后事件
+	// ts ≤ 本窗口；缺省 15min = core.DefaultActivityWindow）。时长字符串（"15m" 形态，
+	// time.ParseDuration）；空 = 不写 = 用默认（见 onlineTableOverrides）。非法值在
+	// validate 启动期就拒（不拖到运行期）。它是在线表注入（K14/K15）与活跃判定
+	//（K11 peers / agentlink presence / GET /api/sessions）共用的**同一个 N**——
+	// 起动值经 onlineTableOverrides 进 onlineTableConfig，再由 syncActivityWindow
+	// 同步进发现表（单源，不给两处各配各的机会）。
+	OnlineTableActivityWindow string
 	// Monitor hub 级 CPU/内存监控（K9）阈值。0 = 用框架默认（见 monitor.go）。
 	// 周期采样，超阈值记告警（日志 + 内存环 + /api/monitor，可查）。
 	MonitorCPUPercent float64
@@ -453,6 +462,18 @@ func (c *Config) validate() error {
 			return fmt.Errorf("host: Config.OnlineTableLevel 只支持 summary | n | full（得到 %q）", c.OnlineTableLevel)
 		}
 	}
+	// G-a 活跃窗口：空 = 不写 = core.DefaultActivityWindow；非空必须是非负时长字符串
+	// （"15m" 形态，time.ParseDuration）。启动期就拒——打错的窗口不该等到运行期改配置
+	// 或第一轮在线表判定才暴露（与 loop.OnlineTableUpdate 的校验同口径、同文案风格）。
+	// ⚠ **0 / "0s" = 默认，不是"关窗"**（P2-1）：装配层（loop 配置面 → 发现表）把 0/负
+	// 归一为 core.DefaultActivityWindow——系统里**没有**"关窗"语义（"只认 running"由
+	// running 短路实现，与窗口值无关）。故 "0s" 合法（= 缺省窗口），负值才拒。
+	if w := strings.TrimSpace(c.OnlineTableActivityWindow); w != "" {
+		if d, err := time.ParseDuration(w); err != nil || d < 0 {
+			return fmt.Errorf("host: Config.OnlineTableActivityWindow 须是非负时长字符串（如 %q；空 = 用默认 %s）（得到 %q）",
+				"15m", core.DefaultActivityWindow, c.OnlineTableActivityWindow)
+		}
+	}
 	// RunID 拼成 workflow:<run_id> 后必须是个合法 gate id（S9：不合则拒，不修复）。
 	if runID := strings.TrimSpace(c.RunID); runID != "" &&
 		!discovery.ValidGateID(discovery.WorkflowGate(runID)) {
@@ -741,6 +762,9 @@ func isLoopbackHost(host string) bool {
 // onlineTableOverrides 把 Config 的在线表初始值折成 loop.OnlineTableUpdate（K15：hub 起动时可配）。
 //
 // 0/"" = 不给对应字段 → Update 不动它 → 保持 loop 默认（"缺省走配置面"口径）。非零/非空才覆盖。
+// activity_window（G-a 活跃窗口）同款：空 = 不写 = core.DefaultActivityWindow；它是在线表
+// 注入与活跃判定（peers / presence / sessions）共用的同一个 N，落进 onlineTableConfig 后
+// 由 syncActivityWindow 同步进发现表。
 func (c *Config) onlineTableOverrides() loop.OnlineTableUpdate {
 	var u loop.OnlineTableUpdate
 	if c.OnlineTableRows > 0 {
@@ -754,6 +778,9 @@ func (c *Config) onlineTableOverrides() loop.OnlineTableUpdate {
 	}
 	if c.OnlineTableWindow > 0 {
 		u.WindowLines = &c.OnlineTableWindow
+	}
+	if w := strings.TrimSpace(c.OnlineTableActivityWindow); w != "" {
+		u.ActivityWindow = &w
 	}
 	return u
 }

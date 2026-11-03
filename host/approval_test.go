@@ -46,10 +46,11 @@ func (p *textThenToolProvider) Run(_ context.Context, _ core.ModelRequest, emit 
 	return core.ModelResult{ToolCalls: []core.ToolCallReq{tc}, Usage: core.Usage{InputTokens: 10, OutputTokens: 5}}, nil
 }
 
-// warmupSession 跑一轮纯文本，让本进程**托管**这个 session（协议面 prompt 端点的准入条件）。
+// warmupSession 跑一轮纯文本，让本进程**托管**这个 session（已托管路径的夹具）。
 //
-// 返回 session id。托管 = h.loops 里有它（跑过一轮就有）——别的进程托管的 session
-// 在本进程永远不是"托管"，prompt 端点对它们一律 404（G25：跨进程双写会破因果序）。
+// 返回 session id。托管 = h.loops 里有它（跑过一轮就有）。G-b 之后未托管不再 404
+// （那是懒接管的入口，见 host/takeover.go）；本夹具用来钉"已托管 → 照常受理、
+// 不留接管留痕"这条另一侧的口径。
 func warmupSession(t *testing.T, h *host.Hub) contracts.Ulid {
 	t.Helper()
 	sid := host.NewSession()
@@ -168,43 +169,65 @@ func waitWSKind(t *testing.T, c *transport.Client, want string, timeout time.Dur
 	return contracts.TransportMessage{}
 }
 
-// TestPromptRequiresHostedSession（P2-2 钉子）：prompt 端点只对**本进程托管**的 session
-// 生效——别的进程托管的 session 在这儿起 prompt = 本进程就地新建 loop 双写同一 agent
-// （G25 破）。所以：未托管 → 404 unknown_session，且**不新建 loop**（第二次仍然 404）。
+// TestPromptRequiresHostedSession（P2-2 钉子，**G-b 改写**）：prompt 端点对未托管
+// session 不再 404，而是**默认接管（懒接管）**，见 host/takeover.go：
+//
+//	未托管 → 202（受理回执形状不变）+ 事件流落一条 hub.alert（metric=session.takeover）留痕；
+//	已托管 → 照常 202 且**不再留痕**（已托管路径不留痕——只有"真接管"才值得复盘）。
+//
+// Claim 冲突的**唯一拒绝线**（409 host_conflict、不建 loop、不留痕）见
+// takeover_test.go 的 TestPromptTakeoverClaimConflictRejected。
+// 变异自证：去掉 ensureHosted 的留痕 → ① 的条数断言必红；把 404 门改回去 → ① 的 202 必红。
 func TestPromptRequiresHostedSession(t *testing.T) {
-	h := newTestHub(t)
+	h := newTestHub(t, func(c *host.Config) { c.Provider = &textOnlyProvider{text: "在"} })
 	srv := httptest.NewServer(h.Handler())
 	defer srv.Close()
 
 	sid := host.NewSession()
-	var te contracts.TransportError
+	var acc struct {
+		SessionID string `json:"session_id"`
+		Status    string `json:"status"`
+	}
+	// ① 未托管 → 懒接管成功 → 202（202 形状不变：session_id + running）。
 	if code := postJSON(t, srv.URL+"/api/sessions/"+string(sid)+"/prompt",
-		map[string]string{"prompt": "你好"}, &te); code != http.StatusNotFound {
-		t.Fatalf("未托管 session 的 prompt 状态码 = %d，want 404", code)
+		map[string]string{"prompt": "你好"}, &acc); code != http.StatusAccepted {
+		t.Fatalf("未托管 session 的 prompt 状态码 = %d，want 202（G-b 懒接管）", code)
 	}
-	if te.Code != "unknown_session" {
-		t.Fatalf("错误码 = %q，want unknown_session", te.Code)
+	if acc.SessionID != string(sid) || acc.Status != "running" {
+		t.Fatalf("受理回执不符: %+v", acc)
 	}
-	// 再发一次仍是 404 → 说明**没有就地新建 loop**（建了就变"托管"，第二次会 202）。
+	// 接管留痕：hub.alert metric=session.takeover，正文带 session id。
+	// 留痕由 ensureHosted **同步**落库（202 返回前）→ 这里不轮询。
+	alerts := takeoverAlertEvents(t, srv.URL)
+	if len(alerts) != 1 {
+		t.Fatalf("接管留痕条数 = %d，want 1", len(alerts))
+	}
+	var p contracts.HubAlertPayload
+	if err := json.Unmarshal(alerts[0].Payload, &p); err != nil {
+		t.Fatalf("留痕载荷解不开: %v", err)
+	}
+	if !strings.Contains(p.Message, string(sid)) || !strings.Contains(p.Message, "懒接管") {
+		t.Fatalf("留痕正文应带 session id + 懒接管，得到 %q", p.Message)
+	}
+	// （hostsSession 翻真由 ② 的"不翻倍留痕"证明：没建 loop 的话第二次 POST 会再接管、
+	// 再落一条留痕——新 session 还没有事件、投影行未出，这里不查 hostable 免得与
+	// 异步首轮赛跑。）
+
+	// ② 已托管 → 再发照常 202，且**不再留痕**。
 	if code := postJSON(t, srv.URL+"/api/sessions/"+string(sid)+"/prompt",
-		map[string]string{"prompt": "你好"}, &te); code != http.StatusNotFound {
-		t.Fatalf("第二次 prompt 状态码 = %d，want 404（不该就地建 loop）", code)
+		map[string]string{"prompt": "再来一次"}, &acc); code != http.StatusAccepted {
+		t.Fatalf("第二次 prompt 状态码 = %d，want 202", code)
 	}
-	// 事件流里也不该有它的任何事件（没跑过）。
-	var view struct {
-		Events []contracts.Event `json:"events"`
-	}
-	if code := getJSON(t, srv.URL+"/api/events?session_id="+string(sid), &view); code != http.StatusOK {
-		t.Fatalf("事件查询状态码 = %d", code)
-	}
-	if len(view.Events) != 0 {
-		t.Fatalf("未托管 session 不该产生任何事件，得到 %d 条", len(view.Events))
+	if n := len(takeoverAlertEvents(t, srv.URL)); n != 1 {
+		t.Fatalf("已托管路径不该再留痕，接管留痕条数 = %d，want 1", n)
 	}
 }
 
 // TestWSCommandSubmitSessionValidation（P3-3 钉子）：WS command.submit 的 session_id
-// 必须是合法 ULID，且（显式给出时）必须由本进程托管——否则回 kind=error，**不假受理**
-// （受理回执说 running，可那个 session 根本不会被跑，客户端会一直等一个不会来的事件）。
+// 必须是合法 ULID（非法 → kind=error，**不假受理**）；显式给出的 session_id 走与
+// HTTP prompt 面**同一个** ensureHosted（G-b 懒接管）——未托管会被接管（成功即
+// command.accepted，见 takeover_test.go），**唯一拒绝线**是 Claim 冲突
+// （kind=error，code=host_conflict，与 HTTP 409 同码同文案，G25 防双写）。
 func TestWSCommandSubmitSessionValidation(t *testing.T) {
 	h := newTestHub(t, func(c *host.Config) {
 		c.Provider = &textThenToolProvider{} // 不打网络
@@ -245,8 +268,13 @@ func TestWSCommandSubmitSessionValidation(t *testing.T) {
 		t.Fatalf("错误文案应点名 session_id，得到 %q", te.Message)
 	}
 
-	// ② 合法但未托管的 session_id → kind=error（跨进程双写的前兆，不受理）。
+	// ② Claim 冲突（已登记给另一个 hub）→ kind=error，code=host_conflict（G-b：未托管
+	//    本身不再报错——那是懒接管的入口；**唯一拒绝线**是 Claim 冲突，G25 防双写，
+	//    且不假受理：这个 session 不会被本 hub 跑）。
 	foreign := host.NewSession()
+	if err := h.Discovery().Claim(foreign, "hub-from-another-process"); err != nil {
+		t.Fatalf("预登记异 hub: %v", err)
+	}
 	msg2, err := transport.NewMessage(transport.KindCommandSubmit, contracts.CommandSubmit{
 		SessionID: &foreign, Prompt: "读一下",
 	})
@@ -261,8 +289,11 @@ func TestWSCommandSubmitSessionValidation(t *testing.T) {
 	if err := json.Unmarshal(m2.Payload, &te2); err != nil {
 		t.Fatalf("error payload: %v", err)
 	}
-	if !strings.Contains(te2.Message, "不是本 hub 托管") {
-		t.Fatalf("错误文案应说明未托管，得到 %q", te2.Message)
+	if te2.Code != "host_conflict" {
+		t.Fatalf("错误码 = %q，want host_conflict（与 HTTP 409 同码）", te2.Code)
+	}
+	if !strings.Contains(te2.Message, "拒绝接管") {
+		t.Fatalf("错误文案应点名拒绝接管，得到 %q", te2.Message)
 	}
 
 	// ③ 不带 session_id → 服务端新建 session（协议面开新会话的入口）→ command.accepted，
@@ -788,8 +819,9 @@ func TestSessionCreateRESTEndpoint(t *testing.T) {
 	defer srv.Close()
 
 	// ① 真·空 body（一个字节都不发 → Decode 得 EOF，按"全默认"受理）→ 201 + 合法 ULID；
-	//    随后对该 id 发 prompt → 202（托管已登记）。这条钉子就是变异自证的红灯：
-	//    去掉 serveSessionCreate 里的 loopFor → hostsSession 不通过 → prompt 404。
+	//    随后对该 id 发 prompt → 202（托管已登记）。G-b 注：去掉 serveSessionCreate 里的
+	//    loopFor 后 prompt 也会 202（懒接管补上了 loop），本断言不再兜那个变异——
+	//    托管登记本身由 hostable/接管留痕那侧的钉子看住（见 takeover_test.go）。
 	var created struct {
 		SessionID string `json:"session_id"`
 	}

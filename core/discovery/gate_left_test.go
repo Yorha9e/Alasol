@@ -164,6 +164,9 @@ func TestGateLeftBreaksVisibility(t *testing.T) {
 	s1, a1 := core.NewUlid(), core.NewUlid()
 	s2, a2 := core.NewUlid(), core.NewUlid()
 	tbl := New()
+	// G-a：mkEvent 夹具的 ts 写死在 2026-10-28（已超默认 15m 活跃窗）——放大窗口让
+	// 对端保持活跃，本用例只考 gate 相交这一维（活跃维由 online_window_test.go 覆盖）。
+	tbl.SetActivityWindow(farWindow)
 	tbl.Activate(s1)
 	tbl.Activate(s2)
 	applyAll(tbl,

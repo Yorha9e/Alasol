@@ -30,6 +30,14 @@ const scanBatch = 500
 //     （托管登记是发现表的**进程本地**状态——跨进程读不到别家的登记，如实留空不猜）。
 //     前端配合 hostable 显示"本进程托管（id）/ 别的进程托管 / 失管"。HTTP 面非契约，只增。
 //     与 hostable 同在 Hub.Sessions 出口处补。
+//   - online / running / last_activity：**G-a 在线三态**（活跃 = running ∨ 最后事件 ts ≤
+//     活跃窗口；托管 = 本进程持有活 loop；历史 = 未托管）。三列同样在 Hub.Sessions 出口处
+//     补（投影不认识发现表，与 hostable/host_hub 同款）：online/running 从发现表的行取
+//     （判定源 = 事件流 ts + 进程本地 running 计数——K14/K15 在线表注入、K11 peers、
+//     agentlink presence、GET /api/sessions 四个消费方同一处判定）；last_activity = 最后
+//     事件 ts 的 RFC3339 串，**与 updated_at 同源同值**（updated_at 是索引/排序口径的
+//     命名，last_activity 是在线语义的命名，值都是同一条最后事件的 ts；无事件 = ""）。
+//     HTTP 面只增不改义。
 type SessionRow struct {
 	SessionID  string `json:"session_id"`
 	FirstSeq   int64  `json:"first_seq"`
@@ -40,6 +48,10 @@ type SessionRow struct {
 	Watermark  int64  `json:"watermark"`
 	Hostable   bool   `json:"hostable"`
 	HostHub    string `json:"host_hub,omitempty"`
+	// Online / Running / LastActivity 的口径见类型注释（G-a；投影只留零值，出口处补）。
+	Online       bool   `json:"online"`
+	Running      bool   `json:"running"`
+	LastActivity string `json:"last_activity"`
 }
 
 // sessionState 是投影里单个 session 的累积状态。

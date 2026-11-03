@@ -442,7 +442,7 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 	return l.RunWithHistory(ctx, nil, prompt)
 }
 
-// RunWithHistory 带**既有历史**跑一次 agent loop（resume 续跑用）。
+// RunWithHistory 带**既有历史**跑一次 agent loop（resume 续跑 / RunPrompt 每轮折叠同源）。
 //
 // history 是此前的对话历史（如 runtime.FoldConversation 从事件流 fold 出来的对话）：
 // 它会**排在本次 prompt 之前**发给模型，本次对话接着它继续（历史本身不被改写——拷贝一份）。
@@ -452,6 +452,10 @@ func (l *Loop) Run(ctx context.Context, prompt string) (Result, error) {
 //
 // 为什么需要它（v1-S1）：对话内容进了事件流（F1）就能被回放重建，但"重建出来的历史"
 // 必须能**喂回 loop** 才叫续跑——否则 FoldConversation 只是素材，不是能力。
+//
+// 谁在用：resume 续跑（cmd/alasol/resume.go）、/btw 旁支 fork（host/fork.go），以及
+// **协议面每轮**（host.RunPrompt：每轮 fold 本 session 的事件流带历史——多轮对话同源；
+// 批次1 P1-3）。
 func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, prompt string) (res Result, err error) {
 	if l == nil {
 		return Result{}, errors.New("loop: Loop 为 nil")

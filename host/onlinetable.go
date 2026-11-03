@@ -18,7 +18,7 @@ import (
 //
 // 与 host/discovery.go 的分工：那个文件管"事件流 → 发现表"的扫描与 gate；本文件管
 // "发现表 → 注入给主 agent 的在线表"。K11 的水平可见性过滤**不在这里重写**——直接复用
-// discovery.VisiblePeers（gate 相交 ∩ 存活 ∩ 只给对端主 agent）。
+// discovery.VisiblePeers（gate 相交 ∩ **活跃**（G-a：running ∨ 窗口内）∩ 只给对端主 agent）。
 
 // discoveryOnlineSource 把发现表折成 loop.OnlineTableSource（self + gate 相交的对端主 agent）。
 type discoveryOnlineSource struct {
@@ -32,8 +32,12 @@ type discoveryOnlineSource struct {
 // 扫失败不致命——用当前表渲染（下次轮次会重试），只记一条告警。
 //
 //	self 行     = 本 session 的主 agent（恒在表首；主 agent 未知时跳过，不塞空壳行）；
-//	对端行     = VisiblePeers(sessionID)——gate 相交 ∩ 存活 ∩ 只含对端主 agent；
+//	             **恒在**：self 不做活跃过滤（自己永远在自己的在线表里，"我在不在线"由
+//	             调用方自己的状态回答——G-a 只滤对端）；
+//	对端行     = VisiblePeers(sessionID)——gate 相交 ∩ 活跃 ∩ 只含对端主 agent；
 //	             别 session 的 subagent **完全不出现**（VisiblePeers 的既有语义，K11①）。
+//	             活跃过滤是件 1 落在 core/discovery.visiblePeersLocked 里的（G-a），
+//	             本层不重复判定（一处判定，四消费方同刀）。
 func (s *discoveryOnlineSource) OnlineRows(ctx context.Context, sessionID contracts.Ulid) []loop.OnlineTableRow {
 	if s == nil || s.table == nil {
 		return nil
@@ -104,7 +108,27 @@ func (h *Hub) UpdateOnlineTable(u loop.OnlineTableUpdate) (loop.OnlineTableView,
 	if err := h.onlineConfig.Update(u); err != nil {
 		return loop.OnlineTableView{}, err
 	}
+	// G-a：activity_window 改了要同步进发现表（唯一旋钮，见 syncActivityWindow）——
+	// 运行期把窗口调到极小，下一拍 GET /api/sessions / peers / presence 就该判超窗。
+	h.syncActivityWindow()
 	return h.onlineConfig.View(), nil
+}
+
+// syncActivityWindow 把在线表配置里的活跃窗口同步进发现表（G-a 单源同步）。
+//
+// 为什么必须有一个显式同步动作：在线表注入（K14/K15，loop 每轮读 onlineConfig）与
+// K11 peers / agentlink presence / GET /api/sessions 的活跃判定（发现表 activeLocked）
+// 是**四个消费方共用同一个 N**——窗口值只活在配置面里，发现表不被告知就会出现
+// "注入面改了、判定面没改"（同一个 N 两个值 = G-a 口径漂移）。构造路径（host.New）与
+// 运行期路径（UpdateOnlineTable ← POST /api/online-table/config）都调本方法，免得两处
+// 各写一行后漂移。
+func (h *Hub) syncActivityWindow() {
+	if h == nil || h.disc == nil || h.onlineConfig == nil {
+		return
+	}
+	// ActivityWindow() 已把零值归一到 core.DefaultActivityWindow；SetActivityWindow 对
+	// d<=0 也回缺省——双保险，缺省值的唯一权威仍是 core.DefaultActivityWindow。
+	h.disc.SetActivityWindow(h.onlineConfig.ActivityWindow())
 }
 
 // maxOnlineTableBody 限制 POST /api/online-table/config 请求体大小（loopback 上也别裸奔）。
@@ -113,8 +137,11 @@ const maxOnlineTableBody = 4 << 10
 // serveOnlineTableConfig 服务 GET/POST /api/online-table/config（K15 运行期动态管理）。
 //
 //	GET  → 当前生效配置（OnlineTableView JSON）；
-//	POST → 部分更新（{max_rows,line_token_budget,level,window_lines}，缺省字段不变），
-//	       200 回更新后的配置；400 体不是 JSON / 参数非法（level 不在 summary|n|full 等）。
+//	POST → 部分更新（{max_rows,line_token_budget,level,window_lines,activity_window}，
+//	       缺省字段不变），200 回更新后的配置；400 体不是 JSON / 参数非法（level 不在
+//	       summary|n|full、activity_window 不是非负时长字符串等）。
+//	       activity_window 是 G-a 活跃窗口的**运行期旋钮**：更新成功即同步进发现表
+//	       （UpdateOnlineTable → syncActivityWindow），在线表注入与判定面同时生效。
 func (h *Hub) serveOnlineTableConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:

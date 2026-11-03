@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -408,12 +409,18 @@ func TestPeersExposeOnlyMainAgents(t *testing.T) {
 	// 别 session 的 subagent 完全不可见（负例）：往表里喂一条**别的 session** 的
 	// agent.spawned（hub 的 loop 都是单 agent——v0 没装配多 agent 环境，故用表的公开
 	// 喂入口 Apply 模拟共享流里的子 agent），可见对端必须毫无变化。
+	//
+	// G-a（件 2）：夹具 ts 必须**新鲜**——旧版写死 2026-10-28，而 seq=9999 会让
+	// touchSession 把该 session 的 lastTS 回拨成过期值 → 对端落出活跃面（活跃 = running ∨
+	// 窗口内）→ 对端数少一个。回拨 lastTS 的行为本身按最小改动**不动**（挂账：高 seq 旧 ts
+	// 可以把 lastTS 往回带，见 core/discovery 的 Apply——真事件流里 ts 单调，这里只修夹具）。
 	peer := sessions[1]
 	sub := core.NewUlid()
 	main, _ := h.Discovery().PrimaryAgent(peer)
 	seq := int64(9999)
 	h.Discovery().Apply(&contracts.Event{
-		V: 1, ID: core.NewUlid(), Kind: "agent.spawned", TS: "2026-10-28T00:00:00Z",
+		V: 1, ID: core.NewUlid(), Kind: "agent.spawned",
+		TS:  time.Now().UTC().Format(time.RFC3339),
 		Seq: &seq, SessionID: peer, AgentID: sub, Durable: true,
 		Payload: mustJSON(t, contracts.AgentSpawnedPayload{
 			ParentAgentID: main, ChildAgentID: sub, AgentType: "scout", Role: "backend",
@@ -517,6 +524,13 @@ func TestDiscoveryRebuildFromEventStreamAfterCrash(t *testing.T) {
 		t.Fatal("重建后老 session 不该还是存活的")
 	}
 	// 直接问发现表（不走 Hub.Peers——它要求 session 由本 hub 托管，重建后正好没有）。
+	//
+	// G-a（件 2，按 core 侧 TestResetAndReplayRebuilds 的修法更新过时断言）：对端可见面
+	// 现在按**活跃**（running ∨ 最后事件 ts ≤ 窗口）过滤，live 只是"托管"另一态——崩前
+	// 真跑出来的事件 ts 是新鲜的，默认 15m 窗内照样算活跃，光"失活"退不出可见面。要断言
+	// "老成员不进面"，把窗口收到极小让全体落出活跃（判定源是事件流 ts，窗口是唯一旋钮；
+	// running 计数随进程重启清零，无需另配）。见 sessions_online_test.go 的窗口夹具口径。
+	h2.Discovery().SetActivityWindow(time.Nanosecond)
 	if got := h2.Discovery().VisiblePeers(a); len(got) != 0 {
 		t.Fatalf("重建后不该还有可见对端: %+v", got)
 	}
@@ -534,6 +548,11 @@ func TestDiscoveryRebuildFromEventStreamAfterCrash(t *testing.T) {
 
 	// resume：宿主重新激活（自动 gate 重算 + gate.joined 历史重放）→ 可见性恢复，
 	// 且主 agent id 不变（复用原来的，不造幽灵 agent）。
+	//
+	// G-a：把活跃窗口恢复缺省（上面收到极小只为断言"失活不进面"）——resume 后 a/b 靠
+	// **新鲜事件 ts** 重新进活跃面（活跃 = running ∨ 窗口内；EndRun 在 RunPrompt 返回前
+	// 已配平，判活跃靠的是事件 ts 不是 running）。
+	h2.Discovery().SetActivityWindow(core.DefaultActivityWindow)
 	if _, err := h2.RunPrompt(context.Background(), a, "A 续跑"); err != nil {
 		t.Fatalf("resume a: %v", err)
 	}

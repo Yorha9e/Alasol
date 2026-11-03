@@ -700,11 +700,23 @@ type ContextStrategyFileConfig struct {
 }
 
 // OnlineTableFileConfig 是在线表注入的文件级默认（K14/K15）。
+//
+//	[online_table]
+//	rows = 50           # 在线表注入行数 N（0 = 默认）
+//	line_tokens = 100   # 每行 summary 的 token 预算
+//	level = "summary"   # 暴露等级 summary | n | full
+//	window = 10         # level=n 时每行展开的窗口行数
+//	activity_window = "15m"  # G-a 活跃窗口（时长字符串；空 = core.DefaultActivityWindow）
 type OnlineTableFileConfig struct {
 	Rows       int    `toml:"rows"`
 	LineTokens int    `toml:"line_tokens"`
 	Level      string `toml:"level"`
 	Window     int    `toml:"window"`
+	// ActivityWindow 是 **G-a 活跃窗口**的文件级起动值（时长字符串，如 "15m"；
+	// time.ParseDuration 口径）。空 = 不写 = core.DefaultActivityWindow；非法值在
+	// host.Config.validate 启动期报错（跟随既有校验风格）。它与在线表注入共用同一个 N
+	//（见 host.Config.OnlineTableActivityWindow）。
+	ActivityWindow string `toml:"activity_window"`
 }
 
 // MonitorFileConfig 是 hub 监控（K9）的文件级阈值。0 = 用框架默认。

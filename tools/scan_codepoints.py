@@ -28,7 +28,13 @@ ALLOWED_SYMBOLS = set(
     # 本次 diff **刻意**引入的新词用字（人工确认过、不是乱码）：
     #   愈 —— "自愈"（Writer 文件没了就重建；缺口 5 的 F2 口径）
     #   捏 —— "拿捏"（host/config.go 的 Retention 措辞）
-    "愈捏"
+    #   洁 —— "整洁"（core/loop 的 activity_window 字符串口径注释）
+    #   马 —— "马上"（host/approval.go 懒接管留痕注释）
+    #   赛 —— "赛跑"（host/approval_test.go 并发首轮注释）
+    #   拢 —— "收拢"（host/http.go serveSessions 过滤注释）
+    "愈捏洁马赛拢"
+    # 逻辑记法（与 15 号设计文档同款："running ∨ 窗口内"、"gate 相交 ∩ 活跃"；∅ 与 ↔ 为 K11 既有记法）：
+    "∨∩∅↔"
     # 流程图框线与分隔符（15 号文档的流程图 / 既有文档的行内分隔）：
     "─│┌┐└┘├┤┬┴┼·"
 )

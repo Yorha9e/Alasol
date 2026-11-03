@@ -70,8 +70,16 @@
 // 恰好没被激活"这种副产物。原始发现表（Hub.Discovery()，宿主内部 / 审计面）里
 // 仍能看到旁支（可审计、可回放）——这是**有意保留**的边界。
 //
-// **历史口径**：主轮次不带历史（每轮只带本轮 prompt，历史只存在于事件流里），
-// /btw 带历史（带条数/长度上限 + 截断告知：模型侧一条 system 说明 + 用户侧一行提示）。
+// **历史口径**：主轮次**每轮 fold 事件流带历史**（RunPrompt 折叠：user.prompt /
+// model.turn / tool.call.* → 对话历史，与 fork / resume 多轮同源；**视角 = 主 agent**
+// （按主 agent id 预过滤——子 agent 自己的对话不进主上下文，它的产出经 spawn 的
+// tool.call.completed 回灌），/btw 带历史（带条数/长度上限 + 截断告知：模型侧一条
+// system 说明 + 用户侧一行提示）。
+//
+// **主轮次历史无上限**（F4：设计如此，**不加截断**）：默认 append 每轮带**全量**历史
+// ——token 随轮次线性涨、每轮 O(整场) 回放。要封顶请开 **context-strategy=tiered**
+// （L1/L2 级联压缩，host.Config.ContextStrategy），注入区配置化在 G-h。fork 的
+// 16 条 / 6000 字是**旁支专属**（一次性请求要有界），不套到主轮次。
 //
 // # agentlink（K18 五件套）
 //
@@ -98,51 +106,63 @@
 // 的 agent 树。`/api/inquiry` 的 `agent_id` 只是"调用方身份"，窗口投影用
 // `project_agent_id`（缺省 = 调用方的可见集：自己 + 父 + 直系子）。
 //
+// **gates 面与 discover/presence 面口径有意不同**（P2-2）：gates 面 = **成员关系面**
+// （谁在这个 gate 里、成员数、成员详情——按"托管(live)"口径，不按活跃窗口过滤）；
+// discover/presence = **活跃可见面**（K11 + G-a：只列活跃对端——running ∨ 最后事件 ts
+// 在活跃窗口内）。前者答"成员关系是什么"，后者答"现在谁在线"——**有意不同**，别读成
+// 漏过滤（详见 host/discovery.go 的 Gates 注释）。
+//
 // # serve 的定位（v3-S4，G2 口径统一）：**观察 + 协调 daemon**
 //
 // `alasol serve` 与 `alasol chat` 是**两个进程、两个 hub、共享同一个事件库**。由此，
 // 写端点分两类，校验口径**有意不同**（不是遗漏）：
 //
-//   - **托管型写面**（/api/peers、/api/gates/join、/api/agentlink/*、**/api/sessions/{id}/prompt**）：
+//   - **托管型写面**（/api/peers、/api/gates/join、/api/agentlink/*）：
 //     要求目标 session 由**本进程**托管（hostsSession 查进程内 h.loops，G25 session 亲和写）。
 //     serve 进程 loops 为空 → 这些端点对 chat 进程建的 session 一律 404 unknown_session。这是**设计**：
 //     水平可见性/广播依赖**进程内活状态**（发现表的存活成员是进程本地的，无租约无心跳），
 //     跨进程没有"谁在线"可判；
+//   - **对话发起面**（POST /api/sessions/{id}/prompt、带 session_id 的 WS command.submit）：
+//     **G-b 懒接管**（2026-11-03）——目标 session 未托管就**自动接管**：loopFor（Claim +
+//     建 loop + 事件流恢复主 agent id），接管成功落 hub.alert 留痕（metric session.takeover）。
+//     **Claim 冲突（另一活宿主持有）= 唯一拒绝线**（409 host_conflict / WS kind=error）：
+//     双宿主会各自 append 同一 session 的事件（G25 破：全局 seq = 提交序 ≠ 因果序）。
+//     挂账：Claim 的宿主登记是**进程本地**（hostHub 不进 Snapshot、无租约心跳）——跨进程
+//     冲突检测不到，前提仍是"一库一 hub"；将来跨进程互斥走 durable claim（F7 新事件 kind）。
+//     历史进模型不用新做：**G-b 起已落实**（RunPrompt 每轮折叠事件流带历史），主 agent id
+//     经既有机制从事件流恢复；
+//     ⚠ **诚实边界（G-b 之后）**：G-b 之前协议面对非托管 session 一律 404（双写面关闭）；
+//     G-b 之后改成懒接管，"能不能接管"的安全性**全部寄托在 Claim 上**——而 Claim 是
+//     **进程本地**的，**只有同进程冲突可拒**。故"一库一 hub"（G12）之外的共享库部署
+//     请自觉**不要用协议面 prompt**；跨进程互斥留 durable claim（F7）另做。
 //   - **协调型写面**（/api/merge/review|check|predict）：**直查库、不校验托管**——merge 是
 //     协调动作（review 结论/合并检查是事件流里的持久事实 + git 观测），不需要目标 session 在线，
 //     任何拿得到 session id 的一方都能记一条 review。**故意不补托管校验**（补了就成了"只能
 //     给自己进程的 session 记 review"，与它作为协调动作的定位矛盾）。
 //
-// **对话发起端点也在托管型写面里**（v3-S4 G1 + G25）：POST /api/sessions/{id}/prompt 若对
-// **别的进程**托管的 session 起 prompt，本进程会**就地新建一个 loop**（hub.go 的 loopFor）
-// → 两个进程往同一个 session/agent 写事件 → **G25 破**（全局 seq = 提交序 ≠ 因果序）。
-// 所以它要求 hostsSession，否则 404 unknown_session（与 peers/gates/agentlink 同口径）。
 // 协议面**开新会话**有两条同源同口径的路：WS `command.submit`（**不带** session_id →
 // 服务端新建一个 session，本进程即宿主）与 **POST /api/sessions**（REST 入口，v3-S5 ①：
 // CreateSession + 本进程建 loop、返回 session_id、不自动跑 prompt——之后对该 id 的
-// /prompt 直接可用）；带上 session_id 的 command.submit 同样要求本进程托管，否则回 kind=error。
+// /prompt 直接可用）。
 //
 // 于是同一 session：读面（/api/sessions、/api/context、/api/cost）与协调写面（merge.*）全通
-// （投影/索引扫的是共享库），托管写面（peers/gates/join/agentlink/prompt）404。**跨进程托管注册不做
-// （记 v4）**——那需要会话亲和/活状态同步一整套（G25 的部署层约束），不是补个端点的事。
+// （投影/索引扫的是共享库）；托管写面（peers/gates/join/agentlink）对非托管 session 404，
+// 而**对话发起面懒接管**（G-b）。**跨进程托管注册不做（记 v4）**——那需要会话亲和/活状态
+// 同步一整套（G25 的部署层约束），不是补个端点的事。
 //
 // **预期拓扑是"一库一 hub"（G25/G12，契约级限制）**：多 hub 共享同一个事件库时，读面
-// 按**库**投影——A 进程建的 session 在 B 进程的列表里看得见（这是**正确行为**），但
-// 事件**没有 hub 归属**、托管写面对非本进程的 session 一律 404——"看得见却发不了
-// prompt"对第三方不直观。呈现辅助（v3-S5 G12）：GET /api/sessions 行的 **hostable**
-// 字段（bool：本进程托管 = 可发 prompt；只增不破坏）标出"可发/不可发"，GUI 直接灰掉
-// 不可发行；404 unknown_session 的文案也点明出路（POST /api/sessions 开新会话继续）。
+// 按**库**投影——A 进程建的 session 在 B 进程的列表里看得见（这是**正确行为**）。呈现辅助
+// （v3-S5 G12 + G-b）：GET /api/sessions 行的 **hostable** 字段（bool：本进程是否已托管）
+// 区分"直发"与"点继续触发懒接管"；Claim 冲突时回 409 host_conflict（文案点明归属别的 hub）。
 // **多 hub 请各自一个库**；跨进程托管/路由记 v4，本刀不做。
 //
 // **重启同理**（活状态是进程本地的）：hub 重启后，**重启前**那些 session 一律**失管**
 // ——本进程没有它们的 loop（h.loops 是内存态，重启即空），发现表的"存活成员"也不会
 // 复活（老 session 不会因重扫事件流而重新变成 live，这是设计）。于是重启后：
-// 读面照常（事件库里的历史还在）、协调写面照常，而托管写面（含 prompt）对**旧 session**
-// 一律 404 unknown_session。**协议面要继续对话就得重新开会话**（WS command.submit 不带
-// session_id → 服务端新建一个 session，本进程即宿主；或 POST /api/sessions——同源同口径）；
-// 想接上旧 session 的上下文，
-// 走 `alasol resume -session <id> -continue "<提示>"`（CLI 的恢复+续跑：**另一个进程**里
-// 自己建 loop 并接管）——协议面**不硬接**旧 session（那正是 G25 要防的双写）。
+// 读面照常（事件库里的历史还在）、协调写面照常，**对话发起面也照常**——G-b 懒接管直接
+// 续跑旧 session（接管落 hub.alert 留痕；Claim 冲突是唯一拒绝线）。开新会话与 CLI 恢复
+// 两条路依旧：WS command.submit 不带 session_id / POST /api/sessions 开新会话（同源同口径）；
+// 或 `alasol resume -session <id> -continue "<提示>"`（CLI 的恢复+续跑）。
 //
 // # 审批应答的鉴权口径（v0 的诚实边界，**有意不做鉴权**）
 //

@@ -7,8 +7,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
+	"github.com/Yorha9e/alasol/core"
 )
 
 // 本表折叠的事件 kind（D7：其余 kind 忽略但已推进"最近活动"——它们仍然是
@@ -154,6 +156,13 @@ type Table struct {
 	// 含"已结束但未显式离开"的 session——session 结束（进程没了）不等于 leave，
 	// 结束只是不再算活跃成员（GateMembers 再叠 live 过滤）；显式 leave 才从本集合摘除。
 	gates map[string]map[contracts.Ulid]struct{}
+	// activityWindow 是活跃窗口（G-a 在线三态：活跃 = running ∨ 最后事件 ts ≤ 本窗口）。
+	// **零值 = 用 core.DefaultActivityWindow**（零值即缺省；SetActivityWindow 只做显式覆盖）。
+	// 进程本地配置，不进 Snapshot——行出口的 Online 随窗口配置走，重建比对要两边窗口一致。
+	activityWindow time.Duration
+	// running 是 session → "本轮在跑"计数（G-a：BeginRun/EndRun 配平）。与 live/hostHub
+	// 同款**进程本地**状态，**不进 Snapshot**——它不是事件能重建的东西（重启后没人正在跑）。
+	running map[contracts.Ulid]int
 }
 
 // New 建一张空的发现表。
@@ -162,6 +171,7 @@ func New() *Table {
 		sessions: make(map[contracts.Ulid]*sessionState),
 		agents:   make(map[contracts.Ulid]*agentState),
 		gates:    make(map[string]map[contracts.Ulid]struct{}),
+		running:  make(map[contracts.Ulid]int),
 	}
 }
 
@@ -303,7 +313,59 @@ func (t *Table) HostOf(sessionID contracts.Ulid) (string, bool) {
 	return st.hostHub, true
 }
 
+// SetActivityWindow 覆盖活跃窗口（G-a：测试与宿主按需调小/调大；缺省 15 分钟见
+// core.DefaultActivityWindow）。d<=0 → 恢复缺省（"0 = 用默认"口径，与 loop 配置面一致）。
+//
+// **进程本地**配置：不进 Snapshot，重启回缺省——在线表四消费方（K14/K15 注入、K11 peers、
+// agentlink presence、GET /api/sessions）用同一张表的同一窗口，不会各配各的。
+func (t *Table) SetActivityWindow(d time.Duration) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if d <= 0 {
+		d = core.DefaultActivityWindow
+	}
+	t.activityWindow = d
+}
+
+// BeginRun 标记 session 本轮开始运行（G-a 活跃判定的 running 分量：宿主进 loop 时调）。
+//
+// **进程本地**状态（同 live/hostHub 口径，不进 Snapshot）：计数 +1，支持嵌套/并发轮次；
+// 与 EndRun 配平。BeginRun 后即使没有事件 ts 也算活跃（running 短路，见 SessionActive）。
+func (t *Table) BeginRun(sessionID contracts.Ulid) {
+	if t == nil || sessionID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.running == nil { // 零值表也得能用（懒建）
+		t.running = make(map[contracts.Ulid]int)
+	}
+	t.running[sessionID]++
+}
+
+// EndRun 标记 session 一轮运行结束（running 计数 -1，**下限 0**：重复 End 不会把计数
+// 打成负数——负计数会让"没在跑"的 session 被判成 running>0 的活跃，且永不回落）。
+func (t *Table) EndRun(sessionID contracts.Ulid) {
+	if t == nil || sessionID == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	switch n := t.running[sessionID]; {
+	case n <= 1:
+		delete(t.running, sessionID)
+	default:
+		t.running[sessionID] = n - 1
+	}
+}
+
 // Reset 清空全部状态（重建入口：宿主随后从 seq 0 重放事件流）。
+//
+// 进程本地的 running 计数一并清空（与 live 随 sessions 重建失活同口径：重启后没有
+// 任何 session "正在跑"，要由宿主重新 BeginRun）。
 func (t *Table) Reset() {
 	if t == nil {
 		return
@@ -313,6 +375,7 @@ func (t *Table) Reset() {
 	t.sessions = make(map[contracts.Ulid]*sessionState)
 	t.agents = make(map[contracts.Ulid]*agentState)
 	t.gates = make(map[string]map[contracts.Ulid]struct{})
+	t.running = make(map[contracts.Ulid]int)
 }
 
 // ---------------------------------------------------------------------------
@@ -512,6 +575,21 @@ func (t *Table) removeGateMemberLocked(gateID string, sid contracts.Ulid) {
 //
 // **没有 live 字段**：存活是进程本地状态（G17b），要它就用 LiveSessions() / IsLive()。
 // 少一个字段，Snapshot 才能被直接比较（重建测试据此断言"重放后与崩溃前一致"）。
+//
+// Online / Running（G-a 在线三态）是查询时**现算**的活跃画像，不存状态：
+//
+//	Online  = 活跃 = 本轮在跑（running）∨ 最后事件 ts 在活跃窗口内（判定源是事件流；
+//	          **同一时刻 + 同一窗口配置**下，跨容器一致——两台容器对同一事件流、同一
+//	          时刻算出同一个 Online）；
+//	Running = running 计数 > 0（进程本地，重启失活）。
+//
+// 与 live 的区别：live 答"本进程是否托管"（hosted），Online 答"现在算不算在线"——
+// 托管但超窗的 session 在对端可见面（VisiblePeers）里不算活跃。
+//
+// ⚠ **Online/Running 是现算态，不作重建比对面**（P2-4）：判定含 time.Now()（窗口是
+// "距现在多久"），两个**不同时刻**取的快照，Online 本就可能不同（事件在窗口内老化）。
+// 故"重放即得同一 Online"只在"同一时刻 + 同一窗口配置"下成立；重建比对**不要**拿
+// Online/Running 当断言面（比事件折叠出的那部分：成员关系、agent 树、join 历史）。
 type SessionRow struct {
 	SessionID   string `json:"session_id"`
 	MainAgentID string `json:"main_agent_id"`
@@ -523,6 +601,9 @@ type SessionRow struct {
 	LastKind  string `json:"last_kind"`
 	LastSeq   int64  `json:"last_seq"`
 	UpdatedAt string `json:"updated_at"`
+	// Online / Running 是查询时现算的活跃画像（G-a，口径见类型注释）。
+	Online  bool `json:"online"`
+	Running bool `json:"running"`
 }
 
 // AgentRow 是发现表里一个 agent 的行（K10 + K11 的树投影）。
@@ -580,6 +661,11 @@ type PeerRow struct {
 //
 // 故意不含 live（进程本地，重启后老成员全部失活——那是特性不是缺陷）。重建测试据此
 // 断言"新实例全量重放后的状态与崩溃前一致"。
+//
+// 行里的 Online / Running（G-a）是查询时现算的：**同一时刻 + 同一窗口配置**下重放
+// 一致；它们是**现算态，不作重建比对面**（P2-4：判定含 time.Now()，不同时刻取的两份
+// 快照，Online 本就可能不同——比对面是事件折叠出的那部分）。running 计数不进快照
+// （重启后没人正在跑，两边都是 false）。
 type Snapshot struct {
 	Sessions []SessionRow `json:"sessions"`
 	Agents   []AgentRow   `json:"agents"`
@@ -619,13 +705,17 @@ func (t *Table) sessionRowsLocked(keep func(*sessionState) bool) []SessionRow {
 		if !keep(st) {
 			continue
 		}
-		out = append(out, sessionRowLocked(st))
+		out = append(out, t.sessionRowLocked(st))
 	}
 	sortSessionRows(out)
 	return out
 }
 
-func sessionRowLocked(st *sessionState) SessionRow {
+// sessionRowLocked 折一个 session 的行（调用方持锁）。Online / Running 在此**现算**
+// （G-a）：活跃判定要读窗口配置与 running 计数，都在 Table 上，所以它是 Table 的方法
+// 而不是自由函数——一处判定（activeLocked），Sessions/LiveSessions/Session/GateMembers/
+// Snapshot 全走它，行出口不会各判各的。
+func (t *Table) sessionRowLocked(st *sessionState) SessionRow {
 	return SessionRow{
 		SessionID:   string(st.id),
 		MainAgentID: string(st.mainAgent()),
@@ -634,6 +724,8 @@ func sessionRowLocked(st *sessionState) SessionRow {
 		LastKind:    st.lastKind,
 		LastSeq:     st.lastSeq,
 		UpdatedAt:   st.lastTS,
+		Online:      t.activeLocked(st),
+		Running:     t.running[st.id] > 0,
 	}
 }
 
@@ -670,7 +762,7 @@ func (t *Table) Session(sessionID contracts.Ulid) (SessionRow, bool) {
 	if !ok {
 		return SessionRow{}, false
 	}
-	return sessionRowLocked(st), true
+	return t.sessionRowLocked(st), true
 }
 
 // IsLive 报告 session 是否由本进程持有（G17b）。
@@ -682,6 +774,59 @@ func (t *Table) IsLive(sessionID contracts.Ulid) bool {
 	defer t.mu.RUnlock()
 	st, ok := t.sessions[sessionID]
 	return ok && st.live
+}
+
+// SessionActive 报告 session 是否**活跃**（G-a 在线三态的活跃判定，对外唯一入口）：
+// 活跃 = 本轮在跑（running>0）∨ 最后事件 ts 落在活跃窗口内。
+//
+// 判定源是**事件流的最后事件 ts**（跨容器一致：同一事件流 + 同一窗口配置 → 同一结论），
+// 不是 live（进程本地"托管"）——托管但超窗的 session 不算活跃（hosted 是另一态）。
+// 未知 session 但已在跑（BeginRun 早于任何事件）也算活跃：本轮在跑是当下事实。
+//
+// 四消费方（K14/K15 在线表注入、K11 peers、agentlink presence、GET /api/sessions）
+// 必须都经本方法（或其锁内版 activeLocked）判定，不得各自复制口径。
+func (t *Table) SessionActive(sessionID contracts.Ulid) bool {
+	if t == nil || sessionID == "" {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	st, ok := t.sessions[sessionID]
+	if !ok {
+		// 还没进表但本轮在跑（BeginRun 早于事件落地）：running 短路照样算活跃。
+		return t.running[sessionID] > 0
+	}
+	return t.activeLocked(st)
+}
+
+// activeLocked 是 SessionActive 的**持锁版**（调用方必须已持锁；SessionActive 与
+// VisiblePeers / 行出口共用——**一处判定**，避免两份口径漂移）。
+//
+// 判定顺序：running 短路（不看 ts）→ 无 ts 不活跃 → 窗口比对（core.WithinActivityWindow，
+// 未来时间戳按活跃算；坏 ts fail-close 判不活跃）。窗口零值 = core.DefaultActivityWindow。
+func (t *Table) activeLocked(st *sessionState) bool {
+	if st == nil {
+		return false
+	}
+	if t.running[st.id] > 0 {
+		return true // 本轮在跑：running 短路，与事件 ts 无关（G-a）
+	}
+	if st.lastTS == "" {
+		return false // 还没有任何带 ts 的事件：没有活动证据
+	}
+	ts, err := time.Parse(time.RFC3339, st.lastTS)
+	if err != nil {
+		return false // 坏 ts：fail-close，宁可判不活跃也不误报在线
+	}
+	return core.WithinActivityWindow(ts, true, time.Now(), t.activityWindowOrLocked())
+}
+
+// activityWindowOrLocked 取生效的活跃窗口（零值 = 缺省；调用方持锁）。
+func (t *Table) activityWindowOrLocked() time.Duration {
+	if t.activityWindow > 0 {
+		return t.activityWindow
+	}
+	return core.DefaultActivityWindow
 }
 
 // Agents 返回某 session 的 agent 行（按首次见到顺序 = 树的自然顺序）。
@@ -976,7 +1121,7 @@ func (t *Table) GateMembers(gateID string) []SessionRow {
 	out := make([]SessionRow, 0, len(members))
 	for sid := range members {
 		if st, ok := t.sessions[sid]; ok && st.live {
-			out = append(out, sessionRowLocked(st))
+			out = append(out, t.sessionRowLocked(st))
 		}
 	}
 	sortSessionRows(out)
@@ -1023,9 +1168,10 @@ func (t *Table) joinHistoryLocked() []GateJoin {
 // VisiblePeers 返回 sessionID 的**水平可见对端**（K11①）。
 //
 // 规则：只有 session 的**主 agent**之间互相可见，条件活跃 gates(A) ∩ 活跃 gates(B) ≠ ∅
-// （G15：任一侧显式 leave 了该 gate → 不再相交 → 互不可见）；对端必须是**存活** session
-// （成员关系是活的，G17b）。别 session 的 subagent 完全不可见（粒度是 session 的主 agent，
-// 不是 agent）。
+// （G15：任一侧显式 leave 了该 gate → 不再相交 → 互不可见）；对端必须是**活跃** session
+// （G-a：running ∨ 最后事件 ts 在窗口内——判定源是事件 ts，跨容器一致；托管 live 不再是
+// 条件，托管但超窗的对端不进可见面）。别 session 的 subagent 完全不可见（粒度是 session
+// 的主 agent，不是 agent）。
 //
 // 查询方自己不在结果里；未知/无事件的 session → 空。
 func (t *Table) VisiblePeers(sessionID contracts.Ulid) []PeerRow {
@@ -1045,7 +1191,10 @@ func (t *Table) visiblePeersLocked(sessionID contracts.Ulid) []PeerRow {
 	mine := me.activeGatesLocked()
 	out := make([]PeerRow, 0, len(t.sessions))
 	for _, other := range t.sessions {
-		if other.id == me.id || !other.live {
+		// 条件①（G-a）：对端必须**活跃**——活跃判定跨容器一致（事件 ts + 窗口），
+		// live 是进程本地的"托管"，拿它当条件会让两台容器对同一事件流算出不同的可见面。
+		// 活跃 = running ∨ 窗口内（activeLocked，与 SessionActive / 行出口同一处判定）。
+		if other.id == me.id || !t.activeLocked(other) {
 			continue
 		}
 		shared := sharedGates(mine, other)

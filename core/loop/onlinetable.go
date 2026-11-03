@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Yorha9e/alasol/contracts"
@@ -97,6 +98,10 @@ type OnlineTableView struct {
 	Level string `json:"level"`
 	// WindowLines level=n 时每行展开的窗口行数（K14；0 由 View 解析为默认）。
 	WindowLines int `json:"window_lines"`
+	// ActivityWindow 活跃窗口（G-a 在线三态：活跃 = running ∨ 最后事件 ts ≤ 本窗口）。
+	// 时长字符串（如 "15m"，time.Duration 形态）；零值由 View 解析为
+	// core.DefaultActivityWindow（全仓唯一权威常量，此处只序列化不复制数值）。
+	ActivityWindow string `json:"activity_window"`
 }
 
 // OnlineTableUpdate 是一次**部分更新**（nil 字段不变；运行期动态管理用，K15）。
@@ -105,6 +110,9 @@ type OnlineTableUpdate struct {
 	LineTokenBudget *int    `json:"line_token_budget,omitempty"`
 	Level           *string `json:"level,omitempty"`
 	WindowLines     *int    `json:"window_lines,omitempty"`
+	// ActivityWindow 活跃窗口的时长字符串（如 "15m"；"" = 用默认；nil = 不变）。
+	// 非法字符串 / 负时长 → Update 拒绝（先校验后应用，原配置不动）。
+	ActivityWindow *string `json:"activity_window,omitempty"`
 }
 
 // OnlineTableConfig 是在线表的**活配置**（并发安全；hub 建一个、所有 loop 共享、HTTP 端点调它）。
@@ -117,15 +125,21 @@ type OnlineTableConfig struct {
 	lineTokenBudget int
 	level           string
 	windowLines     int
+	// activityWindow 活跃窗口（G-a）。**零值 = core.DefaultActivityWindow**（零值即缺省，
+	// 与 discovery.Table 同口径）——本文件不 import core/discovery（边界纪律），缺省值
+	// 只从 core 根包的权威常量取。
+	activityWindow time.Duration
 }
 
-// NewOnlineTableConfig 建一个带默认值的在线表配置（K15：N=50 / 每行 ≤100 token / summary）。
+// NewOnlineTableConfig 建一个带默认值的在线表配置（K15：N=50 / 每行 ≤100 token / summary；
+// 活跃窗口 = core.DefaultActivityWindow，G-a）。
 func NewOnlineTableConfig() *OnlineTableConfig {
 	return &OnlineTableConfig{
 		maxRows:         DefaultOnlineTableRows,
 		lineTokenBudget: DefaultLineTokenBudget,
 		level:           DefaultLevel,
 		windowLines:     DefaultWindowLines,
+		activityWindow:  core.DefaultActivityWindow,
 	}
 }
 
@@ -137,6 +151,7 @@ func (c *OnlineTableConfig) View() OnlineTableView {
 			LineTokenBudget: DefaultLineTokenBudget,
 			Level:           DefaultLevel,
 			WindowLines:     DefaultWindowLines,
+			ActivityWindow:  activityWindowString(core.DefaultActivityWindow),
 		}
 	}
 	c.mu.RLock()
@@ -146,7 +161,19 @@ func (c *OnlineTableConfig) View() OnlineTableView {
 		LineTokenBudget: positiveOr(c.lineTokenBudget, DefaultLineTokenBudget),
 		Level:           levelOr(c.level),
 		WindowLines:     positiveOr(c.windowLines, DefaultWindowLines),
+		ActivityWindow:  activityWindowString(activityWindowOr(c.activityWindow)),
 	}
+}
+
+// ActivityWindow 取当前生效的活跃窗口（G-a；零值/负值归一到 core.DefaultActivityWindow）。
+// 供只拿这一个参数的调用方用，不必整份 View 快照。
+func (c *OnlineTableConfig) ActivityWindow() time.Duration {
+	if c == nil {
+		return core.DefaultActivityWindow
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return activityWindowOr(c.activityWindow)
 }
 
 // Update 应用一次部分更新（nil 字段不变）。**先校验后应用**：校验失败 → 原配置一动不动 + 返回 error
@@ -167,6 +194,17 @@ func (c *OnlineTableConfig) Update(u OnlineTableUpdate) error {
 	if u.Level != nil && !validLevel(*u.Level) {
 		return fmt.Errorf("loop: level 只支持 %s | %s | %s（得到 %q）", LevelSummary, LevelN, LevelFull, *u.Level)
 	}
+	// activity_window：时长字符串（"15m" 形态，time.ParseDuration）。"" = 用默认（同
+	// 数值参数的 0 = 用默认口径）；解析失败 / 负时长 → 拒（负数 = 拒，与数值参数一致）。
+	var newWindow time.Duration
+	if u.ActivityWindow != nil && *u.ActivityWindow != "" {
+		d, err := time.ParseDuration(*u.ActivityWindow)
+		if err != nil || d < 0 {
+			return fmt.Errorf("loop: activity_window 须是非负时长字符串（如 %q；空 = 用默认 %s）（得到 %q）",
+				"15m", activityWindowString(core.DefaultActivityWindow), *u.ActivityWindow)
+		}
+		newWindow = d // 0（如 "0s"）存 0 → View 归一到默认
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if u.MaxRows != nil {
@@ -181,6 +219,9 @@ func (c *OnlineTableConfig) Update(u OnlineTableUpdate) error {
 	if u.WindowLines != nil {
 		c.windowLines = *u.WindowLines
 	}
+	if u.ActivityWindow != nil {
+		c.activityWindow = newWindow
+	}
 	return nil
 }
 
@@ -189,6 +230,32 @@ func positiveOr(v, def int) int {
 		return v
 	}
 	return def
+}
+
+// activityWindowOr 把 0/负时长归一到 core.DefaultActivityWindow（零值即缺省，G-a）。
+func activityWindowOr(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return core.DefaultActivityWindow
+}
+
+// activityWindowString 把窗口序列化成配置面的时长字符串（"15m" / "2h" / "1m30s"）。
+//
+// 为什么不直接用 Duration.String()：它把 15 分钟写成 "15m0s"——配置面的书写形态是
+// "15m"（time.ParseDuration 两种都认，但 HTTP 面给用户的值该是整洁的那个）。
+// 整小时 / 整分钟走短形，其余（带秒）回退 Duration.String()（仍是合法 ParseDuration 输入）。
+func activityWindowString(d time.Duration) string {
+	switch {
+	case d <= 0:
+		return activityWindowString(core.DefaultActivityWindow)
+	case d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	case d%time.Minute == 0:
+		return fmt.Sprintf("%dm", int64(d/time.Minute))
+	default:
+		return d.String()
+	}
 }
 
 func levelOr(v string) string {

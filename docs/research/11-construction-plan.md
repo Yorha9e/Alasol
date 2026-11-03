@@ -367,7 +367,7 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 
 | 批次 | 刀 | 内容 |
 |---|---|---|
-| 1 | G-a + G-b | 在线表三态（活跃 = running ∨ 最后事件 ts ≤ 15min，窗口进 onlineTableConfig）+ 四消费方对齐（注入/peers/presence/API）+ 默认接管（懒接管；Claim 冲突为唯一拒绝线） |
+| 1 | G-a + G-b | 在线表三态（活跃 = running ∨ 最后事件 ts ≤ 15min，窗口进 onlineTableConfig）+ 四消费方对齐（注入/peers/presence/API）+ 默认接管（懒接管；Claim 冲突为唯一拒绝线）。**✅ 完成（2026-11-03）**：critic 3 轮收口（P0 并发绕过/截断次序/历史折叠/F1-F4）+ 变异自证 5 处；RunPrompt 顺手落"每轮折叠历史"（多轮同源）；挂账见 07 尾注 |
 | 2 | G-c + G-d + G-f | per-prompt 配置体系（`config.changed` 契约增量 F7 全链 + 生效链 hub 默认→session fold→本轮快照）+ 模型面字段（model/effort/provider+凭据纪律）+ standby 待机工具（waiting 态 + message/timeout；X1/resume/WAL 三交互点） |
 | 3 | G-e + G-g + G-j | config.tools 工具白名单修改（白名单语义）+ 权限面（config.policy；**开工前拍安全语义**）+ standby 的 `event` 等待条件（第二批等待条件） |
 | 4 | G-h + G-i | 上下文面配置化 + profile 机制 / 执行面 |
