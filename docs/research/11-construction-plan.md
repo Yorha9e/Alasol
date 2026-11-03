@@ -361,6 +361,19 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 
 ---
 
+## 4.6 下一阶段：session / per-prompt 面（2026-11-03 定稿，设计见 `15`）
+
+缺口 1–8 收口后用户拍板的新工程。设计全部定稿（`15-session-per-prompt-design.md`），施工按批次：
+
+| 批次 | 刀 | 内容 |
+|---|---|---|
+| 1 | G-a + G-b | 在线表三态（活跃 = running ∨ 最后事件 ts ≤ 15min，窗口进 onlineTableConfig）+ 四消费方对齐（注入/peers/presence/API）+ 默认接管（懒接管；Claim 冲突为唯一拒绝线） |
+| 2 | G-c + G-d + G-f | per-prompt 配置体系（`config.changed` 契约增量 F7 全链 + 生效链 hub 默认→session fold→本轮快照）+ 模型面字段（model/effort/provider+凭据纪律）+ standby 待机工具（waiting 态 + message/timeout；X1/resume/WAL 三交互点） |
+| 3 | G-e + G-g | config.tools 工具白名单修改（白名单语义）+ 权限面（config.policy；**开工前拍安全语义**） |
+| 4 | G-h + G-i | 上下文面配置化 + profile 机制 / 执行面 |
+
+验收硬门槛照 §2 阶段纪律（critic → reviewer → critic 循环至 clean + 变异自证 + 07 回填）。
+
 ## 5. 相关
 
 `00` 调研总览 · `01` 权限与沙箱 · `03` provider SDK 实测 · `05` 语言定案 · `06` 骨架规格 · `07` 决策总表 · `08` ID 设计 · `09` 包边界 · `10` 审阅报告 · `spike/` 存储实测

@@ -18,6 +18,10 @@
 | 6 | **观测/工程缺口** | telemetry/trace（L1/L2/D19）、长历史分段惰性加载（G5）、模型路由（I7）、git 状态按需查（J3，07 口径） | ·83 真缺口部分 | **b 半 = telemetry/trace（L1/L2/D19）✅ 完成（2026-11-01）**：事件流即 trace（不另建 trace 系统）+ 独立 telemetry 管道（默认关/脱敏/单向；`runtime/telemetry` noop/file/otlp 留位 + host `[telemetry]`，见 07 L1/L2/D19 行内）；**G5 ✅ 完成（2026-11-01）**：长历史分段 + 偏移索引 + 惰性加载——core.Store 只增只读增量面 `SliceReader.ReadSlice`（seq 闭区间分段读，Append/ReadFrom 一字不改、零契约改动）+ sqlite 实现（seq 主键范围扫描 + LIMIT）+ 消费点接上（host storeTextSource recall 逐段惰性读，不认 SliceReader 自动退回 ReadFrom；酸测试关/开逐字节一致、变异自证钉子红，见 07 G5 行内）；I7 路由扩展点 + J3 git_status 工具已落（530b7ae）——**第 6 项全件收口** |
 | 7 | **原 v4 冻结遗留** | 跨进程托管注册（G2/G25 根治）、hub 归属字段（G12）、run_id 归组（G13）、policy 结构化成因码、G17 git 观测、评测（L4/L5） | 挂账注记 | **GUI 反馈三件已根治（2026-11-01 v4-7）**：① 跨进程托管注册（G25）——core/discovery `Claim`/`HostOf`（Activate 之上登记宿主 hub 进程标识，冲突 fail-close 拒绝接管）+ host loopFor 接线 + `Hub.ID()`；② hub 归属字段（GUI G12）——/api/sessions 行增 `host_hub`（与 hostable 组合，HTTP 面只增）；③ run_id 归组（GUI G13）——`ModelDeltaPayload` 增可选 `run_id`（F7 只增：schema→codegen→INVENTORY→样本→TS 三件套），loop Run 起始生成 ULID 随 delta 带出，订阅端按 (run_id, turn) 归组；变异自证：不带 run_id → 归组钉红。钉子：discovery/host_claim_test.go、host TestSessionsHostHubField+TestLoopForClaimConflictFailClose、loop TestModelDeltaRunIDPresent+TestModelDeltaConcurrentRunsGroupByRunID。**后半三小件已根治（2026-11-01 v4-7 后半）**：④ policy 结构化成因码——`Decision.code`（DecisionCode 十码，F7 只增全链）+ core/policy·core/registry 全出口填码 + policy_snapshot 透出 + isNoAnswerDeny 改按 code 判（07 D13/D14 行内）；⑤ G17 git 观测——`GET /api/git`（共享 SnapshotGitStatus 探测逻辑；HTTP-only 不进事件流、拉式现采、非仓如实 repo=false，07 J3 行内）；⑥ 评测（L4/L5）——`alasol eval -session <id>`（事件流即数据集、逐 turn 指标单行 JSON、不建独立评测框架；07 L4/L5 ·→✅ 合计同步）。钉子：policy/registry 成因码钉 + host TestGitEndpoint 三钉 + cmd TestEvalCLI 三钉。**第 7 项全件收口** |
 
+## 下一阶段（2026-11-03 定稿）：session / per-prompt 面
+
+v4 排期 7 项全收口后的用户拍板新工程。**设计定稿见 `15`**，施工排期见 `11 §4.6`。一句话：在线表三态（15min 活跃窗口防接管后膨胀）+ 旧 session 默认接管 + per-prompt = 会话配置修改（`config.changed` 事件折叠、本轮生效/持久/重启生效）+ standby 待机工具（多 agent 协作防掉线）+ 权限面（待拍安全语义）。批次 G-a..G-i。
+
 ## 不做（已拍板排除）
 
 - W11 热重载（启动装载+运行期挂/卸够用）
