@@ -485,6 +485,31 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 					}
 				}
 			}
+			// G-h 上下文装配面：样本钉住 context 的真实形状（kind + 窗口 + 两个百分比
+			// + 两个注入区预算都带；数值项**出现 = 覆盖**，0 = 清除回默认——样本演示
+			// 覆盖形状，不该拿 0 占位）。
+			if p.Context == nil {
+				t.Errorf("line %d: config.changed 应带 context 上下文面（G-h）", lineNo)
+				break
+			}
+			if p.Context.Kind == nil || *p.Context.Kind == "" {
+				t.Errorf("line %d: config.changed context.kind 带了就不该是空串（空串 = 清除，样本应演示覆盖）", lineNo)
+			}
+			if p.Context.Window == nil || *p.Context.Window <= 0 {
+				t.Errorf("line %d: config.changed context.window 应带正数（出现 = 覆盖；0 = 清除回默认）", lineNo)
+			}
+			if p.Context.L1Pct == nil || *p.Context.L1Pct <= 0 {
+				t.Errorf("line %d: config.changed context.l1_pct 应带正数（0 = 清除回默认）", lineNo)
+			}
+			if p.Context.L2Pct == nil || *p.Context.L2Pct <= 0 {
+				t.Errorf("line %d: config.changed context.l2_pct 应带正数（0 = 清除回默认）", lineNo)
+			}
+			if p.Context.RulesBudget == nil || *p.Context.RulesBudget <= 0 {
+				t.Errorf("line %d: config.changed context.rules_budget 应带正数（0 = 清除回默认）", lineNo)
+			}
+			if p.Context.CommonSenseBudget == nil || *p.Context.CommonSenseBudget <= 0 {
+				t.Errorf("line %d: config.changed context.common_sense_budget 应带正数（0 = 清除回默认）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}

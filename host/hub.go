@@ -1167,6 +1167,12 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		h.mu.Unlock()
 		return nil, false, fmt.Errorf("host: 为 session %s 装配上下文策略: %w", sessionID, err)
 	}
+	if strategy == nil {
+		// G-h：session 级 kind 覆盖（config.context.kind=tiered）能把 append 提成 tiered
+		// → 补挂一个**只备不用**的 tiered 能力工厂（loop 只在本轮生效 kind = tiered 时
+		// 才调它；append 时它不会被调用 → 零开销、零行为变化）。
+		strategy = h.contextStrategyCapabilityFactory(sessionID, agentID)
+	}
 	// v3-S6-B：MultiAgent 开 → 每 session 一棵 agent 树（root=主 agent id，续跑复用）+ 把
 	// loop.Agents 接进 loop.Config（spawn/complete 对模型可见、子 agent 可派生、W6-A 子策略钩子）。
 	// 关（默认）= agentsEnv 留 nil → loop.New 收 nil = 单 agent 模式零行为变化（酸测试）。
@@ -1200,7 +1206,10 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		// config.fold（扫平事件流）+ 叠 hub 默认 → 冻结进 runState（轮 = Run 开始
 		// 重取；运行中变更不影响已冻结的本轮，下一轮生效）。无配置事件时返回零值
 		// 覆盖（等价于不挂），代价只是每次 Run 多一次增量扫描。
-		RunOverrides:  h.runOverridesHook(sessionID),
+		//
+		// G-h：钩子顺带解析**本轮生效的上下文策略 kind**（session 覆盖 + 基线 kind），
+		// 基线 kind = strategyKind（宿主默认 / 工作流声明）。
+		RunOverrides:  h.runOverridesHook(sessionID, strategyKind),
 		ContextBudget: h.contextBudgetFor(strategyKind),
 		// W15 逐轮预算制动（v4-4-B 缺口 5）：BudgetMaxTokens<=0 → nil 钩子（零查询、
 		// 零行为变化）；>0 → 每轮 provider.Run 前读一次累计成本（checkBudget 同款
@@ -1215,6 +1224,11 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		// 上下文策略（v2-S1；nil = append 默认）。per-Run 工厂，见 contextStrategyFactory。
 		// strategyKind 已按激活的工作流声明的 context_strategy 收敛（W6）。
 		ContextStrategy: strategy,
+		// 注入区截断的观测回调（G-h）：loop 灌完本轮参数后回读装配器的截断观测面 →
+		// 截断了就 Warn 留痕（退化必须可见——静默砍掉规则等于悄悄丢上下文）。
+		ContextInjectionObserver: func(rules, commonSense bool) {
+			h.noteContextInjectionTruncated(sessionID, rules, commonSense)
+		},
 		// goal ledger 更新工具（J19/X6；opt-in，默认关 = 零行为变化）。
 		GoalLedger: h.cfg.GoalLedger,
 		// 多 agent 环境（v3-S6-B；nil = 单 agent 模式默认）。见上面的 agentsEnv 装配。
@@ -1330,6 +1344,11 @@ func (h *Hub) agentTreeForLocked(sessionID, agentID contracts.Ulid) *agents.Tree
 // **与上下文策略同源**（F10/F13）：挂 tiered 时窗口 W 就是上下文预算——用 loop 的 200k
 // 默认分母去算 1M 窗口的占用，UI 的占比会显示成几百个百分点（占比失真）。
 // 显式配了 ContextBudget 则以它为准；kind 非 tiered → 0 = loop 用默认（append 路径）。
+//
+// **session 级窗口覆盖优先**（G-h）：session 改了窗口（config.context.window）→ 分母
+// 跟着换（否则窗口换了、占比还按旧窗口算 = 占比失真）。这一步在 **loop 侧按 Run** 做
+// （core/loop 的 tokensBudgetFor：读本轮快照的覆盖值）——因为覆盖是运行期可变的，
+// 装配期定下来的分母跟不上。
 func (h *Hub) contextBudgetFor(kind string) int64 {
 	if h.cfg.ContextBudget > 0 {
 		return h.cfg.ContextBudget

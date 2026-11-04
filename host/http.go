@@ -423,11 +423,12 @@ const maxSessionCreateBody = 4 << 10
 
 // serveSessionCreate 服务 POST /api/sessions（开新会话的 REST 入口，v3-S5 ①）。
 //
-//	请求体（可选，可为空）：{"cwd":"…","run_id":"…","worktree":"…"}（SessionSpec 的 JSON 面；
-//	    全部可省 = 用 hub 级默认）
+//	请求体（可选，可为空）：{"cwd":"…","run_id":"…","worktree":"…","profile":"…"}
+//	    （SessionSpec 的 JSON 面；全部可省 = 用 hub 级默认）
 //	201 → {"session_id":"<ULID>"}：本进程托管的空 session（**不自动跑 prompt**——纯建会话，
 //	    首轮对话由调用方随后 POST /api/sessions/{id}/prompt 发起）
-//	400 → 体不是合法 JSON / CreateSession 校验失败（坏 cwd / 坏 worktree / 坏 run_id）
+//	400 → 体不是合法 JSON / CreateSession 校验失败（坏 cwd / 坏 worktree / 坏 run_id）/
+//	    未知 profile 名（bad_profile）
 //
 // 托管口径（G2/G25）：与 WS command.submit（不带 session_id）新建路径**同源同口径**——
 // 都是"本进程即宿主"。CreateSession 只登记归属（specs），托管的判据是 h.loops 里有
@@ -438,13 +439,46 @@ func (h *Hub) serveSessionCreate(w http.ResponseWriter, r *http.Request) {
 		CWD      string `json:"cwd"`
 		RunID    string `json:"run_id"`
 		Worktree string `json:"worktree"`
+		// Profile 命名 profile（G-i）：**执行面**（cwd / worktree / run_id）做基线，
+		// 显式 body 字段压过它。配置面（模型/工具/上下文）不在这儿——那走 prompt 的
+		// profile 槽位（展开成 config.changed 变更集）。
+		Profile string `json:"profile"`
 	}
 	// body 可空：EOF（没发体）= 全用 hub 级默认，不算坏体。
 	if err := json.NewDecoder(io.LimitReader(r.Body, maxSessionCreateBody)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
 		return
 	}
-	sid, err := h.CreateSession(SessionSpec{CWD: body.CWD, RunID: body.RunID, Worktree: body.Worktree})
+	spec := SessionSpec{CWD: body.CWD, RunID: body.RunID, Worktree: body.Worktree}
+	// G-i：profile 的**执行面**填进 SessionSpec（显式 body 字段压过 profile——请求里
+	// 显式写的更近，优先级更高）。未知 profile 名 → 400 bad_profile（fail-close）。
+	if name := strings.TrimSpace(body.Profile); name != "" {
+		p, ok := h.cfg.Profiles[name]
+		if !ok {
+			writeJSONError(w, http.StatusBadRequest, "bad_profile",
+				fmt.Sprintf("profile %q 不存在（可用的：%s）", name, h.profileNamesText()))
+			return
+		}
+		if strings.TrimSpace(spec.CWD) == "" {
+			spec.CWD = p.CWD
+		}
+		if strings.TrimSpace(spec.RunID) == "" {
+			spec.RunID = p.RunID
+		}
+		if strings.TrimSpace(spec.Worktree) == "" {
+			spec.Worktree = p.Worktree
+		}
+		// **remote_host 的 v1 边界**：只留痕、不校验（**不**换 hub 级执行环境——执行器
+		// 一次性装配，per-session 换执行环境属后置，见 host/worktree.go 文件头）。与 hub
+		// 级 -remote 不符时只 WARN（不拒：声明本身无害，拒了反而挡住"先声明后实现"）。
+		if p.RemoteHost != "" && (!h.cfg.Remote || strings.TrimSpace(h.cfg.RemoteHost) != p.RemoteHost) {
+			hubLog.Warn("host: profile 声明了 remote_host，但 v1 不实现 per-session 远程执行"+
+				"（只作声明记录，不改变 hub 级执行环境）；且与 hub 级 -remote 不符",
+				"profile", name, "profile_remote_host", p.RemoteHost,
+				"hub_remote", h.cfg.Remote, "hub_remote_host", h.cfg.RemoteHost)
+		}
+	}
+	sid, err := h.CreateSession(spec)
 	if err != nil {
 		// CreateSession 的校验失败都是入参问题（坏 CWD / 坏 worktree / 坏 run_id）→ 400。
 		writeJSONError(w, http.StatusBadRequest, "session_create_failed", err.Error())

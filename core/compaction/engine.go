@@ -91,8 +91,16 @@ type Engine struct {
 	//
 	// 两者都**在设置时**按布局预算截断并缓存（SetCommonSense/SetRules）；截断事实由
 	// 下面的两个标记记录（InjectionTruncated 暴露给宿主留痕——退化必须可见）。
+	//
+	// **原文另存一份**（commonSenseRaw / rulesRaw）：参数被换掉时（SetParams，G-h 的
+	// per-Run 生效口）要按**新预算重新截断**——只存截断后的文本就再也截不回去了
+	//（上限变了、注入区还是老口径 → 可能超预算顶穿窗口）。
 	commonSense string
 	rules       string
+	// commonSenseRaw / rulesRaw 是注入文本的**原文**（重截断的输入；不截断 = 与
+	// 截断后的文本相同）。
+	commonSenseRaw string
+	rulesRaw       string
 	// commonSenseTruncated / rulesTruncated：注入文本被截断过（未截断 = false）。
 	commonSenseTruncated bool
 	rulesTruncated       bool
@@ -168,6 +176,7 @@ func NewEngine(params Params, seq SeqSource, text TextSource, ledger LedgerSourc
 // 截断事实由 InjectionTruncated() 暴露（宿主据此留痕）。
 func (e *Engine) SetCommonSense(text string) {
 	e.mu.Lock()
+	e.commonSenseRaw = text
 	e.commonSense = truncate(text, e.params.CommonSenseBudget)
 	e.commonSenseTruncated = e.commonSense != text
 	e.mu.Unlock()
@@ -187,9 +196,40 @@ func (e *Engine) Params() Params {
 // 截断事实由 InjectionTruncated() 暴露（宿主据此留痕——退化必须可见）。
 func (e *Engine) SetRules(text string) {
 	e.mu.Lock()
+	e.rulesRaw = text
 	e.rules = truncate(text, e.params.RulesBudget)
 	e.rulesTruncated = e.rules != text
 	e.mu.Unlock()
+}
+
+// SetParams 换成本轮生效的可配参数（G-h 的 per-Run 生效口；loop 在冻结本轮快照之后调）。
+//
+// **fail-close**：窗口硬约束（W ≥ 256k）与布局自洽（历史区预算不得为负）在这里**重做**
+// 一次（NewEngine 时已校过一次——参数换了，那两条可能就不成立了）。不合法 → 返回
+// error，**不静默降级**成默认值（那等于"用户配的窗口悄悄没生效"，比报错更糟）。
+//
+// 注入区文本（规则 / 常识区）按**设置时**的预算截断并缓存 → 参数换了要**重新截断**
+// （上限变了、截断还按老口径 = 注入区可能超预算顶穿窗口）。原文留着，重截断不丢内容。
+func (e *Engine) SetParams(p Params) error {
+	if e == nil {
+		return errors.New("compaction: Engine 为 nil")
+	}
+	p = p.normalized()
+	if err := ValidateWindow(p.Window); err != nil {
+		return err
+	}
+	if err := ValidateLayout(p); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.params = p
+	// 注入区按新预算重截断（原文是输入；退化事实照旧留痕）。
+	e.rules = truncate(e.rulesRaw, p.RulesBudget)
+	e.rulesTruncated = e.rules != e.rulesRaw
+	e.commonSense = truncate(e.commonSenseRaw, p.CommonSenseBudget)
+	e.commonSenseTruncated = e.commonSense != e.commonSenseRaw
+	e.mu.Unlock()
+	return nil
 }
 
 // InjectionTruncated 报告注入区文本是否被截断（退化留痕的观测面）。

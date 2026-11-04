@@ -107,11 +107,17 @@ func estimateMessageTokens(m core.Message) int64 {
 //
 // 没有条目就没有 part：System 为空 / 无可见工具 / 无消息时对应 source 根本不出现
 // （"谁都没贡献"用"没有这个 source"表达，比渲染一个 0 宽分段诚实）。
-func (l *Loop) contextSnapshot(turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart) contracts.ContextSnapshot {
+//
+// budget 是**本轮**的占比分母（G-h：session 覆盖了窗口 → 分母跟着换；<=0 = 用
+// loop 基线，即构造期那套 Config.ContextBudget / tiered 窗口）。
+func (l *Loop) contextSnapshot(turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart, budget int64) contracts.ContextSnapshot {
+	if budget <= 0 {
+		budget = l.contextBudget // 没带本轮预算 → 用基线（构造期那套）
+	}
 	snap := contracts.ContextSnapshot{
 		SessionID:    l.sessionID,
 		Turn:         int64(turn),
-		TokensBudget: l.contextBudget,
+		TokensBudget: budget,
 		Parts:        []contracts.ContextPart{},
 	}
 	var used int64
@@ -209,8 +215,8 @@ const phaseContextAssembled = "context.assembled"
 // 所有 durable 事件都落不下去（那种情况下 loop.error 同样落不下，agent 也跑不动），
 // 但把"可视化"做成 agent 的执行前提会让可用性被一个非核心特性绑架。诚实取舍：
 // 落不下就在事件流里记一笔，绝不在调用前伪造一条没落库的快照。
-func (l *Loop) publishContextAssembled(ctx context.Context, turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart) int {
-	ev, err := l.newEvent(KindContextAssembled, nil, l.contextSnapshot(turn, req, ot, stratParts))
+func (l *Loop) publishContextAssembled(ctx context.Context, turn int, req core.ModelRequest, ot *onlineTable, stratParts []contracts.ContextPart, budget int64) int {
+	ev, err := l.newEvent(KindContextAssembled, nil, l.contextSnapshot(turn, req, ot, stratParts, budget))
 	if err != nil {
 		l.publishLoopError(ctx, turn, phaseContextAssembled, err)
 		return 0

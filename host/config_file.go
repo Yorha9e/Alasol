@@ -87,6 +87,17 @@ type FileConfig struct {
 	// 零行为变化）。装载期 fail-close（仅 MultiAgent 开时）：id 空/重名/**保留名(root)**、
 	// can_spawn 悬空/自环/成环、permission 级别非法、context_strategy.kind 越枚举 → 启动即拒并点名。
 	AgentTypes []AgentTypeFileConfig `toml:"agent_types"`
+	// Profiles 命名 profile 表（G-i；TOML 数组表 [[profiles]]）。
+	//
+	// 一张 profile = 一组 session 配置旋钮（model / reasoning_effort / provider /
+	// tools / context）+ 一组会话创建执行参数（cwd / worktree / run_id / remote_host
+	// 声明）。**数组表**而不是 map：map 下钻的 unknown-key 闸门查不到"map 里某个键名
+	// 写错了"（[[profiles]] 元素写错键能当场报错，profile 名写错只能等"找不到 profile"）。
+	//
+	// 展开与叠放：POST /prompt（或 WS command.submit）带 profile="名字" → 展开成一份
+	// config 变更集，再让请求里的显式 config 逐字段压过它，合成一条 config.changed
+	// 落流（审计里看得见展开后的值）。
+	Profiles []ProfileFileConfig `toml:"profiles"`
 	// Blob 大 payload 外置 blob（v4-3-A，G2e/D4）：[blob] 段。默认关（dir 空）= 不外置，
 	// completed 载荷与现状逐字节等价（酸测试）。配了 dir 且 max_inline>0 才启用外置。
 	Blob BlobFileConfig `toml:"blob"`
@@ -591,6 +602,140 @@ func (c FileConfig) AgentTypeConfigs() []contracts.AgentType {
 		out = append(out, ct)
 	}
 	return out
+}
+
+// ProfileFileConfig 是一张命名 profile 的文件级声明（[[profiles]] 的元素，G-i）。
+//
+// 形如：
+//
+//	[[profiles]]
+//	name = "review-fast"              # profile 名（唯一；重名 → 装载期拒）
+//	model = "gpt-4o-mini"             # 配置面：模型（空 = 不覆盖）
+//	reasoning_effort = "low"          # 配置面：思维链档位（空 = 不覆盖）
+//	cwd = "D:\work\review"            # 执行面：工作目录（会话创建时进 SessionSpec）
+//	worktree = "wt-review"            # 执行面：绑定的 worktree 名
+//	run_id = "rev-2026-11"            # 执行面：工作流运行 id（自动 gate）
+//	remote_host = "build-01"          # 执行面：远程主机**声明**（v1 不实现，只留痕不校验）
+//
+//	[profiles.provider]                # 配置面：端点覆盖（base_url + api_key_env 成对）
+//	base_url = "https://api.openai.com/v1"
+//	api_key_env = "OPENAI_API_KEY"
+//
+//	[profiles.tools]                   # 配置面：工具白名单（G-e 同款）
+//	only = ["read"]
+//	except = ["bash"]
+//
+//	[profiles.context]                 # 配置面：上下文装配面（G-h 同款，六项旋钮）
+//	kind = "tiered"
+//	window = 512000
+//	l1_pct = 8
+//	l2_pct = 0.5
+//	rules_budget = 20000
+//	common_sense_budget = 40000
+//
+// **空字段 = 不覆盖**（profile 是模板，不是"清除"指令）：空串 / 0 / 空列表的项不出现
+// 在展开后的变更集里（出现 = 覆盖；缺失 = 不变）。
+type ProfileFileConfig struct {
+	// Name profile 名（唯一；空名 / 重名 → 装载期 fail-close）。
+	Name string `toml:"name"`
+	// Model 模型名（空 = 不覆盖）。
+	Model string `toml:"model"`
+	// ReasoningEffort 思维链档位（空 = 不覆盖）。
+	ReasoningEffort string `toml:"reasoning_effort"`
+	// Provider 端点覆盖（子表 [profiles.provider]）。
+	Provider ProfileProviderFileConfig `toml:"provider"`
+	// Tools 工具白名单覆盖（子表 [profiles.tools]）。
+	Tools ProfileToolsFileConfig `toml:"tools"`
+	// Context 上下文装配面覆盖（子表 [profiles.context]）。
+	Context ProfileContextFileConfig `toml:"context"`
+	// CWD 工作目录（执行面；会话创建时进 SessionSpec）。
+	CWD string `toml:"cwd"`
+	// Worktree 绑定的 worktree 名（执行面）。
+	Worktree string `toml:"worktree"`
+	// RunID 工作流运行 id（执行面；自动 gate 的 workflow:<run_id>）。
+	RunID string `toml:"run_id"`
+	// RemoteHost 远程执行主机的**声明**（v1：只留痕、不校验，不换 hub 级执行环境）。
+	RemoteHost string `toml:"remote_host"`
+}
+
+// ProfileProviderFileConfig 是 profile 的 provider 面（[profiles.provider]）。
+type ProfileProviderFileConfig struct {
+	// BaseURL provider 端点（空 = 不覆盖）。
+	BaseURL string `toml:"base_url"`
+	// APIKeyEnv 凭据的环境变量名（空 = 不覆盖；**只存名字**，H15）。
+	APIKeyEnv string `toml:"api_key_env"`
+}
+
+// ProfileToolsFileConfig 是 profile 的工具白名单面（[profiles.tools]）。
+type ProfileToolsFileConfig struct {
+	// Only 可见集（空数组 = 不覆盖）。
+	Only []string `toml:"only"`
+	// Except 排除集（空数组 = 不覆盖）。
+	Except []string `toml:"except"`
+}
+
+// ProfileContextFileConfig 是 profile 的上下文装配面（[profiles.context]，G-h 同款）。
+type ProfileContextFileConfig struct {
+	// Kind 上下文策略 kind（空 = 不覆盖；"append" / "tiered" 显式值）。
+	Kind string `toml:"kind"`
+	// Window 上下文窗口预算 W（token；0 = 不覆盖）。
+	Window int64 `toml:"window"`
+	// L1Pct L1 目标残留百分比（0 = 不覆盖）。
+	L1Pct float64 `toml:"l1_pct"`
+	// L2Pct L2 目标残留百分比（0 = 不覆盖）。
+	L2Pct float64 `toml:"l2_pct"`
+	// RulesBudget 项目规则注入 token 上限（0 = 不覆盖）。
+	RulesBudget int64 `toml:"rules_budget"`
+	// CommonSenseBudget 常识区注入 token 上限（0 = 不覆盖）。
+	CommonSenseBudget int64 `toml:"common_sense_budget"`
+}
+
+// ProfileConfigs 把文件级 [[profiles]] 声明折成 host.Config.Profiles（**唯一来源**，G-i）。
+//
+// **重名 → 报错**（fail-close）：同名两张表落成 map 时后者盖前者——"配了不生效"且
+// 不报错，是最难排查的一类坑（这里当场拒，指出是哪个名字重了）。
+//
+// 深拷贝切片（Tools.Only / Tools.Except）：不共享底层数组（与 AgentTypeConfigs 同纪律）。
+func (c FileConfig) ProfileConfigs() (map[string]ProfileConfig, error) {
+	if len(c.Profiles) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]ProfileConfig, len(c.Profiles))
+	for _, pf := range c.Profiles {
+		name := strings.TrimSpace(pf.Name)
+		if name == "" {
+			return nil, errors.New("host: [[profiles]] 里有一张没写 name（profile 名是按名引用的，缺名没法用）")
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("host: [[profiles]] 里有重名的 profile %q（同名两张表落哪张是随机的——当场拒，不静默取后者）", name)
+		}
+		out[name] = ProfileConfig{
+			Name:            name,
+			Model:           strings.TrimSpace(pf.Model),
+			ReasoningEffort: strings.TrimSpace(pf.ReasoningEffort),
+			Provider: ProfileProviderConfig{
+				BaseURL:   strings.TrimSpace(pf.Provider.BaseURL),
+				APIKeyEnv: strings.TrimSpace(pf.Provider.APIKeyEnv),
+			},
+			Tools: ProfileToolsConfig{
+				Only:   append([]string(nil), pf.Tools.Only...),
+				Except: append([]string(nil), pf.Tools.Except...),
+			},
+			Context: ProfileContextConfig{
+				Kind:              strings.TrimSpace(pf.Context.Kind),
+				Window:            pf.Context.Window,
+				L1Pct:             pf.Context.L1Pct,
+				L2Pct:             pf.Context.L2Pct,
+				RulesBudget:       pf.Context.RulesBudget,
+				CommonSenseBudget: pf.Context.CommonSenseBudget,
+			},
+			CWD:        strings.TrimSpace(pf.CWD),
+			Worktree:   strings.TrimSpace(pf.Worktree),
+			RunID:      strings.TrimSpace(pf.RunID),
+			RemoteHost: strings.TrimSpace(pf.RemoteHost),
+		}
+	}
+	return out, nil
 }
 
 // permLevelOrNone 把权限级别归一化：空（trim 后）= none（least privilege）；其余原样返回

@@ -28,6 +28,15 @@ import (
 // contextStrategyTiered 是 Config.ContextStrategy 启用 tiered 引擎的取值。
 const contextStrategyTiered = "tiered"
 
+// contextStrategyAppend 是上下文策略 kind 的**显式追加式**取值（G-h 的 config.context
+// 专用值空间）。
+//
+// **为什么宿主配置那边没有它**：Config.ContextStrategy 的值空间是宿主默认（"" = append
+// / tiered），**不动**（那是另一层语义）；而 session 级的 config.context.kind 需要能
+// **显式**把 tiered 切回追加式——"空串"只能"清除回默认"（落回宿主默认，仍是 tiered），
+// 切不回来。故 session 级多一个显式值 "append"。
+const contextStrategyAppend = "append"
+
 // defaultRecallReadLimit 是 recall 回捞原文时单次最多读多少条事件（区间再长也只读这么多）。
 //
 // 口径（F17）：recall 是"按指针取回某段原文"，不是"把整场会话搬回来"——没有上限的话，
@@ -81,13 +90,23 @@ func (h *Hub) tieredFactory(sessionID, agentID contracts.Ulid, kind string, shar
 		return nil, nil // 宿主只实现 tiered；其余（含枚举内未实现的 stage_scoped/sliding_window）→ nil
 	}
 	params := h.cfg.contextStrategyParams()
-	rules := h.cfg.ContextRules
-	if !shareRules {
-		rules = "" // 子 agent 未开 share_project_assets → 不注入项目规则（W6-A）
-	}
 	// 先校验一次窗口（装配期就拒，别等到第一次 Run 才炸）。
 	if _, err := compaction.NewEngine(params, nil, nil, nil, nil, nil); err != nil {
 		return nil, err
+	}
+	return h.tieredBuilder(sessionID, agentID, params, shareRules, cursor, false), nil
+}
+
+// tieredBuilder 造 tiered 的 **per-Run 引擎工厂**（引擎每次 Run 现造，参数在闭包里）。
+//
+// failClose = true（能力工厂那条路）：引擎造不出来 → 返回 **nil** → loop 收成
+// fail-close（"工厂产出 nil Assembler"），**不静默降级**成 append。
+// failClose = false（宿主基线已是 tiered 那条路）：已在装配期校验过窗口，理论不失败；
+// 真失败返回一个 append（不阻断 agent）——与本文件既有口径同款。
+func (h *Hub) tieredBuilder(sessionID, agentID contracts.Ulid, params compaction.Params, shareRules bool, cursor *compaction.ValidationCursor, failClose bool) compaction.AssemblerFactory {
+	rules := h.cfg.ContextRules
+	if !shareRules {
+		rules = "" // 子 agent 未开 share_project_assets → 不注入项目规则（W6-A）
 	}
 	return func() compaction.Assembler {
 		engine, err := compaction.NewEngine(
@@ -99,6 +118,13 @@ func (h *Hub) tieredFactory(sessionID, agentID contracts.Ulid, kind string, shar
 			busEmitter{bus: h.bus, sessionID: sessionID, agentID: agentID},
 		)
 		if err != nil {
+			if failClose {
+				// 能力工厂（宿主基线是 append、session 级 kind 覆盖把它提成 tiered）：
+				// 引擎造不出来 = 装配残缺 → fail-close（loop 会以错误收口本轮）。
+				hubLog.Warn("host: tiered 上下文策略装配失败（该轮以错误收口，不静默降级成 append）",
+					"session_id", string(sessionID), "agent_id", string(agentID), "err", err.Error())
+				return nil
+			}
 			// 已在装配期校验过窗口，这里理论不失败；真失败返回一个 append（不阻断 agent）。
 			return compaction.AppendAssembler{}
 		}
@@ -115,19 +141,59 @@ func (h *Hub) tieredFactory(sessionID, agentID contracts.Ulid, kind string, shar
 			engine.SetValidationCursor(cursor)
 		}
 		// 注入区被截断 → **留痕**（退化必须可见：静默砍掉规则等于悄悄丢上下文）。
-		// 工厂是 per-Run 的 → 告警**只报一次**（否则每轮一条，噪声淹没真问题）。
-		if r, cs := engine.InjectionTruncated(); r || cs {
-			h.mu.Lock()
-			first := !h.injectWarned
-			h.injectWarned = true
-			h.mu.Unlock()
-			if first {
-				hubLog.Warn("host: 上下文注入区文本超预算已被截断（规则/常识区不可压缩 → 按布局预算截断；请调小规则文本或调大注入区预算）",
-					"session_id", string(sessionID), "rules_truncated", r, "common_sense_truncated", cs)
-			}
-		}
+		rules, commonSense := engine.InjectionTruncated()
+		h.noteContextInjectionTruncated(sessionID, rules, commonSense)
 		return engine
-	}, nil
+	}
+}
+
+// noteContextInjectionTruncated 注入区（规则 / 常识区）被预算截断 → 留痕（Warn）。
+//
+// **只报一次**（h.injectWarned）：工厂是 per-Run 的、参数也可能每轮变——不去重就是每轮
+// 一条，噪声淹没真问题。
+//
+// 两条来路都走这里：① 引擎**构造时**就超预算（宿主默认那套预算）；② 本轮生效参数灌进去
+// 后**重新截断**（G-h 的 per-Run 生效口——之前没人回读，截断是静默的，critic P2）。
+func (h *Hub) noteContextInjectionTruncated(sessionID contracts.Ulid, rules, commonSense bool) {
+	if !rules && !commonSense {
+		return
+	}
+	h.mu.Lock()
+	first := !h.injectWarned
+	h.injectWarned = true
+	h.mu.Unlock()
+	if first {
+		hubLog.Warn("host: 上下文注入区文本超预算已被截断（规则/常识区不可压缩 → 按布局预算截断；请调小规则文本或调大注入区预算）",
+			"session_id", string(sessionID), "rules_truncated", rules, "common_sense_truncated", commonSense)
+	}
+}
+
+// contextStrategyCapabilityFactory 造一个**只备不用**的 tiered 能力工厂（G-h）。
+//
+// 为什么需要它：session 级 kind 覆盖（config.context.kind=tiered）能把 append 提成
+// tiered——而宿主默认（Config.ContextStrategy=""）时**不挂**策略工厂（contextStrategyFactory
+// 对非 tiered 返回 nil）。不补这个能力，session 级的 kind 覆盖在默认宿主上就落不了地。
+//
+// **按需调用**：loop 只在**本轮生效 kind = tiered** 时才调工厂（append 时不调 → 零开销、
+// 零行为变化）。引擎用**宿主默认参数**造（那是"基值 + 覆盖"里的基值）；本轮生效参数
+// 由 loop 在冻结快照之后灌进引擎（compaction.ParamsSetter）。
+//
+// 窗口校验**不在这里做**（与 contextStrategyFactory 不同）：宿主默认窗口可能不合法
+// （append 模式下宿主不校它），但真正生效的口径是「宿主默认 + session 覆盖」——由引擎
+// 构造（NewEngine）与 loop 的参数灌入（SetParams）各自 fail-close 一次。宿主默认窗口
+// 本身不合法时，用**缺省窗口**兜底造引擎（载体），让 session 覆盖有机会把它救回来。
+func (h *Hub) contextStrategyCapabilityFactory(sessionID, agentID contracts.Ulid) compaction.AssemblerFactory {
+	params := h.cfg.contextStrategyParams()
+	if params.Window <= 0 {
+		params.Window = compaction.DefaultWindow // 0 = 缺省（compaction 的归一口径）
+	}
+	if err := compaction.ValidateWindow(params.Window); err != nil {
+		hubLog.Warn("host: 宿主默认上下文窗口不合法（append 模式下宿主不校它）；tiered 能力工厂改用缺省窗口兜底，"+
+			"本轮生效窗口由 session 覆盖决定（生效值仍会在装配期 fail-close 校验）",
+			"session_id", string(sessionID), "err", err.Error())
+		params.Window = compaction.DefaultWindow
+	}
+	return h.tieredBuilder(sessionID, agentID, params, true, h.validationCursorFor(sessionID), true)
 }
 
 // childStrategyFactory 造 W6-A 的 ChildStrategy 装配钩子（loop.Agents.ChildStrategy），绑到某

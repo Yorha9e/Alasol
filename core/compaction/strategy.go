@@ -156,5 +156,45 @@ type ToolVisibilitySetter interface {
 	SetVisibleToolNames(names []string)
 }
 
+// ParamsSetter 是 Assembler 的可选扩展：loop 把**本轮生效**的可配参数（窗口 W /
+// L1% / L2% / 注入区预算）告诉策略（G-h 的 per-Run 生效口）。
+//
+// 为什么是可选扩展、而不是改 AssemblerFactory 的签名：工厂签名是既有契约（core 只认
+// 接口、换/摘策略零改动），而**参数是 per-Run 的**——session 级的上下文覆盖在 Run
+// 开始冻结之后才拿得到（工厂闭包构造时那套参数只是 hub 默认）。故：工厂照旧造引擎，
+// loop 在**冻结快照之后**用本接口把生效参数灌进去。
+//
+// 实现方**必须 fail-close**：参数不合法（如 W < 256k 硬约束、注入区把窗口吃光）时
+// 返回 error，**不许静默降级**成默认值（那等于"用户配的旋钮悄悄没生效"）。
+type ParamsSetter interface {
+	SetParams(p Params) error
+}
+
+// InjectionTruncationObserver 是 Assembler 的可选扩展：**回读**注入区（规则 / 常识区）
+// 是否被预算截断。
+//
+// 为什么需要它（G-h 的 critic P2）：注入区文本在**设置时**按当时的预算截断并缓存——参数
+// 被换掉（per-Run 生效口 SetParams）后会**重新截断**，截断与否变了却**没人回读** →
+// 退化静默（悄悄丢了上下文，用户看不见）。loop 在灌参后回读这个观测面，把"截断了"报给
+// 宿主留痕（Warn，与宿主既有的注入截断告警同款口径）。
+type InjectionTruncationObserver interface {
+	InjectionTruncated() (rules, commonSense bool)
+}
+
+// ParamsGetter 是 Assembler 的可选扩展：读出当前的可配参数。
+//
+// loop 合并"基值 + 本轮覆盖"时用它取**基值**（引擎构造时那套参数 = 宿主默认）；
+// 不实现（如 AppendAssembler）= 没有基值，调用方按 compaction 的缺省值处理。
+type ParamsGetter interface {
+	Params() Params
+}
+
 // 编译期证明：*Engine 提供框架工具（recall / stage）。
 var _ ToolProvider = (*Engine)(nil)
+
+// 编译期证明：*Engine 支持 per-Run 参数注入（G-h）、参数读出与注入截断观测。
+var (
+	_ ParamsSetter                = (*Engine)(nil)
+	_ ParamsGetter                = (*Engine)(nil)
+	_ InjectionTruncationObserver = (*Engine)(nil)
+)

@@ -49,6 +49,36 @@ type Field struct {
 // HasValue 报告是否有**生效的非空覆盖**（true → 调用方用 Value；false → 叠 hub 默认）。
 func (f Field) HasValue() bool { return f.Written && f.Value != "" }
 
+// NumField 是一个**数值**字段的折叠态——三态（与 Field 同口径，只是值是数）：
+//
+//	未写过    Written=false          → 生效值 = hub 默认；
+//	显式清除  Written=true, Value=0  → 数值 0 = 清除回 hub 默认（沿用 host.Config 的
+//	                                    0 = 默认口径：0 不是"窗口为 0"，而是"用默认"）；
+//	显式覆盖  Written=true, Value≠0  → 生效值 = Value。
+//
+// 为什么单独一类（不把数值塞进 Field）：Field 的"清除"载体是空串，数值没有空串——
+// 0 既是合法值（窗口 0 无意义但预算 0 = 不限）又是"清除"的载体，必须显式约定。
+type NumField struct {
+	// Written 报告该字段是否出现过显式覆盖记录（含 0 = 清除）。
+	Written bool
+	// Value 是覆盖值（Written=true 时有效；0 = 显式清除，回 hub 默认）。
+	Value int64
+}
+
+// HasValue 报告是否有**生效的非零覆盖**（true → 调用方用 Value；false → 叠 hub 默认）。
+func (f NumField) HasValue() bool { return f.Written && f.Value != 0 }
+
+// FloatField 是**浮点**字段（百分比）的折叠态——三态同 NumField。
+type FloatField struct {
+	// Written 报告该字段是否出现过显式覆盖记录（含 0 = 清除）。
+	Written bool
+	// Value 是覆盖值（Written=true 时有效；0 = 显式清除，回 hub 默认）。
+	Value float64
+}
+
+// HasValue 报告是否有**生效的非零覆盖**（true → 调用方用 Value；false → 叠 hub 默认）。
+func (f FloatField) HasValue() bool { return f.Written && f.Value != 0 }
+
 // ProviderState 是 provider 覆盖项（base_url / api_key_env）的折叠态。
 //
 // Touched = provider 对象出现过（含"两字段都空串 = 清除覆盖"的记录）——与"从未
@@ -122,6 +152,41 @@ type ToolsState struct {
 	Except StringListField
 }
 
+// ContextState 是 session **上下文装配面**（G-h）的折叠态。
+//
+// **子字段各自 LWW**（与 ProviderState 同口径，**不学 ToolsState 的整组 LWW**）：
+// 每个子项（kind / window / l1_pct / l2_pct / rules_budget / common_sense_budget）
+// **各带一个 LWW 戳**，后写的子项只覆盖自己那一项，不影响别的子项。
+//
+// 为什么不学 tools 的整组 LWW：整组 LWW 下，一次只带部分子项的提交会把**没带的子项**
+// 一起清掉（静默丢字段）——上下文面正是"只想调一个旋钮"的典型场景（改窗口不该把
+// 百分比与注入区预算一起打回默认）。
+//
+// 子项三态：
+//
+//	kind（字符串三态，见 Field）：出现 = 覆盖；空串 = 清除回默认；缺失 = 不变；
+//	数值子项（数值三态，见 NumField / FloatField）：出现 = 覆盖；**0 = 清除回默认**；
+//	                                              缺失 = 不变（沿用上一次的值）。
+type ContextState struct {
+	// Touched 表示 context 对象曾在变更集里出现过（含"各项都没带"的空对象）。
+	Touched bool
+	// Kind 是上下文策略 kind 的折叠态（字符串三态：空串 = 清除回默认）。
+	//
+	// **值空间**（G-h 的 session 级）：""（清除回默认）/ "append"（**显式**追加式）/
+	// "tiered"（两级压缩）。"append" 是**实值**（HasValue = true）——它让 session 能把
+	// tiered 显式切回追加式（"空串"只清除、落回宿主默认，切不回来）。
+	Kind Field
+	// Window 是上下文窗口预算 W 的折叠态（数值三态：0 = 清除回默认）。
+	Window NumField
+	// L1Pct / L2Pct 是 L1（浅摘要）/ L2（深压缩）目标残留百分比的折叠态（浮点三态）。
+	L1Pct FloatField
+	L2Pct FloatField
+	// RulesBudget / CommonSenseBudget 是注入区（项目规则 / 常识区）token 上限的折叠态
+	// （数值三态：0 = 清除回默认）。
+	RulesBudget       NumField
+	CommonSenseBudget NumField
+}
+
 // SessionConfig 是一个 session 的配置 fold 结果（**值类型**：Current 返回副本，
 // 调用方读它不持有表锁）。生效值 = 各字段 HasValue() 的 Value，否则由调用方叠
 // hub 默认（生效链第一层在 host/loop 装配里）。
@@ -131,27 +196,42 @@ type SessionConfig struct {
 	Provider        ProviderState
 	// Tools 是 session 工具白名单（G-e）的折叠态（整组 LWW，见 ToolsState）。
 	Tools ToolsState
+	// Context 是 session 上下文装配面（G-h）的折叠态（子字段各自 LWW，见 ContextState）。
+	Context ContextState
 }
 
 // fieldState 是表内单字段的折叠态（值 + LWW 戳）。
-type fieldState struct {
+//
+// 泛型化：字符串 / 整数 / 浮点三类字段共用同一套 LWW 逻辑（后写覆盖先写、旧事件不动、
+// 重复投递幂等）——三态的差别只在"清除"的载体（空串 / 0），不在折叠逻辑。
+type fieldState[T any] struct {
 	set   bool
-	value string
+	value T
 	seq   int64
 	ts    string
 }
 
 // apply 把一条变更集里的字段值折进来（后写覆盖先写；旧事件/重复投递不动）。
-func (fs *fieldState) apply(value string, seq int64, ts string) {
+func (fs *fieldState[T]) apply(value T, seq int64, ts string) {
 	if fs.set && !newerStamp(seq, ts, fs.seq, fs.ts) {
 		return // 旧事件（或同一条事件的重复投递）：折叠态不变（幂等 + 乱序容忍）
 	}
 	fs.set, fs.value, fs.seq, fs.ts = true, value, seq, ts
 }
 
-// field 折出对外的三态 Field（调用方持锁）。
-func (fs *fieldState) field() Field {
+// stringFieldOf 折出对外的三态 Field（调用方持锁）。
+func stringFieldOf(fs *fieldState[string]) Field {
 	return Field{Written: fs.set, Value: fs.value}
+}
+
+// numFieldOf 折出对外的三态 NumField（调用方持锁）。
+func numFieldOf(fs *fieldState[int64]) NumField {
+	return NumField{Written: fs.set, Value: fs.value}
+}
+
+// floatFieldOf 折出对外的三态 FloatField（调用方持锁）。
+func floatFieldOf(fs *fieldState[float64]) FloatField {
+	return FloatField{Written: fs.set, Value: fs.value}
 }
 
 // newerStamp 判定 (seq, ts) 是否**新于**已存戳（seq 守卫，照 discovery.touchSession
@@ -180,18 +260,38 @@ func newerStamp(seq int64, ts string, oseq int64, ots string) bool {
 
 // sessionState 是表内单个 session 的折叠态。
 type sessionState struct {
-	model   fieldState
-	effort  fieldState
-	baseURL fieldState
-	keyEnv  fieldState
+	model   fieldState[string]
+	effort  fieldState[string]
+	baseURL fieldState[string]
+	keyEnv  fieldState[string]
 	// providerSeen 表示 provider 对象出现过（含清除记录；只增不减——"出现过"是事实）。
 	providerSeen bool
 	// tools 是工具白名单组（G-e）的折叠态（**整组 LWW**：组自带戳，整组覆盖）。
 	tools toolsState
+	// context 是上下文装配面（G-h）的折叠态（**子字段各自 LWW**：每个子项自带戳）。
+	context contextState
 	// seen 是已折叠的 config.changed 事件 id 集合（Generation 的计数源：按事件 id
 	// 去重 → 幂等重放不重数、乱序投递不漏数）。id 为空的事件不计（纵深防御：拿不到
 	// 稳定判别位就不拿它推进"届数"，避免所有无 id 事件挤成一个计数）。
 	seen map[contracts.Ulid]struct{}
+}
+
+// contextState 是表内 context 面的折叠态（**子字段各自 LWW**：每个子项一个戳，
+// 不像 tools 那样整组共用一个戳——子字段各自 LWW 才不会"一次只带一项的提交"把
+// 别的项静默丢掉）。
+type contextState struct {
+	// seen 表示 context 对象出现过（含"各项都没带"的空对象；只增不减——"出现过"是事实）。
+	seen bool
+	// kind 是策略 kind 的折叠态（字符串三态）。
+	kind fieldState[string]
+	// window 是窗口预算 W 的折叠态（数值三态：0 = 清除回默认）。
+	window fieldState[int64]
+	// l1 / l2 是 L1/L2 目标残留百分比的折叠态（浮点三态：0 = 清除回默认）。
+	l1 fieldState[float64]
+	l2 fieldState[float64]
+	// rules / cs 是注入区（项目规则 / 常识区）token 上限的折叠态（数值三态）。
+	rules fieldState[int64]
+	cs    fieldState[int64]
 }
 
 // toolsState 是表内 tools 组的折叠态（**整组 LWW**：戳挂在组上，不挂子项）。
@@ -304,6 +404,33 @@ func (t *Table) Apply(ev *contracts.Event) {
 			}
 		}
 	}
+	// context 面（G-h）：**子字段各自 LWW**（与 provider 同口径，**不学 tools 的整组
+	// LWW**）——每个子项一个戳：后写的子项只覆盖自己那一项；没带的子项**沿用上一次
+	// 的值**（不像 tools 那样被整组覆盖打回"未设置"）。
+	//
+	// 子项三态：kind 出现 = 覆盖（空串 = 清除回默认）；数值子项出现 = 覆盖（**0 = 清除
+	// 回默认**）；缺失 = 不变。
+	if p.Context != nil {
+		st.context.seen = true // context 对象出现过（含空对象；"出现过"是事实）
+		if p.Context.Kind != nil {
+			st.context.kind.apply(*p.Context.Kind, seq, ev.TS)
+		}
+		if p.Context.Window != nil {
+			st.context.window.apply(*p.Context.Window, seq, ev.TS)
+		}
+		if p.Context.L1Pct != nil {
+			st.context.l1.apply(*p.Context.L1Pct, seq, ev.TS)
+		}
+		if p.Context.L2Pct != nil {
+			st.context.l2.apply(*p.Context.L2Pct, seq, ev.TS)
+		}
+		if p.Context.RulesBudget != nil {
+			st.context.rules.apply(*p.Context.RulesBudget, seq, ev.TS)
+		}
+		if p.Context.CommonSenseBudget != nil {
+			st.context.cs.apply(*p.Context.CommonSenseBudget, seq, ev.TS)
+		}
+	}
 }
 
 // Current 返回某 session 的配置 fold 结果（值类型副本；未知 session → 零值 =
@@ -319,17 +446,26 @@ func (t *Table) Current(sessionID contracts.Ulid) SessionConfig {
 		return SessionConfig{}
 	}
 	return SessionConfig{
-		Model:           st.model.field(),
-		ReasoningEffort: st.effort.field(),
+		Model:           stringFieldOf(&st.model),
+		ReasoningEffort: stringFieldOf(&st.effort),
 		Provider: ProviderState{
 			Touched:   st.providerSeen,
-			BaseURL:   st.baseURL.field(),
-			APIKeyEnv: st.keyEnv.field(),
+			BaseURL:   stringFieldOf(&st.baseURL),
+			APIKeyEnv: stringFieldOf(&st.keyEnv),
 		},
 		Tools: ToolsState{
 			Touched: st.tools.set,
 			Only:    st.tools.only.copy(),
 			Except:  st.tools.except.copy(),
+		},
+		Context: ContextState{
+			Touched:           st.context.seen,
+			Kind:              stringFieldOf(&st.context.kind),
+			Window:            numFieldOf(&st.context.window),
+			L1Pct:             floatFieldOf(&st.context.l1),
+			L2Pct:             floatFieldOf(&st.context.l2),
+			RulesBudget:       numFieldOf(&st.context.rules),
+			CommonSenseBudget: numFieldOf(&st.context.cs),
 		},
 	}
 }

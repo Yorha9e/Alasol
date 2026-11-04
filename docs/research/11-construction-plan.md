@@ -370,7 +370,7 @@ ho_536a1eca9585  独立核实 + 结项归档（设计 → 施工）
 | 1 | G-a + G-b | 在线表三态（活跃 = running ∨ 最后事件 ts ≤ 15min，窗口进 onlineTableConfig）+ 四消费方对齐（注入/peers/presence/API）+ 默认接管（懒接管；Claim 冲突为唯一拒绝线）。**✅ 完成（2026-11-03）**：critic 3 轮收口（P0 并发绕过/截断次序/历史折叠/F1-F4）+ 变异自证 5 处；RunPrompt 顺手落"每轮折叠历史"（多轮同源）；挂账见 07 尾注 |
 | 2 | G-c + G-d + G-f | per-prompt 配置体系（`config.changed` 契约增量 F7 全链 + 生效链 hub 默认→session fold→本轮快照）+ 模型面字段（model/effort/provider+凭据纪律）+ standby 待机工具（waiting 态 + message/timeout；X1/resume/WAL 三交互点）。**✅ 完成（2026-11-03）**：critic 五轮收口（含交付集合机制两度重构）+ 变异自证 20+ 处；挂账见 07 尾注 |
 | 3 | G-e + G-g + G-j | config.tools 工具白名单修改（白名单语义）+ 权限面（config.policy；**开工前拍安全语义**）+ standby 的 `event` 等待条件（第二批等待条件）。**✅ 完成（2026-11-04）**：G-e 落地（契约 F7 只增 `tools{only, except}` + 整组 LWW + 写路径回填堵静默放宽 + 可见集白名单两层相交）；G-j 落地（`wait:"event"` v1 表达式 + 交付集合泛化 + 早到窗口两面口径）；**G-g 拍板不做（用户）**——运行时权限修改面取消、权限维持两层静态（理由见 15 §5）；critic 修复轮收口 |
-| 4 | G-h + G-i | 上下文面配置化 + profile 机制 / 执行面 |
+| 4 | G-h + G-i | 上下文面配置化 + profile 机制 / 执行面。**✅ 完成（2026-11-04）**：G-h（config.context 六旋钮 + kind 值空间 append/tiered + 策略来回切无损钉）+ G-i（[[profiles]] 命名模板 + 展开叠放审计 + 会话创建执行参数；remote 纯声明后置）；critic 修复轮（P1 生效 kind 防钉死 + 5 P2）收口 |
 
 验收硬门槛照 §2 阶段纪律（critic → reviewer → critic 循环至 clean + 变异自证 + 07 回填）。
 

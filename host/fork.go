@@ -401,6 +401,10 @@ func (h *Hub) forkLoopConfig(forkSID, forkAgent contracts.Ulid) loop.Config {
 		WalSink:       h.walFor(forkSID),
 		TelemetrySink: h.telemetrySink(),
 		// TurnBudget / ContextStrategy **故意不传**（nil = 不挂）：见 RunBtw ④ 的刻意决定。
+		//
+		// G-h：fork **不继承**父 session 的上下文面配置（config.context）——与
+		// model / reasoning_effort / tools 同口径：fork 出来的是**新 session**，配置继承
+		// **hub 默认**。挂账：旁支那次请求的上下文边界另由 RunBtw ④ 的有界读兜着。
 	}
 }
 

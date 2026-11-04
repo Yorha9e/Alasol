@@ -172,6 +172,13 @@ type Config struct {
 	OnlineTable *OnlineTableConfig
 	// OnlineTableSource 在线表数据源（K11：self + gate 相交的对端主 agent；nil = 关闭注入）。
 	OnlineTableSource OnlineTableSource
+	// ContextInjectionObserver 是**注入区截断**的观测回调（G-h；可选，默认 nil = 不回调）。
+	//
+	// loop 在把本轮生效参数灌进装配器之后**回读**装配器的注入截断观测面
+	// （compaction.InjectionTruncationObserver）：注入区（项目规则 / 常识区）不可压缩，
+	// 预算一改就可能被截断——**截断了必须留痕**（退化必须可见：静默砍掉规则等于悄悄丢
+	// 上下文）。回调给宿主去 Warn（core 不打日志——日志出口在宿主）。
+	ContextInjectionObserver func(rules, commonSense bool)
 	// ContextStrategy 上下文装配策略工厂（v2-S1；compaction.AssemblerFactory，J8 context_strategy）。
 	// **可挂可不挂的预备单位**（13 §1）：
 	//   - nil = 不挂 → loop 走内建 append 路径，装配输出与 v1 **逐字节等价**（酸测试）；
@@ -247,6 +254,173 @@ type RunOverrides struct {
 	// Tools 本轮 session 工具白名单（G-e；零值 = 不限 = 全部已注册工具可见，
 	// 与本字段引入前的行为逐字节等价）。
 	Tools ToolVisibility
+	// Context 本轮上下文装配面的覆盖（G-h；nil = 本轮不带上下文面信息 → 用 loop/宿主
+	// 基值，行为与本字段引入前逐字节等价）。
+	//
+	// **为什么是"覆盖"而不是"生效值"**：数值项的 0 是**清除回默认**的载体（沿用
+	// host.Config 的 0 = 默认口径），所以"没覆盖"与"覆盖成 0"在生效上同义、但在
+	// **占比分母**上不同义（覆盖了窗口 → 分母换成覆盖值；没覆盖 → 分母保持宿主给的
+	// 预算）。故本快照存**覆盖值**（0 = 不覆盖），生效值 = 基值 + 覆盖（loop 侧合并，
+	// 基值取装配器当前的参数，见 compaction.ParamsGetter）。
+	Context *ContextParams
+}
+
+// ContextParams 是本轮上下文装配面的**覆盖参数**（G-h）。
+//
+// 三态口径（与 core/sessioncfg 的数值三态同款）：
+//
+//	未覆盖    零值（0 / ""）      → 用基值（宿主默认 / 装配器当前参数）；
+//	显式清除  数值 0（与未覆盖同义）→ 生效上回默认（host.Config 的 0 = 默认口径）；
+//	显式覆盖  非零值             → 生效值 = 该值。
+//
+// Kind 是**选择器**（不是数值旋钮）："" = 本轮走追加式（append）；"tiered" = 本轮走
+// 两级压缩策略。宿主在折叠 session 配置时把它解析成**本轮生效的 kind**（session 覆盖
+// 优先于宿主/工作流声明；宿主只实现 tiered，其余 kind 一律按 append 走）。
+type ContextParams struct {
+	// Kind 本轮生效的上下文策略 kind（"" = append；"tiered" = 两级压缩）。
+	Kind string
+	// Window 上下文窗口预算 W 的覆盖（token；0 = 不覆盖）。
+	Window int64
+	// L1Pct L1（浅摘要）目标残留占窗口百分比的覆盖（0 = 不覆盖）。
+	L1Pct float64
+	// L2Pct L2（深压缩）目标残留占窗口百分比的覆盖（0 = 不覆盖）。
+	L2Pct float64
+	// RulesBudget 项目规则注入的 token 上限覆盖（0 = 不覆盖）。
+	RulesBudget int64
+	// CommonSenseBudget 常识区注入的 token 上限覆盖（0 = 不覆盖）。
+	CommonSenseBudget int64
+}
+
+// hasOverride 报告本快照是否带了任何**数值覆盖**（全零 = 没带 → 装配器保持基线参数）。
+func (c *ContextParams) hasOverride() bool {
+	if c == nil {
+		return false
+	}
+	return c.Window > 0 || c.L1Pct > 0 || c.L2Pct > 0 || c.RulesBudget > 0 || c.CommonSenseBudget > 0
+}
+
+// merge 把本轮覆盖叠到基线参数上（覆盖值 0 = 不覆盖 → 保留基线）。
+//
+// 基值 = 装配器当前的参数（compaction.ParamsGetter；宿主默认那套）；装配器不实现该
+// 接口时基线取零值 → 由 compaction 的归一（0 = 缺省）兜住。
+func (c *ContextParams) merge(base compaction.Params) compaction.Params {
+	out := base
+	if c == nil {
+		return out
+	}
+	if c.Window > 0 {
+		out.Window = c.Window
+	}
+	if c.L1Pct > 0 {
+		out.L1TargetPct = c.L1Pct
+	}
+	if c.L2Pct > 0 {
+		out.L2TargetPct = c.L2Pct
+	}
+	if c.RulesBudget > 0 {
+		out.RulesBudget = c.RulesBudget
+	}
+	if c.CommonSenseBudget > 0 {
+		out.CommonSenseBudget = c.CommonSenseBudget
+	}
+	return out
+}
+
+// 上下文策略 kind 的**内部取值**（G-h）：
+//
+//	contextKindMounted —— "本轮用宿主挂载的那个策略"（老口径：挂了策略工厂就用它，
+//	                    不问 kind——那是策略自己声明的语义）。
+//
+// 宿主口径下（快照带了 context）kind 只可能是 "tiered" 或 ""（append）：宿主只实现
+// tiered，其余 kind（stage_scoped / sliding_window 等保留未实现的）一律按 append 走
+// （与 host/compaction.go 的"静默降级口径"同款）。
+const contextKindMounted = "mounted"
+
+// contextStrategyFor 解析本轮**是否**用上下文策略（以及用哪种 kind）。
+//
+//   - 快照带了 context（config.context 的折叠结果）→ kind = 快照的 kind：
+//     **空 = 走追加式**（不用策略：宿主口径下 = session/宿主/工作流都没要策略）；
+//     非空 = 用宿主挂载的那个策略（宿主只实现 tiered，故非空即 tiered）。
+//   - 快照没带（老装配：fork / CLI 直连 / 未挂覆盖钩子）→ 挂了策略工厂就用它
+//     （contextKindMounted，不问 kind——那是策略自己声明的语义），没挂 = 追加式。
+func (l *Loop) contextStrategyFor(st *runState) (bool, string) {
+	if st != nil && st.overrides.Context != nil {
+		kind := strings.TrimSpace(st.overrides.Context.Kind)
+		if kind == "" || kind == string(contracts.ContextStrategyKindAppend) {
+			// "" = 本轮走追加式（策略不参与装配）；"append" = **显式**追加式
+			// （G-h：session 能把 tiered 显式切回来——"空串"只能清除、落回默认）。
+			return false, kind
+		}
+		return true, kind
+	}
+	if l.ctxStrategy != nil {
+		return true, contextKindMounted
+	}
+	return false, ""
+}
+
+// tokensBudgetFor 取本轮 context.assembled 的 tokens_budget **占比分母**（J21）。
+//
+// 分母口径（G-h）：宿主给的预算（Config.ContextBudget / tiered 窗口 / loop 缺省）是
+// **基线**；session 覆盖了窗口（config.context.window）→ 用**覆盖值**当分母——窗口换了
+// 还拿旧窗口当分母，占比直接失真（1M 窗口的 30k 在 256k 窗口下会显示成 12%）。
+// 没覆盖 → 保持基线（零行为变化）。
+func (l *Loop) tokensBudgetFor(st *runState) int64 {
+	if st != nil && st.overrides.Context != nil && st.overrides.Context.Window > 0 {
+		return st.overrides.Context.Window
+	}
+	return l.contextBudget
+}
+
+// applyContextParams 把本轮生效的上下文参数（窗口 / L1% / L2% / 注入区预算）灌进本轮
+// 的装配器（G-h 的 per-Run 生效口）。
+//
+//   - 快照没带覆盖值 → 装配器保持自己的基线参数（宿主默认那套）→ 零行为变化；
+//   - 装配器不支持参数注入（compaction.ParamsSetter）→ 带覆盖值时 fail-close
+//     （不许静默忽略用户配的旋钮："配了没生效"比报错更糟）；没带覆盖值 → 不管；
+//   - 参数不合法（窗口 < 256k 硬约束 / 注入区把窗口吃光）→ 由 compaction 侧重做校验
+//     并返回 error → 本轮 fail-close（core/compaction 的 ParamsSetter 口径）。
+func (l *Loop) applyContextParams(st *runState) error {
+	if st == nil || st.assembler == nil {
+		return nil
+	}
+	ov := st.overrides.Context
+	if ov == nil || !ov.hasOverride() {
+		return nil // 没带覆盖值：装配器保持基线参数（零行为变化）
+	}
+	setter, ok := st.assembler.(compaction.ParamsSetter)
+	if !ok {
+		return errors.New("loop: 本轮带上下文参数覆盖，但装配器不支持参数注入（compaction.ParamsSetter）：fail-close，不静默忽略用户配的旋钮")
+	}
+	base := compaction.Params{}
+	if getter, ok := st.assembler.(compaction.ParamsGetter); ok {
+		base = getter.Params()
+	}
+	if err := setter.SetParams(ov.merge(base)); err != nil {
+		return fmt.Errorf("loop: 本轮上下文参数不合法（fail-close）: %w", err)
+	}
+	// 灌参后**回读**注入截断观测面：参数换了 → 注入区按新预算重截断 → 截断了要留痕
+	//（G-h 的 critic P2：回读之前没人看，截断是静默的）。
+	l.reportInjectionTruncation(st)
+	return nil
+}
+
+// reportInjectionTruncation 回读装配器的注入截断观测面并回调宿主（留痕）。
+//
+// 装配器不支持该观测面（自定义策略）→ 不回调（没观测面可读，不是退化）。
+func (l *Loop) reportInjectionTruncation(st *runState) {
+	if st == nil || st.assembler == nil || l.ctxInjectionObserver == nil {
+		return
+	}
+	obs, ok := st.assembler.(compaction.InjectionTruncationObserver)
+	if !ok {
+		return
+	}
+	rules, commonSense := obs.InjectionTruncated()
+	if !rules && !commonSense {
+		return
+	}
+	l.ctxInjectionObserver(rules, commonSense)
 }
 
 // ToolVisibility 是**本轮**的工具可见性白名单（G-e；设计 15 §3.5 白名单语义）。
@@ -330,6 +504,9 @@ type Loop struct {
 	// onlineConfig 是**共享活配置**（hub 建一个传给所有 loop，运行期可调）。
 	onlineConfig *OnlineTableConfig
 	onlineSource OnlineTableSource
+
+	// ctxInjectionObserver 是注入区截断的观测回调（G-h；nil = 不回调）。
+	ctxInjectionObserver func(rules, commonSense bool)
 
 	// ctxStrategy 支撑 v2-S1 上下文装配策略工厂（compaction.AssemblerFactory；nil = 不挂 =
 	// append，与 v1 逐字节等价）。见 Config.ContextStrategy。每次 Run 经它造一个 fresh
@@ -454,32 +631,33 @@ func New(cfg Config) (*Loop, error) {
 		budget = DefaultContextBudget
 	}
 	return &Loop{
-		provider:        cfg.Provider,
-		bus:             cfg.Bus,
-		registry:        cfg.Registry,
-		policy:          cfg.Policy,
-		approver:        cfg.Approver,
-		sessionID:       cfg.SessionID,
-		agentID:         cfg.AgentID,
-		model:           cfg.Model,
-		system:          cfg.System,
-		sessionEnv:      cfg.SessionEnv,
-		maxTurns:        maxTurns,
-		agents:          cfg.Agents,
-		reasoningEffort: strings.TrimSpace(cfg.ReasoningEffort),
-		contextBudget:   budget,
-		store:           cfg.Store,
-		checkpointEvery: cfg.CheckpointEvery,
-		onlineConfig:    cfg.OnlineTable,
-		onlineSource:    cfg.OnlineTableSource,
-		ctxStrategy:     cfg.ContextStrategy,
-		goalLedger:      cfg.GoalLedger,
-		blob:            cfg.BlobSink,
-		blobMaxInline:   cfg.BlobMaxInline,
-		wal:             newWalWriter(cfg.WalSink),
-		tel:             newTelWriter(cfg.TelemetrySink),
-		turnBudget:      cfg.TurnBudget,
-		runOverrides:    cfg.RunOverrides,
+		provider:             cfg.Provider,
+		bus:                  cfg.Bus,
+		registry:             cfg.Registry,
+		policy:               cfg.Policy,
+		approver:             cfg.Approver,
+		sessionID:            cfg.SessionID,
+		agentID:              cfg.AgentID,
+		model:                cfg.Model,
+		system:               cfg.System,
+		sessionEnv:           cfg.SessionEnv,
+		maxTurns:             maxTurns,
+		agents:               cfg.Agents,
+		reasoningEffort:      strings.TrimSpace(cfg.ReasoningEffort),
+		contextBudget:        budget,
+		store:                cfg.Store,
+		checkpointEvery:      cfg.CheckpointEvery,
+		onlineConfig:         cfg.OnlineTable,
+		onlineSource:         cfg.OnlineTableSource,
+		ctxStrategy:          cfg.ContextStrategy,
+		ctxInjectionObserver: cfg.ContextInjectionObserver,
+		goalLedger:           cfg.GoalLedger,
+		blob:                 cfg.BlobSink,
+		blobMaxInline:        cfg.BlobMaxInline,
+		wal:                  newWalWriter(cfg.WalSink),
+		tel:                  newTelWriter(cfg.TelemetrySink),
+		turnBudget:           cfg.TurnBudget,
+		runOverrides:         cfg.RunOverrides,
 	}, nil
 }
 
@@ -561,26 +739,6 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	// 无论从哪条路径返回，都把本次累积的污点级写进 Result（Q7；空归一为 clean）。
 	defer func() { res.Taint = normalizeTaint(st.acc.level) }()
 
-	// v2-S1：挂了对上下文策略时，本次 Run 造一个 fresh Assembler（策略有状态，per-Run 持有），
-	// 并收集它注入的框架工具（recall / stage）。nil 工厂 = 不挂 = append（v1 等价）。
-	if l.ctxStrategy != nil {
-		st.assembler = l.ctxStrategy()
-		// **工厂造出 nil Assembler = 装配残缺**（W6-A fail-close）：声明了策略却没装配出
-		// 装配器 → 静默走 append 等于"策略语义悄悄变味"（用户以为配了策略，其实跑的是
-		// 追加式）。故此处**不静默降级**：留一条 loop.error 留痕 + 以错误终止本次 Run
-		// （子 agent 路径上由 runSpawn 收口成 agent.failed）。
-		if st.assembler == nil {
-			err := errors.New("loop: 上下文策略工厂产出了 nil Assembler（装配钩子残缺）：fail-close，不静默降级成 append")
-			l.publishLoopError(ctx, 0, phaseContextStrategy, err)
-			return res, err
-		}
-		tools, err := l.collectStrategyTools(st.assembler)
-		if err != nil {
-			return res, err // 装配期重名 → fail-close（不许静默遮蔽，F12）
-		}
-		st.strategyTools = tools
-	}
-
 	// J19：goal ledger 生产者（opt-in）。Store 已配 + GoalLedger 开启 → 每 Run 造一个
 	// per-(session,agent) 的 LedgerWriter（X6：关键字段立即落盘、过程字段 turn 末合并），
 	// 注入 ledger 框架工具。nil store = 即使开了也不注入（fail-close：没库就没法持久化账本）。
@@ -629,6 +787,64 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 			return res, fmt.Errorf("loop: 取本轮覆盖配置失败（fail-close，不带未定配置开跑）: %w", oerr)
 		}
 		st.overrides = ov
+	}
+
+	// v2-S1 + G-h：**本轮快照冻结之后**才造上下文装配器。
+	//
+	// 挂了对上下文策略时，本次 Run 造一个 fresh Assembler（策略有状态，per-Run 持有），
+	// 并收集它注入的框架工具（recall / stage）。nil 工厂 = 不挂 = append（v1 等价）。
+	//
+	// **本块从"冻结之前"挪到了"冻结之后"**（G-h）：上下文策略的 kind 与参数是**本轮覆盖**
+	// 的一部分（config.context，G-h）——快照冻结前造引擎，引擎就早于快照诞生，拿不到本轮
+	// 生效的 kind/参数（那时的引擎只会带宿主默认那套）。挪到冻结点之后，引擎才知道本轮该
+	// 按什么装配。（挪动安全性：原位置与冻结点之间无人用 assembler——本块原先只是造引擎 +
+	// 收框架工具，两件事都不依赖本轮覆盖；框架工具的重名检查与 ledger 工具互不依赖先后，
+	// 合并时按名字去重、可见集按名字排序。）
+	//
+	// **已知取舍（挪动带来的显式后果）**：本块在 **user.prompt 已落库之后**——策略装配
+	// 失败（工厂产出 nil / 参数不合法）时，本轮的 prompt **已经在事件流里**了，补一条
+	// loop.error 留痕后以错误收口。这与"冻结失败"路径（钩子取覆盖失败 → 同样 fail-close、
+	// 同样 prompt 已落）是**同款取舍**：用户说过的话是事实，不因为配置/装配失败就不落
+	// （下一轮 fold 历史仍看得到）。
+	//
+	// 生效 kind 的口径（G-h）：宿主口径优先——本轮快照带了 context（config.context 的
+	// 折叠结果）时，快照里的 kind 就是**本轮生效的 kind**（"" = append / "tiered"）；
+	// 快照没带（老装配：fork / CLI 直连 / 未挂覆盖钩子）时沿用旧口径：**挂了策略工厂
+	// 就用它**（不限 kind——那是策略自己声明的语义）。
+	//
+	// 为什么快照优先：session 级覆盖能把 append 提成 tiered（也能把 tiered 的参数改掉），
+	// 这些都是**本轮**才知道的事——引擎必须晚于快照诞生（见上面的挪动说明）。
+	useStrategy, kind := l.contextStrategyFor(st)
+	if useStrategy {
+		if l.ctxStrategy == nil {
+			// 本轮要求走上下文策略，但宿主没挂策略工厂 → fail-close（不静默走 append：
+			// "以为配了策略、其实跑的是追加式"比失败更糟）。
+			err := fmt.Errorf("loop: 本轮上下文策略要求 %q，但宿主未装配上下文策略工厂（fail-close，不静默降级成 append）", kind)
+			l.publishLoopError(ctx, 0, phaseContextStrategy, err)
+			return res, err
+		}
+		st.assembler = l.ctxStrategy()
+		// **工厂造出 nil Assembler = 装配残缺**（W6-A fail-close）：声明了策略却没装配出
+		// 装配器 → 静默走 append 等于"策略语义悄悄变味"（用户以为配了策略，其实跑的是
+		// 追加式）。故此处**不静默降级**：留一条 loop.error 留痕 + 以错误终止本次 Run
+		// （子 agent 路径上由 runSpawn 收口成 agent.failed）。
+		if st.assembler == nil {
+			err := errors.New("loop: 上下文策略工厂产出了 nil Assembler（装配钩子残缺）：fail-close，不静默降级成 append")
+			l.publishLoopError(ctx, 0, phaseContextStrategy, err)
+			return res, err
+		}
+		// G-h：本轮生效参数（窗口 / L1% / L2% / 注入区预算）灌进装配器——**冻结之后**才
+		// 灌（参数是本轮覆盖的一部分）。装配器不支持参数注入时：带了覆盖值 → fail-close
+		// （不许静默忽略用户配的旋钮）；没带覆盖值 → 保持装配器自己的基线参数。
+		if err := l.applyContextParams(st); err != nil {
+			l.publishLoopError(ctx, 0, phaseContextStrategy, err)
+			return res, err
+		}
+		tools, err := l.collectStrategyTools(st.assembler, st.strategyTools)
+		if err != nil {
+			return res, err // 装配期重名 → fail-close（不许静默遮蔽，F12）
+		}
+		st.strategyTools = tools
 	}
 
 	// L2/D19 telemetry：run.begin（user.prompt 之后、第一轮之前）+ deferred run.end
@@ -682,7 +898,7 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 每轮模型调用**前**落一条 context.assembled（06 §4.2：上下文可见性的数据源）。
 		// 此刻装配已定型（req 就是模型将看到的全部），记录"这一轮给模型看了什么"；
 		// 落库失败不中止 loop（观测性事实，不是执行前提，见 publishContextAssembled）。
-		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts)
+		res.Events += l.publishContextAssembled(ctx, turn, req, ot, stratParts, l.tokensBudgetFor(st))
 
 		// v4-4-B：turn.begin——provider.Run **之前**写 WAL（"第 N 轮在跑 X 模型"的现场）。
 		// WAL 是崩溃恢复补充面、不是事实源（F5 不受影响）；写在 X1 三段路径之外，失败
@@ -949,13 +1165,19 @@ func (l *Loop) toolNames(tools []contracts.Tool) []string {
 // 变成两套含义：模型看到两个同名工具，执行时却只跑其中一个（框架工具还会遮蔽注册表工具）。
 // 装配期直接报错拒绝（fail-close），不做静默遮蔽——要豁免就把工具名写进 agent 类型的
 // tools 白名单（见 visibleTools 的类型过滤）。
-func (l *Loop) collectStrategyTools(a compaction.Assembler) (map[string]compaction.FrameworkTool, error) {
+//
+// existing = 本次 Run **已有**的框架工具（ledger 工具等——它在本块之前就装好了）：
+// 策略工具与它们重名同样 fail-close；返回的是**合并后**的集合（不覆盖已有的）。
+func (l *Loop) collectStrategyTools(a compaction.Assembler, existing map[string]compaction.FrameworkTool) (map[string]compaction.FrameworkTool, error) {
 	tp, ok := a.(compaction.ToolProvider)
 	if !ok {
-		return nil, nil
+		return existing, nil
 	}
 	tools := tp.Tools()
-	out := make(map[string]compaction.FrameworkTool, len(tools))
+	out := existing
+	if out == nil {
+		out = make(map[string]compaction.FrameworkTool, len(tools))
+	}
 	for _, ft := range tools {
 		name := strings.TrimSpace(ft.Desc.Name)
 		if name == "" {

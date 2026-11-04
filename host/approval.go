@@ -519,8 +519,19 @@ func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 	// 照常受理（F8，判在 recordConfigChanged 里——两面共用一处）。hub 关闭的前置检查
 	// 在上面（与接管检查同一处，之间的并发关闭窗口与 P2-5 同类，startPromptAsync
 	// 还会再拦一次——那句 503 的文案在 Config 非空时会点明"配置已持久化"）。
+	// G-i：profile 展开（先展开 profile → 再叠显式 config → 合成一份变更集）。
+	// 展开后 spec.Config 就是**展开后的值**（下面的校验与落事件都看它 → 审计里看得见）。
+	// 未知 profile 名 → 400 bad_profile（fail-close，零事件）。
+	if strings.TrimSpace(spec.Profile) != "" {
+		merged, err := h.expandProfile(spec.Profile, spec.Config)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "bad_profile", err.Error())
+			return
+		}
+		spec.Config = merged
+	}
 	if spec.Config != nil {
-		if err := validatePromptConfig(spec.Config); err != nil {
+		if err := h.validatePromptConfigFor(sid, spec.Config); err != nil {
 			writeJSONError(w, http.StatusBadRequest, "bad_config", err.Error())
 			return
 		}
@@ -721,7 +732,10 @@ func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (
 		// 接管"，本进程自己新建的会话不是接管）→ 校验（fail-close，非法零事件）→ 落
 		// config.changed（经 bus）→ 起跑。校验/写失败回**既有 error 帧形状**（code 与
 		// HTTP 的 bad_config / config_write_failed 同码；连接不关，D7）。
-		if cs.Config != nil {
+		// G-i：带 profile 时**即使没有 config 也要走这条路径**（profile 本身就是一份
+		// 变更集——展开后要落 config.changed，审计才看得见）。
+		profileNamed := cs.Profile != nil && strings.TrimSpace(*cs.Profile) != ""
+		if cs.Config != nil || profileNamed {
 			if h.hubClosedForPrompt() {
 				return nil, errors.New("hub 正在关闭，不受理新的协议面 prompt")
 			}
@@ -730,7 +744,20 @@ func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (
 					return nil, fmt.Errorf("为新会话建 loop（写配置前）: %w", err)
 				}
 			}
-			if err := validatePromptConfig(cs.Config); err != nil {
+			// G-i：profile 展开（同 HTTP 面：先展开 profile → 再叠显式 config）。
+			// 未知 profile 名 → error 帧（code=bad_profile，与 HTTP 400 同码）。
+			if profileNamed {
+				merged, perr := h.expandProfile(*cs.Profile, cs.Config)
+				if perr != nil {
+					reply, merr := transport.NewErrorMessage(&m.ID, "bad_profile", perr.Error())
+					if merr != nil {
+						return nil, merr
+					}
+					return &reply, nil
+				}
+				cs.Config = merged
+			}
+			if err := h.validatePromptConfigFor(sid, cs.Config); err != nil {
 				reply, merr := transport.NewErrorMessage(&m.ID, "bad_config", err.Error())
 				if merr != nil {
 					return nil, merr
@@ -757,7 +784,7 @@ func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (
 			// 上面同步落库持久化（顺序按本轮生效语义定，不改）——文案点明"配置已生效、
 			// 本轮没受理"，别让调用方按纯失败回滚认知与事件流对不上。错误帧形状不变
 			//（transport 对返回的 error 统一回 kind=error，连接不关，D7）。
-			if cs.Config != nil {
+			if cs.Config != nil || profileNamed {
 				return nil, errors.New("hub 正在关闭，本轮 prompt 未受理；但本次提交的配置变更" +
 					"已生效并持久化（config.changed 已落库，下一轮/重启后照常生效）")
 			}

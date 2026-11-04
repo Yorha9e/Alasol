@@ -122,6 +122,14 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		reasoningEffort = host.ReasoningEffortValue(fc.ReasoningEffort)
 	}
 
+	// profile 表（G-i）：**只走文件配置面**（TOML `[[profiles]]`，不给 flag——与
+	// [[agent_types]] / [[mcp.servers]] 同款：结构化数据 + 按名引用）。
+	// 重名 → **装载期 fail-close**（同名两张表落哪张是随机的——当场拒，不静默取后者）。
+	profiles, err := fc.ProfileConfigs()
+	if err != nil {
+		return host.Config{}, err
+	}
+
 	// max_turns / context_budget：flag 非零才用 flag；否则用文件（0=未设）。
 	maxTurns := *f.maxTurns
 	if maxTurns == 0 {
@@ -208,6 +216,10 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// host/agenttypes.go 装配；只在 MultiAgent 开时才建注册表并 fail-close 校验）。
 		MultiAgent: fc.MultiAgent,
 		AgentTypes: fc.AgentTypeConfigs(),
+
+		// profile 表（G-i）：命名装配模板（配置面 + 会话创建执行面）。按名引用：
+		// POST /prompt 或 WS command.submit 带 profile="名字" → 展开成变更集。
+		Profiles: profiles,
 
 		// 大 payload 外置 blob（v4-3-A，G2e/D4）：**只走文件配置面**（TOML `[blob]`，
 		// 不给 flag——与 multi_agent 同款：一个目录路径 + 一个阈值，结构化数据 + 默认关）。

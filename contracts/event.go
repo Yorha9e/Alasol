@@ -448,7 +448,7 @@ type BtwForkedPayload struct {
 	Question string `json:"question"`
 }
 
-// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}；第二批字段：tools（工具白名单，G-e）；后续批次只增 context/policy 字段，不预留占位——F7 只增，届时再加。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）；tools 的元素非空串、数量上限由 host 层校验（工具名**不**校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行，白名单语义天然容错）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
+// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}；第二批字段：tools（工具白名单，G-e）；第三批字段：context（上下文装配面，G-h）；后续批次只增 policy 字段，不预留占位——F7 只增，届时再加。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）；tools 的元素非空串、数量上限由 host 层校验（工具名**不**校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行，白名单语义天然容错）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
 type ConfigChangedPayload struct {
 	// 目标模型名覆盖：出现 = 覆盖为该值；空串 = 清除回 hub 默认；缺失 = 不变。
 	Model *string `json:"model,omitempty"`
@@ -458,6 +458,24 @@ type ConfigChangedPayload struct {
 	Provider *ProviderConfigChange `json:"provider,omitempty"`
 	// session 工具白名单变更集（G-e，设计 15 §3.5）：缺失 = 不变；出现 = 按 ToolsConfigChange 的语义覆盖（**整组 LWW**：tools 组与 model 等标量字段同口径，后写整组覆盖前一组，不拆子字段跨事件合并）。
 	Tools *ToolsConfigChange `json:"tools,omitempty"`
+	// 上下文装配面变更集（G-h）：缺失 = 不变；出现 = 按 ContextConfigChange 的语义覆盖（**子字段各自 LWW**：与 provider 同口径，不学 tools 的整组 LWW——避免一次只带部分子项的提交把别的子项静默丢掉）。
+	Context *ContextConfigChange `json:"context,omitempty"`
+}
+
+// 上下文装配面的变更集（config.changed 的 payload.context）：修改该 session 的上下文装配旋钮（策略 kind / 窗口 W / L1 与 L2 目标残留百分比 / 注入区预算），持久化 + 本轮生效（生效链同 config.model：hub 默认 → session 折叠 → 本轮快照冻结）。**子字段各自 LWW**（与 provider 同口径，**不学 tools 的整组 LWW**）：每个子项出现 = 覆盖该项；缺失 = 该项不变（沿用上一次的值）；**数值 0 = 清除该项回默认**（沿用 host.Config 的 0 = 默认口径）；kind 的值空间 = 空串（清除回默认）/ append（显式追加式）/ tiered（两级压缩）。合法性与取值范围由 host 层校验（契约层只定形状）：kind 取值白名单（空串 / append / tiered）、数值非负、tiered 时窗口须过 compaction 的 W ≥ 256k 硬约束、L1 与 L2 百分比在 (0,100] 内且 L2 ≤ L1、注入区预算与窗口的布局自洽。
+type ContextConfigChange struct {
+	// 上下文策略 kind 覆盖：**值空间 = ""（清除回默认：落回宿主/工作流声明的 kind）| "append"（显式追加式：压缩全关、原样透传历史）| "tiered"（两级压缩）**。出现 = 覆盖为该值；空串 = 清除回默认；缺失 = 不变。"append" 让 session 能把 tiered **显式切回**追加式（空串只能"清除"、落回默认——切不回 append 时用这个值）。取值白名单（空串 / append / tiered）由 host 层校验。
+	Kind *string `json:"kind,omitempty"`
+	// 上下文窗口预算 W（token）覆盖：出现 = 覆盖为该值；0 = 清除回默认；缺失 = 不变。负数由 host 层拒绝（写时 400 bad_config）。
+	Window *int64 `json:"window,omitempty"`
+	// L1（浅摘要）目标残留占窗口百分比覆盖：出现 = 覆盖为该值；0 = 清除回默认；缺失 = 不变。取值范围 (0,100] 由 host 层校验。
+	L1Pct *float64 `json:"l1_pct,omitempty"`
+	// L2（深压缩）目标残留占窗口百分比覆盖：出现 = 覆盖为该值；0 = 清除回默认；缺失 = 不变。取值范围 (0,100] 且不大于 L1 由 host 层校验。
+	L2Pct *float64 `json:"l2_pct,omitempty"`
+	// 项目规则注入的 token 上限覆盖：出现 = 覆盖为该值；0 = 清除回默认；缺失 = 不变。负数由 host 层拒绝。
+	RulesBudget *int64 `json:"rules_budget,omitempty"`
+	// 常识区注入的 token 上限覆盖：出现 = 覆盖为该值；0 = 清除回默认；缺失 = 不变。负数由 host 层拒绝。
+	CommonSenseBudget *int64 `json:"common_sense_budget,omitempty"`
 }
 
 // session 工具白名单的变更集（config.changed 的 payload.tools）：修改 session 的**工具可见性白名单**（对**已注册**工具的可见性增删，持久化）——**白名单制**（R5/R3：不暴露即不存在；点名白名单外的工具 = **模型看不到**——隐藏的工具仍按 policy/perm 正常判定，**可见≠可执行**，天然无"越权"概念）。**可见 ≠ 可执行**：执行许可归 policy/perm 层（本字段只影响模型可见集，不放宽任何执行侧检查）。与 agent 类型级白名单（spawn 时的类型过滤，W5）**各自独立、互不突破**（两层相交：session 白名单不得绕过类型白名单）。**整组 LWW**：tools 对象**出现** = 该 session 的 tools 配置整组被本次提交覆盖（同一次提交的 only/except 一起落；后写整组覆盖前一组，**不拆子字段跨事件合并**——与 model 等标量字段同口径）；tools 对象**缺失** = 不变；tools 对象**出现且两子字段都缺**（`{}`）= 清除回默认（全部已注册工具可见，仍受类型白名单与策略链管辖）。组内子字段三态：出现 = 覆盖（**空数组 = 清空该项**：only 的空数组 = 一个工具都不暴露；except 的空数组 = 不排除任何工具）；缺失 = 该项未设置（only 未设置 = 不限；except 未设置 = 不排除）。

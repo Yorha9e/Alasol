@@ -2,7 +2,7 @@
 {"v":1,"id":"01JN8JC080BKFDBKAT2VBAAG9H","kind":"subscribed","reply_to":"client-sub-0001","payload":{"kind_prefixes":["tool.call."],"durable_only":true,"replaced":false}}
 {"v":1,"id":"client-cmd-0001","kind":"command.submit","payload":{"prompt":"读一下目标文件"}}
 {"v":1,"id":"01JN8JC1PWZ75NA9Z5BVAWY5Z1","kind":"command.accepted","reply_to":"client-cmd-0001","session_id":"01JN8JC080EW3Y1C2AAA8M9XJB","payload":{"session_id":"01JN8JC080EW3Y1C2AAA8M9XJB","status":"running"}}
-{"v":1,"id":"client-cmd-0003","kind":"command.submit","payload":{"prompt":"换 gpt-4o-mini 高档位再总结一遍","config":{"model":"gpt-4o-mini","reasoning_effort":"high","provider":{"base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_API_KEY"}}}}
+{"v":1,"id":"client-cmd-0003","kind":"command.submit","payload":{"prompt":"换 gpt-4o-mini 高档位再总结一遍","config":{"model":"gpt-4o-mini","reasoning_effort":"high","provider":{"base_url":"https://api.openai.com/v1","api_key_env":"OPENAI_API_KEY"}},"profile":"review-fast"}}
 {"v":1,"id":"01JN8JC29M57MNPCN48T9KSDHZ","kind":"approval.request","session_id":"01JN8JC080EW3Y1C2AAA8M9XJB","payload":{"v":1,"id":"01JN8JC29M57MNPCN48T9KSDHZ","ts":"2025-03-01T10:00:00.000Z","session_id":"01JN8JC080EW3Y1C2AAA8M9XJB","agent_id":"01JN8JC0800EHT9NTXW9D1FKHH","trigger":"policy_ask","tool_call_id":"toolu_01ABC","side_effect":"read","summary":"策略拦截：工具 read 需要人审"}}
 {"v":1,"id":"01JN8JC35RAEFCPRAV2DQXX1Z8","kind":"approval.respond","reply_to":"01JN8JC29M57MNPCN48T9KSDHZ","payload":{"v":1,"request_id":"01JN8JC29M57MNPCN48T9KSDHZ","ts":"2025-03-01T10:00:01.000Z","decision":"allow","decided_by":"user:gui"}}
 {"v":1,"id":"client-ping-0001","kind":"ping"}

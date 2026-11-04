@@ -50,6 +50,8 @@ type CommandSubmit struct {
 	Prompt string `json:"prompt"`
 	// 可选：本轮要应用的 session 配置变更（G-c per-prompt 配置，HTTP 面 = POST /prompt body 的 config——两处入口**同源同型**，引用同一个变更集类型、不复制两份定义）。缺省 = 不修改配置；形状与语义见 ConfigChangedPayload（字段出现 = 覆盖、缺失 = 不变、空串 = 清除回 hub 默认）。
 	Config *ConfigChangedPayload `json:"config,omitempty"`
+	// 可选：命名 profile 名（G-i；HTTP 面 = POST /prompt body 的 profile——两处入口同源同型）。出现 = 先展开该 profile（宿主配置里的命名模板），再让 config 的字段**逐项压过**它，合成一份变更集落 config.changed（审计里看得见展开后的值）。缺省 = 不展开。未知 profile 名 = 拒绝（HTTP 400 bad_profile / WS error 帧）。
+	Profile *string `json:"profile,omitempty"`
 }
 
 // kind=command.accepted 的载荷：command.submit 的受理回执（reply_to 指向原 command.submit）。带回生效的 session id（客户端未提供时是服务端新建的那个）与运行状态；**受理不等于跑完**——结果经事件流异步回流。

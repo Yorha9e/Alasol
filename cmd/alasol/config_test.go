@@ -877,3 +877,65 @@ func TestBuildConfigEmbeddingCredentialFileEnvSameAsChat(t *testing.T) {
 		t.Fatalf("Authorization = %q，期望与 chat 同款（同名 = 同一凭据）", auths[0])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// G-i profile 表（[[profiles]]）：折进 host.Config + 重名启动拒
+// ---------------------------------------------------------------------------
+
+// TestBuildConfigProfilesFromFile：[[profiles]] 折进 host.Config.Profiles（按名引用）。
+func TestBuildConfigProfilesFromFile(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := `model = "file-model"
+
+[[profiles]]
+name = "fast"
+model = "gpt-4o-mini"
+cwd = "D:/work"
+run_id = "run-1"
+
+[profiles.context]
+kind = "tiered"
+window = 512000
+`
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	hc, err := buildConfigFrom(t, "-config", cfgFile)
+	if err != nil {
+		t.Fatalf("buildConfig: %v", err)
+	}
+	p, ok := hc.Profiles["fast"]
+	if !ok {
+		t.Fatalf("host.Config.Profiles 应含 fast: %v", hc.Profiles)
+	}
+	if p.Model != "gpt-4o-mini" || p.CWD != "D:/work" || p.RunID != "run-1" {
+		t.Errorf("profile 折进 host.Config 不对: %+v", p)
+	}
+	if p.Context.Kind != "tiered" || p.Context.Window != 512000 {
+		t.Errorf("profile 的 context 面折进不对: %+v", p.Context)
+	}
+}
+
+// TestBuildConfigProfilesDuplicateNameFailsClosed：重名 profile → **启动即拒**
+// （同名两张表落哪张是随机的——不静默取后者）。
+func TestBuildConfigProfilesDuplicateNameFailsClosed(t *testing.T) {
+	cfgFile := filepath.Join(t.TempDir(), "config.toml")
+	body := `model = "file-model"
+
+[[profiles]]
+name = "fast"
+model = "m1"
+
+[[profiles]]
+name = "fast"
+model = "m2"
+`
+	if err := os.WriteFile(cfgFile, []byte(body), 0o600); err != nil {
+		t.Fatalf("写配置: %v", err)
+	}
+	if _, err := buildConfigFrom(t, "-config", cfgFile); err == nil {
+		t.Fatal("重名 profile 应在启动期被拒（fail-close）")
+	} else if !strings.Contains(err.Error(), "fast") {
+		t.Errorf("错误应点名重名的 profile: %v", err)
+	}
+}

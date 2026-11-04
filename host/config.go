@@ -298,6 +298,16 @@ type Config struct {
 	// **只在 MultiAgent=true 时生效**：关 = 不建注册表、**也不校验**（零行为变化——用一个
 	// 根本用不到的扩展点不许拒绝宿主启动；口径见 host/hub.go 的 New 装配处）。
 	AgentTypes []contracts.AgentType
+	// Profiles 是**命名 profile 表**（G-i；TOML `[[profiles]]` 装载）。
+	//
+	// 一张 profile = 一组 session 配置旋钮（model / reasoning_effort / provider /
+	// tools / context）+ 一组会话创建执行参数（cwd / worktree / run_id / remote_host
+	// 声明）。按名引用：POST /prompt（或 WS command.submit）带 profile="名字" → 展开成
+	// 一份 config 变更集，再让显式 config 逐字段压过它，合成一条 config.changed 落流。
+	//
+	// **空 = 没有 profile**（零行为变化：请求里不带 profile = 不展开）。装载期 fail-close：
+	// 名字为空 / 重名（重名在 TOML 折叠那一步就拒）/ 配置面不合法（复用写时那道校验）。
+	Profiles map[string]ProfileConfig
 
 	// ---- v4-3-A 大 payload 外置 blob（G2e / D4）----
 	//
@@ -435,6 +445,12 @@ func (c *Config) validate() error {
 	case "", "deny-all", "always-allow", "terminal", "protocol":
 	default:
 		return fmt.Errorf("host: Config.Approval 只支持 deny-all | always-allow | terminal | protocol（得到 %q）", c.Approval)
+	}
+	// profile 表（G-i）：表键非空 + Name 与表键一致 + 配置面取值合法 + 生效组合合法
+	// （**装载期 fail-close**——"配了不生效"最难排查：profile 名写错要到请求时才报，
+	// profile 里的值不合法更该当场拒）。
+	if err := c.validateProfiles(); err != nil {
+		return err
 	}
 	if c.MaxTurns < 0 {
 		return fmt.Errorf("host: Config.MaxTurns 不能为负（得到 %d）", c.MaxTurns)

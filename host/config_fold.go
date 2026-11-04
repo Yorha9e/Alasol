@@ -30,6 +30,7 @@ import (
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/compaction"
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/sessioncfg"
 	"github.com/Yorha9e/alasol/runtime/provider/openai"
@@ -46,6 +47,12 @@ import (
 type PromptSpec struct {
 	// Prompt 用户 prompt 原文（空 = 拒绝）。
 	Prompt string `json:"prompt"`
+	// Profile 是命名 profile 名（G-i；缺省 = 不展开）。
+	//
+	// 出现 = 先展开该 profile（宿主配置里的命名模板），再让 Config 的字段**逐项压过**
+	// 它，合成**一份**变更集落 config.changed（审计里看得见展开后的值——不是"profile 名
+	// + 隐式模板"那种审计看不懂的形态）。未知 profile 名 → 400 bad_profile（fail-close）。
+	Profile string `json:"profile,omitempty"`
 	// Config 是可选的 session 配置变更集（G-c/G-d 首批字段：model / reasoning_effort /
 	// provider{base_url, api_key_env}；G-e 第二批：tools{only, except}）。语义见
 	// contracts.ConfigChangedPayload：字段出现（含显式空串）= 覆盖、缺失 = 不变、
@@ -145,9 +152,9 @@ func (f *configFeed) rebuild(ctx context.Context) error {
 // ② 写路径：校验 + 落 config.changed（经 bus）
 // ---------------------------------------------------------------------------
 
-// validatePromptConfig 校验 per-prompt 配置变更集（**写时 fail-close**，G-c/G-d/G-e）。
+// validatePromptConfig 校验 per-prompt 配置变更集（**写时 fail-close**，G-c/G-d/G-e/G-h）。
 //
-// 三道闸（契约层只定形状，合法性归 host——契约注释同口径）：
+// 四道闸（契约层只定形状，合法性归 host——契约注释同口径）：
 //
 //  1. reasoning_effort 非空必须过 ValidateReasoningEffort（G14 白名单，**唯一事实源**）
 //     → 不合法返回错误，调用方回 400 / WS error 帧 **bad_config**（校验在落事件**之前**
@@ -155,7 +162,9 @@ func (f *configFeed) rebuild(ctx context.Context) error {
 //  2. provider 凭据纪律（gap2/G-d）：base_url 出现且非空 → api_key_env 必须**同时显式
 //     给且非空**——不静默把 hub key 发给第三方端点。provider 两字段都空串 = 清除覆盖
 //     （合法，本函数不拦）；
-//  3. tools 白名单的元素纪律（G-e）：元素非空串 + 数量上限（见 validateToolList）。
+//  3. tools 白名单的元素纪律（G-e）：元素非空串 + 数量上限（见 validateToolList）；
+//  4. context 装配面的取值纪律（G-h）：kind 白名单 / 数值非负 / 窗口硬约束 / 百分比范围
+//     与 L2≤L1 / 布局自洽（见 validateContextChange）。
 func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 	if cfg == nil {
 		return nil
@@ -183,6 +192,239 @@ func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 			if err := validateToolList("except", *cfg.Tools.Except); err != nil {
 				return err
 			}
+		}
+	}
+	if err := validateContextChange(cfg.Context); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePromptConfigFor 是**宿主口径**的写时校验（HTTP / WS 两面共用）：
+// 包级校验（形状与取值，见 validatePromptConfig）+ **生效组合**校验（当前 fold +
+// 本次提交 + 宿主默认）。
+//
+// 为什么多这一层：单个提交里的值都合法，**叠到宿主默认上**仍可能不成立——例：宿主
+// 窗口 300k + 本次 rules_budget 200k → 注入区把历史区挤成负数（布局不成立）。这类
+// 组合错只有宿主知道（宿主才知道自己的默认窗口与注入区预算），故在**写时**就拒
+// （400 bad_config / WS error 帧，零事件），而不是拖到装配期才炸。
+func (h *Hub) validatePromptConfigFor(sid contracts.Ulid, cfg *contracts.ConfigChangedPayload) error {
+	if err := validatePromptConfig(cfg); err != nil {
+		return err
+	}
+	if cfg == nil || cfg.Context == nil {
+		return nil // 没有上下文面变更 → 宿主口径无额外校验
+	}
+	// 生效覆盖 = 当前 fold + 本次提交（本次提交出现的项覆盖 fold 的项；0 = 清除）。
+	cp := &loop.ContextParams{}
+	if h != nil && h.cfgTable != nil {
+		fold := h.cfgTable.Current(sid).Context
+		// fold 的覆盖值（**没有任何 context 子项**时是 nil = 没有信息）。
+		if folded := contextParamsFromFold(fold); folded != nil {
+			*cp = *folded
+		}
+		// fold 的 kind（**实值**才生效；空串 = 清除记录 → 落回基线）。
+		if fold.Kind.HasValue() {
+			cp.Kind = fold.Kind.Value
+		}
+	}
+	applyContextChange(cp, cfg.Context)
+	// 生效 kind：**本次提交的 kind 优先**（空串 = 清除 → 落回基线）> fold 的 kind >
+	// 基线 kind（宿主默认 / 工作流声明）。
+	//
+	// **本次提交必须算进去**（critic P1）：只看 fold + 基线的话，"这次把 kind 切成
+	// tiered"会绕开写时校验（202 + config.changed 已落 → session 钉死，每轮装配期
+	// 才 fail-close）——切策略与改布局必须**同时**被写时校验看到。
+	//
+	// **只有 tiered 下**窗口与布局才参与判定（追加式不挂策略，窗口本就不参与装配
+	// ——不为不参与的东西拒人）。
+	kind := resolveContextKindWith(cp.Kind, h.contextBaseKind(sid))
+	return h.validateContextEffective(cp, kind)
+}
+
+// contextBaseKind 取该 session 的**基线 kind**（宿主默认 / 工作流声明，W6）。
+//
+// 独立短临界区：调用方（写时校验）不持 h.mu——工作流状态在 h.activeWorkflow 里，
+// 要读它就得按 hub 的既有口径持锁（见 workflowStrategyKindForLocked）。
+func (h *Hub) contextBaseKind(sid contracts.Ulid) string {
+	if h == nil {
+		return ""
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.workflowStrategyKindForLocked(sid)
+}
+
+// applyContextChange 把一次提交的 context 变更集叠到覆盖参数上（出现 = 覆盖；
+// **数值 0 = 清除** → 归零 = "不覆盖"，生效上回默认；**kind 同一条口径**：出现 = 覆盖
+// （空串 = 清除 → 落回基线））。
+//
+// **kind 与数值同口径**（critic P1）：两者都是"出现 = 覆盖、缺失 = 不变"，合成**一个**
+// 生效态（cp）——分两套各算各的就会出现"本次提交的 kind 没算进去"的洞。
+func applyContextChange(cp *loop.ContextParams, sub *contracts.ContextConfigChange) {
+	if cp == nil || sub == nil {
+		return
+	}
+	if sub.Kind != nil {
+		cp.Kind = strings.TrimSpace(*sub.Kind)
+	}
+	if sub.Window != nil {
+		cp.Window = *sub.Window
+	}
+	if sub.L1Pct != nil {
+		cp.L1Pct = *sub.L1Pct
+	}
+	if sub.L2Pct != nil {
+		cp.L2Pct = *sub.L2Pct
+	}
+	if sub.RulesBudget != nil {
+		cp.RulesBudget = *sub.RulesBudget
+	}
+	if sub.CommonSenseBudget != nil {
+		cp.CommonSenseBudget = *sub.CommonSenseBudget
+	}
+}
+
+// validateContextEffective 是宿主口径的生效组合校验（宿主自己的默认参数 + 本次覆盖）。
+func (h *Hub) validateContextEffective(cp *loop.ContextParams, kind string) error {
+	base := compaction.Params{}
+	if h != nil {
+		base = h.cfg.contextStrategyParams()
+	}
+	return validateContextEffectiveParams(base, cp, kind)
+}
+
+// validateContextEffectiveParams 校验**生效组合**（宿主默认 base + 覆盖 cp）：
+// L2 ≤ L1 + 窗口硬约束 + **布局自洽**（唯一事实源 = compaction 的校验口）。
+//
+// **布局必须按真实生效窗口判**（critic P1）：base 是宿主自己的默认参数（窗口可能是
+// 300k 而不是缺省 1M）——拿缺省窗口兜底 = 两处各算各的、结论可能相反。
+//
+// kind ≠ tiered（追加式）→ 只校百分比，**不**校窗口与布局（追加式不挂策略，窗口与
+// 注入区预算本就不参与装配——不为不参与的东西拒人）。
+func validateContextEffectiveParams(base compaction.Params, cp *loop.ContextParams, kind string) error {
+	p := base
+	if p.Window <= 0 {
+		p.Window = compaction.DefaultWindow // 0 = 缺省（compaction 的归一口径）
+	}
+	if cp != nil {
+		if cp.Window > 0 {
+			p.Window = cp.Window
+		}
+		if cp.L1Pct > 0 {
+			p.L1TargetPct = cp.L1Pct
+		}
+		if cp.L2Pct > 0 {
+			p.L2TargetPct = cp.L2Pct
+		}
+		if cp.RulesBudget > 0 {
+			p.RulesBudget = cp.RulesBudget
+		}
+		if cp.CommonSenseBudget > 0 {
+			p.CommonSenseBudget = cp.CommonSenseBudget
+		}
+	}
+	l1 := p.L1TargetPct
+	if l1 <= 0 {
+		l1 = compaction.DefaultL1TargetPct
+	}
+	l2 := p.L2TargetPct
+	if l2 <= 0 {
+		l2 = compaction.DefaultL2TargetPct
+	}
+	if l2 > l1 {
+		return fmt.Errorf("config.context 生效 l2_pct（%v）必须 ≤ l1_pct（%v）：L2 是更深的一级", l2, l1)
+	}
+	if kind != contextStrategyTiered {
+		return nil // 追加式：窗口与布局不参与装配，不校
+	}
+	if err := compaction.ValidateWindow(p.Window); err != nil {
+		return fmt.Errorf("config.context 生效窗口不合法: %w", err)
+	}
+	if err := compaction.ValidateLayout(p); err != nil {
+		return fmt.Errorf("config.context 生效布局不合法: %w", err)
+	}
+	return nil
+}
+
+// validateContextChange 校验上下文装配面变更集（G-h；**写时 fail-close**）。
+//
+// 四道闸（**唯一事实源复用**，不另抄一份口径）：
+//
+//  1. kind 白名单：""（清除回默认）/ "tiered"（两级压缩）——其余取值拒（400 bad_config）；
+//  2. 数值非负：窗口 / 注入区预算 / 百分比出现**负数** → 拒（**0 是"清除回默认"的载体**，
+//     不是负值——沿用 host.Config 的 0 = 默认口径）；
+//  3. 窗口硬约束：窗口 > 0 时过 compaction.ValidateWindow（W ≥ 256k，13 §8）；
+//  4. 百分比 ∈ (0,100] 且 L2 ≤ L1（与 host/config.go 的 tiered 校验同口径）+ 布局自洽
+//     （compaction.ValidateLayout：注入区预算不许把历史区挤成负数）。
+//
+// 口径说明：未在本次提交里出现的子项按**缺省**参与比较（L1 默认 10% / L2 默认 1%，
+// 窗口默认 1M）——与 compaction.Params 的归一口径（0 = 缺省）同款。**跨项的生效组合**
+// （session 覆盖 + 宿主默认）由宿主层再校一遍（见 Hub.validatePromptConfigFor）。
+func validateContextChange(cc *contracts.ContextConfigChange) error {
+	if cc == nil {
+		return nil
+	}
+	// ① kind 白名单（trim 后比较，与宿主配置同一口径：F23）。
+	//
+	// 值空间 = ""（清除回默认）| "append"（显式追加式）| "tiered"（两级压缩）：
+	// "append" 是 session 级**显式**切回追加式的值（"空串"只能清除、落回宿主默认——
+	// 宿主默认是 tiered 时切不回来）。
+	if cc.Kind != nil {
+		switch strings.TrimSpace(*cc.Kind) {
+		case "", contextStrategyAppend, contextStrategyTiered:
+		default:
+			return fmt.Errorf("config.context.kind 非法：只支持 %q（清除回默认）| %q（显式追加式）| %q（两级压缩），得到 %q",
+				"", contextStrategyAppend, contextStrategyTiered, *cc.Kind)
+		}
+	}
+	// ② 数值非负（0 = 清除回默认；负数一律拒）。
+	if cc.Window != nil && *cc.Window < 0 {
+		return fmt.Errorf("config.context.window 不能为负（得到 %d；0 = 清除回默认）", *cc.Window)
+	}
+	if cc.RulesBudget != nil && *cc.RulesBudget < 0 {
+		return fmt.Errorf("config.context.rules_budget 不能为负（得到 %d；0 = 清除回默认）", *cc.RulesBudget)
+	}
+	if cc.CommonSenseBudget != nil && *cc.CommonSenseBudget < 0 {
+		return fmt.Errorf("config.context.common_sense_budget 不能为负（得到 %d；0 = 清除回默认）", *cc.CommonSenseBudget)
+	}
+	if cc.L1Pct != nil && *cc.L1Pct < 0 {
+		return fmt.Errorf("config.context.l1_pct 不能为负（得到 %v；0 = 清除回默认）", *cc.L1Pct)
+	}
+	if cc.L2Pct != nil && *cc.L2Pct < 0 {
+		return fmt.Errorf("config.context.l2_pct 不能为负（得到 %v；0 = 清除回默认）", *cc.L2Pct)
+	}
+	// ③ 百分比范围 (0,100]（0 = 清除回默认，故只拒 > 100 与负数——与 host/config.go 同口径）。
+	if cc.L1Pct != nil && *cc.L1Pct > 100 {
+		return fmt.Errorf("config.context.l1_pct 必须在 (0,100] 内（得到 %v；0 = 清除回默认）", *cc.L1Pct)
+	}
+	if cc.L2Pct != nil && *cc.L2Pct > 100 {
+		return fmt.Errorf("config.context.l2_pct 必须在 (0,100] 内（得到 %v；0 = 清除回默认）", *cc.L2Pct)
+	}
+	// ④ L2 ≤ L1（归一后比较：未提交的项按缺省算——与 host/config.go:521-542 同口径）。
+	l1 := compaction.DefaultL1TargetPct
+	if cc.L1Pct != nil && *cc.L1Pct > 0 {
+		l1 = *cc.L1Pct
+	}
+	l2 := compaction.DefaultL2TargetPct
+	if cc.L2Pct != nil && *cc.L2Pct > 0 {
+		l2 = *cc.L2Pct
+	}
+	if l2 > l1 {
+		return fmt.Errorf("config.context.l2_pct（%v）必须 ≤ l1_pct（%v）：L2 是更深的一级", l2, l1)
+	}
+	// ⑤ 窗口硬约束（W ≥ 256k，13 §8——唯一事实源 = compaction.ValidateWindow）。
+	//
+	// 口径：窗口 > 0 一律按硬约束校（append 模式下窗口本就不参与装配——让无效窗口进不来
+	// 比"配了没生效"好；tiered 模式下它直接决定布局是否成立）。
+	//
+	// **布局自洽不在这里判**（critic P1）：布局 = 窗口 − 注入区 − 阶段槽 − 尾部，**依赖
+	// 真实生效的窗口**——包级校验拿不到宿主的窗口（拿 DefaultWindow 兜底 = 两处各算各的，
+	// 结论可能相反）。布局由**宿主层**按生效窗口判（validateContextEffectiveParams，唯一
+	// 事实源 = compaction.ValidateLayout）。
+	if cc.Window != nil && *cc.Window > 0 {
+		if err := compaction.ValidateWindow(*cc.Window); err != nil {
+			return fmt.Errorf("config.context.window 不合法: %w", err)
 		}
 	}
 	return nil
@@ -248,15 +490,19 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	if cfg == nil {
 		return nil
 	}
-	// F8：**全空变更集**（model / reasoning_effort / provider / tools 全缺失）= 不修改
-	// 配置 → **不落事件**、照常受理 prompt（202）。贴"缺失 = 不变"语义：`{"config":{}}`
+	// F8：**全空变更集**（model / reasoning_effort / provider / tools / context 全缺失）=
+	// 不修改配置 → **不落事件**、照常受理 prompt（202）。贴"缺失 = 不变"语义：`{"config":{}}`
 	// 是无操作，落一条 payload `{}` 的 durable 事件只会往唯一事实源里灌噪声（fold 结果
 	// 也确实不变）。HTTP/WS 两面共用本函数 → 一处判，两面同口径。
 	//
 	// **tools 出现即是有变更**（G-e）：`{"config":{"tools":{}}}` = 清除回默认（全部已
 	// 注册工具可见）——这是一次**实打实的配置变更**（清除动作要可审计），必须落事件。
 	// 判据是"tools 对象出现"，不是"tools 里有东西"（tools:{} 也要落）。
-	if cfg.Model == nil && cfg.ReasoningEffort == nil && cfg.Provider == nil && cfg.Tools == nil {
+	//
+	// **context 出现即是有变更**（G-h）：同款口径——`{"config":{"context":{}}}` 落一条
+	// 事件（子字段各自 LWW：各项都没带 = 各项都不变；但"这次动过上下文面"要可审计）。
+	if cfg.Model == nil && cfg.ReasoningEffort == nil && cfg.Provider == nil &&
+		cfg.Tools == nil && cfg.Context == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -379,6 +625,37 @@ func configChangedEventID(sid contracts.Ulid, gen int, payload []byte) contracts
 // ③ 本轮快照钩子（生效链第三层）+ G-d provider 覆盖构造
 // ---------------------------------------------------------------------------
 
+// expandProfile 展开命名 profile（G-i）并与**显式** config 叠放，返回合成后的变更集。
+//
+// 叠放次序（定稿）：**先展开 profile → 再叠显式 config**（显式逐字段压过 profile 的
+// 同名字段）→ 合成**一个** ConfigChangedPayload（写路径拿它落**一条** config.changed
+// → 审计里看得见展开后的值）。
+//
+// profile 名未知 → 报错（调用方回 400 bad_profile / WS error 帧，**零事件**：不静默
+// 当成"没有 profile"——那会让用户以为配了模板其实没生效）。
+//
+// profile 名空 → 原样返回显式 config（没有 profile = 不展开，零行为变化）。
+func (h *Hub) expandProfile(name string, explicit *contracts.ConfigChangedPayload) (*contracts.ConfigChangedPayload, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return explicit, nil // 没给 profile = 不展开
+	}
+	p, ok := h.cfg.Profiles[name]
+	if !ok {
+		return nil, fmt.Errorf("profile %q 不存在（可用的：%s）", name, h.profileNamesText())
+	}
+	return overlayConfig(profileConfigPayload(p), explicit), nil
+}
+
+// profileNamesText 列可用的 profile 名（诊断文案用；没有 profile 时给一句人话）。
+func (h *Hub) profileNamesText() string {
+	names := sortedProfileNames(h.cfg.Profiles)
+	if len(names) == 0 {
+		return "（本宿主没有配置任何 profile）"
+	}
+	return strings.Join(names, ", ")
+}
+
 // runOverridesHook 返回绑在某 session 上的 loop.RunOverrides 钩子（loopFor 装配时传入）。
 //
 // 每次 Run 开头被调一次（**轮 = 一个 prompt 的 Run**）：
@@ -386,13 +663,18 @@ func configChangedEventID(sid contracts.Ulid, gen int, payload []byte) contracts
 //	① 先扫平事件流（写路径经 bus 落的 config.changed 到此进 fold）；
 //	② 取 Current(sid) 折叠态 → RunOverridesFromConfig 叠 hub 默认 + 构造 provider 覆盖
 //	   （**与 cmd/alasol resume 共用的唯一取值口**：fold 字段无生效覆盖 → 返回空值，
-//	   loop 侧回退到它的基值——loop 基值就是 loopFor 用 h.cfg 装配的那份）。
+//	   loop 侧回退到它的基值——loop 基值就是 loopFor 用 h.cfg 装配的那份）；
+//	③ 解析本轮**生效的上下文策略 kind**（G-h）：session 折叠的 kind 优先，空串 = 清除
+//	   回默认（落回基线 kind = 宿主默认 / 工作流声明）。
 //
 // 闭包是**无状态**的（只读 fold 表与 hub 配置）→ 并发 Run 只读共享，不破坏 loop 的
 // 并发不变式。**运行中修改配置不影响已冻结的本轮**：钩子只在 Run 开头调一次，
 // 之后的轮次全部读 runState 里的快照——这就是设计 §3.1"当前轮结束后下一轮生效"
 // （轮 = 一个 prompt 的 Run）。
-func (h *Hub) runOverridesHook(sid contracts.Ulid) func(context.Context) (loop.RunOverrides, error) {
+//
+// baseKind 是**基线 kind**（loopFor 时按宿主默认 / 工作流声明解析好，闭包捕获）：
+// session 折叠的 kind 只覆盖它、不改写它（空串 = 清除回默认 = 回到基线）。
+func (h *Hub) runOverridesHook(sid contracts.Ulid, baseKind string) func(context.Context) (loop.RunOverrides, error) {
 	return func(ctx context.Context) (loop.RunOverrides, error) {
 		if ctx == nil {
 			ctx = context.Background()
@@ -403,16 +685,70 @@ func (h *Hub) runOverridesHook(sid contracts.Ulid) func(context.Context) (loop.R
 			return loop.RunOverrides{}, fmt.Errorf("host: 扫配置事件流（G-c 生效链）: %w", err)
 		}
 		if h.cfgTable == nil {
-			return loop.RunOverrides{}, nil // 字面量构造的 Hub：没有 fold 面 = 无覆盖
+			// 字面量构造的 Hub：没有 fold 面 = 无覆盖（但 kind 仍按基线走——快照必须
+			// 带 context，否则 loop 侧会退回"挂了工厂就用它"的老口径）。
+			return loop.RunOverrides{
+				Context: &loop.ContextParams{Kind: resolveContextKind(sessioncfg.Field{}, baseKind)},
+			}, nil
 		}
 		// ② 取值口径收敛在 RunOverridesFromConfig（host/resume 共用）；provider 构造
 		// 走本 hub 的缓存口（同参数复用实例）。错误带上 session 定位。
-		out, err := RunOverridesFromConfig(h.cfgTable.Current(sid), h.cachedProviderOverride)
+		cur := h.cfgTable.Current(sid)
+		out, err := RunOverridesFromConfig(cur, h.cachedProviderOverride)
 		if err != nil {
 			return loop.RunOverrides{}, fmt.Errorf("host: session %s 的配置覆盖（G-c/G-d 本轮快照）: %w", sid, err)
 		}
+		// ③ G-h：上下文面的生效 kind（宿主口径：session 覆盖 + 基线 kind）。
+		if out.Context == nil {
+			out.Context = &loop.ContextParams{}
+		}
+		out.Context.Kind = resolveContextKind(cur.Context.Kind, baseKind)
 		return out, nil
 	}
+}
+
+// resolveContextKind 解析本 session 的**生效**上下文策略 kind（G-h）。
+//
+// 口径：
+//
+//	session 折叠的 kind 为**实值**（非空）→ 用它（"tiered" = 两级压缩；
+//	                                          "append" = **显式追加式**）；
+//	session 折叠的 kind 是**显式空串**（清除记录）→ 落回**基线 kind**（宿主默认 /
+//	工作流声明，loopFor 时解析好）；
+//	session 没写过 → 基线 kind。
+//
+// 返回值："" = 追加式（loop 侧读它就是"本轮不走策略"）；"tiered" = 两级压缩。
+//
+// 宿主只实现 tiered：其余 kind（stage_scoped / sliding_window 等枚举内但保留未实现的）
+// 一律按 append 走（与 contextStrategyFactory 的"静默降级口径"同款——宿主没实现的
+// 策略不报错，按追加式跑）。
+func resolveContextKind(foldKind sessioncfg.Field, baseKind string) string {
+	merged := ""
+	if foldKind.HasValue() {
+		merged = foldKind.Value
+	}
+	return resolveContextKindWith(merged, baseKind)
+}
+
+// resolveContextKindWith 由**合并后的** kind 值解析生效 kind：
+//
+//	非空 → 用它（"tiered" = 两级压缩；"append" = 显式追加式）；
+//	空串 → 清除记录 → 落回**基线 kind**（宿主默认 / 工作流声明）。
+//
+// 返回值："" = 追加式（loop 侧读它就是"本轮不走策略"）；"tiered" = 两级压缩。
+//
+// 宿主只实现 tiered：其余 kind（stage_scoped / sliding_window 等枚举内但保留未实现的）
+// 一律按 append 走（与 contextStrategyFactory 的"静默降级口径"同款——宿主没实现的
+// 策略不报错，按追加式跑）。
+func resolveContextKindWith(mergedKind, baseKind string) string {
+	kind := strings.TrimSpace(mergedKind)
+	if kind == "" {
+		kind = strings.TrimSpace(baseKind)
+	}
+	if kind != contextStrategyTiered {
+		return "" // append（含显式 "append" 与宿主保留未实现的 kind）
+	}
+	return contextStrategyTiered
 }
 
 // ResolveProviderCredential 解析 G-d provider 覆盖的凭据值：**只从环境变量取**
@@ -442,7 +778,7 @@ func NewProviderOverride(baseURL, key string) core.Provider {
 }
 
 // RunOverridesFromConfig 把 fold 出的 sessioncfg.SessionConfig 叠成 loop.RunOverrides
-// （G-c/G-d/G-e 生效链第二层 → 第三层的**唯一取值口**）：
+// （G-c/G-d/G-e/G-h 生效链第二层 → 第三层的**唯一取值口**）：
 //
 //   - model / reasoning_effort：取**生效覆盖**（HasValue）；空 = 返回空值，loop 侧
 //     回退基值（hub 默认 / CLI -model flag——session fold 在其上，与 serve 面同一条
@@ -451,7 +787,9 @@ func NewProviderOverride(baseURL, key string) core.Provider {
 //     切换的端点 → 维持基值 provider，不猜）；成对纪律与凭据解析经
 //     ResolveProviderCredential（fail-close，绝不回退 hub 的 key）；
 //   - tools：session 工具白名单（G-e）——**整组 LWW** 的折叠态折成本轮可见性过滤
-//     （见 toolVisibilityFromFold）。
+//     （见 toolVisibilityFromFold）；
+//   - context：上下文装配面（G-h）——**子字段各自 LWW** 的折叠态折成本轮**覆盖参数**
+//     （零值 = 用默认；见 contextParamsFromFold）。
 //
 // newProvider 是 provider 覆盖的构造口（nil = 直造 NewProviderOverride；host 传带
 // 缓存的实现）。**host 的 Run 钩子与 cmd/alasol resume 共用本函数**——三面一条口径，
@@ -469,6 +807,15 @@ func RunOverridesFromConfig(sc sessioncfg.SessionConfig, newProvider func(baseUR
 	if sc.Tools.Touched {
 		out.Tools = toolVisibilityFromFold(sc.Tools)
 	}
+	// context（G-h）：折叠出的**覆盖值**（零值 = 用默认）。
+	//
+	// **nil 语义**：fold 没有任何 context 子项 → Context = nil（"本轮没有上下文面的
+	// 信息"——与"显式 append"分开，见 contextParamsFromFold 的说明）。
+	//
+	// **kind 不在这里解析**：kind 是宿主口径（session 覆盖 + 宿主/工作流声明），而本函数
+	// 是 host/resume 共用的取值口——CLI 那条链没有宿主默认（挂不起上下文策略），
+	// kind 由宿主钩子解析（Hub.resolveContextKind）。CLI 侧 kind 恒为 ""（追加式）。
+	out.Context = contextParamsFromFold(sc.Context)
 	if !sc.Provider.BaseURL.HasValue() {
 		return out, nil
 	}
@@ -488,6 +835,46 @@ func RunOverridesFromConfig(sc sessioncfg.SessionConfig, newProvider func(baseUR
 		out.Provider = NewProviderOverride(baseURL, key)
 	}
 	return out, nil
+}
+
+// contextParamsFromFold 把折叠出的 context 态折成本轮的**覆盖参数**（G-h）。
+//
+// **nil 语义**（critic P2-3）：fold **没有任何 context 子项** → 返回 nil（"本轮没有
+// 上下文面的信息"）；有任意子项（含 kind 的清除记录）→ 返回非 nil（"有信息"）。
+//
+// 为什么要把 nil 与零值分开：loop 侧两种情形的含义不同——**nil** = 本轮不带上下文面
+// 信息（老装配口径：挂了策略工厂就用它，问不问 kind）；**非 nil** = 宿主口径（快照里的
+// kind 就是**生效 kind**，"" = 追加式）。混成一个零值就会把"显式 append"与"什么都没说"
+// 当成同一件事（显式 append 会被当成"没信息"→ 退回"挂了工厂就用它"）。
+//
+// 三态口径（与 core/sessioncfg 的数值三态同款）：
+//
+//	未写过 / 显式 0 → 零值 = **不覆盖** → 生效上用默认（宿主默认那套）；
+//	显式非零       → 覆盖值。
+//
+// **kind 不在这里折**（宿主口径，见 RunOverridesFromConfig 的说明）。
+func contextParamsFromFold(st sessioncfg.ContextState) *loop.ContextParams {
+	if !st.Kind.Written && !st.Window.Written && !st.L1Pct.Written && !st.L2Pct.Written &&
+		!st.RulesBudget.Written && !st.CommonSenseBudget.Written {
+		return nil // 没有任何 context 子项 = 没有信息（nil）
+	}
+	cp := &loop.ContextParams{}
+	if st.Window.HasValue() {
+		cp.Window = st.Window.Value
+	}
+	if st.L1Pct.HasValue() {
+		cp.L1Pct = st.L1Pct.Value
+	}
+	if st.L2Pct.HasValue() {
+		cp.L2Pct = st.L2Pct.Value
+	}
+	if st.RulesBudget.HasValue() {
+		cp.RulesBudget = st.RulesBudget.Value
+	}
+	if st.CommonSenseBudget.HasValue() {
+		cp.CommonSenseBudget = st.CommonSenseBudget.Value
+	}
+	return cp
 }
 
 // toolVisibilityFromFold 把 fold 出的 tools 折叠态折成本轮的工具可见性白名单（G-e）。

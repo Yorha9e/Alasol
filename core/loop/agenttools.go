@@ -577,6 +577,12 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// K25）——子 agent 的可见集 = 它的类型白名单 ∩ session 白名单（两层相交，谁也
 		// 突破不了谁）。不传 = 子 agent 不受 session 白名单约束（父收窄了、子还看得见
 		// 全部工具 = 白名单形同虚设）。
+		//
+		// Context（G-h）随快照走：**参数**（窗口 / L1% / L2% / 注入区预算）父子同口径
+		// （子 agent 是同一轮的一部分，两边用同一套上下文预算）；**kind 不随**——子 agent
+		// 的策略 kind 归**类型声明**（W6-A：子 agent 的上下文策略按其类型显式声明装配，
+		// 不继承主 agent 的策略），session 级的 kind 覆盖不改写类型声明（那会让"这个
+		// 类型用哪种策略"的声明被 per-prompt 覆盖悄悄推翻）。
 		RunOverrides: func(context.Context) (RunOverrides, error) {
 			if st == nil {
 				return RunOverrides{}, nil // 纵深防御：没快照就用 loop 基值（与不挂钩子等价）
@@ -585,6 +591,7 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 				ReasoningEffort: st.overrides.ReasoningEffort,
 				Provider:        st.overrides.Provider,
 				Tools:           st.overrides.Tools,
+				Context:         childContextParams(st.overrides.Context, childStrategyKindOf(childType, strategy)),
 			}, nil
 		},
 		// D4（G2e，v4-3-A）：大 payload 外置的**仓库与阈值透传给子 agent**。
@@ -608,6 +615,32 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// （独立 fork session id + 独立 per-session WAL 文件），故旁支照常挂 WAL。
 	}
 	return New(cfg)
+}
+
+// childStrategyKindOf 取子 agent 本轮生效的策略 kind（G-h）。
+//
+// 口径：**类型声明**说了算（factory == nil = 追加式 → kind = ""；factory 非 nil = 宿主
+// 装出来的那个策略 → kind = 类型声明的 kind）。
+//
+// 为什么不用父快照的 kind：子 agent 的策略按类型显式声明装配（W6-A，不继承主 agent 的
+// 策略）；session 级的 kind 覆盖是**主 agent 那一轮**的事，不改写类型声明。
+func childStrategyKindOf(childType agents.AgentType, factory compaction.AssemblerFactory) string {
+	if factory == nil {
+		return "" // 追加式（未声明 / append / 宿主没装出来）
+	}
+	return strings.TrimSpace(string(agentStrategyKind(childType)))
+}
+
+// childContextParams 组子 agent 的上下文参数快照（G-h）：**参数随父透传、kind 归类型**。
+//
+// 父快照为 nil（父那一轮没带上下文面信息）→ 子快照也 nil（子 loop 走自己的基线）。
+func childContextParams(parent *ContextParams, childKind string) *ContextParams {
+	if parent == nil {
+		return nil
+	}
+	out := *parent
+	out.Kind = childKind
+	return &out
 }
 
 // agentStrategyKind 取类型声明的上下文策略 kind（未声明 → ""）。

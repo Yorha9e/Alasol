@@ -670,3 +670,113 @@ func TestLoadFileConfigTelemetryDefaults(t *testing.T) {
 		t.Errorf("[telemetry] 缺省应为空（关），got mode=%q dir=%q", fc.Telemetry.Mode, fc.Telemetry.Dir)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// G-i profile 表（[[profiles]]）：解析 + unknown-key 闸门
+// ---------------------------------------------------------------------------
+
+// TestLoadFileConfigProfilesParse：[[profiles]] 数组表 + 其嵌套表（provider / tools /
+// context）解析成宿主形状（配置面 + 执行面）。
+func TestLoadFileConfigProfilesParse(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[[profiles]]
+name = "fast"
+model = "gpt-4o-mini"
+reasoning_effort = "low"
+cwd = "D:/work"
+worktree = "wt"
+run_id = "run-1"
+remote_host = "build-01"
+
+[profiles.provider]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[profiles.tools]
+only = ["read"]
+except = ["bash"]
+
+[profiles.context]
+kind = "tiered"
+window = 512000
+l1_pct = 8
+l2_pct = 0.5
+rules_budget = 20000
+common_sense_budget = 40000
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	profiles, err := fc.ProfileConfigs()
+	if err != nil {
+		t.Fatalf("ProfileConfigs: %v", err)
+	}
+	p, ok := profiles["fast"]
+	if !ok {
+		t.Fatalf("应有名为 fast 的 profile: %v", profiles)
+	}
+	if p.Model != "gpt-4o-mini" || p.ReasoningEffort != "low" {
+		t.Errorf("模型面解析不对: %+v", p)
+	}
+	if p.Provider.BaseURL != "https://api.openai.com/v1" || p.Provider.APIKeyEnv != "OPENAI_API_KEY" {
+		t.Errorf("provider 面解析不对: %+v", p.Provider)
+	}
+	if len(p.Tools.Only) != 1 || p.Tools.Only[0] != "read" || len(p.Tools.Except) != 1 {
+		t.Errorf("工具白名单解析不对: %+v", p.Tools)
+	}
+	if p.Context.Kind != "tiered" || p.Context.Window != 512000 || p.Context.L1Pct != 8 ||
+		p.Context.L2Pct != 0.5 || p.Context.RulesBudget != 20000 || p.Context.CommonSenseBudget != 40000 {
+		t.Errorf("上下文面解析不对: %+v", p.Context)
+	}
+	if p.CWD != "D:/work" || p.Worktree != "wt" || p.RunID != "run-1" || p.RemoteHost != "build-01" {
+		t.Errorf("执行面解析不对: %+v", p)
+	}
+}
+
+// TestLoadFileConfigProfilesUnknownKeyFailsClosed：[[profiles]] 里写错键 → 当场拒
+// （unknown-key 闸门对 profile 表同样生效——"配了不生效比当场报错难排查得多"）。
+func TestLoadFileConfigProfilesUnknownKeyFailsClosed(t *testing.T) {
+	_, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[[profiles]]
+name = "fast"
+modle = "gpt-4o-mini"
+`))
+	if err == nil {
+		t.Fatal("[[profiles]] 里的未知键应被拒（fail-close）")
+	}
+	if !strings.Contains(err.Error(), "modle") {
+		t.Errorf("错误应点名未知键 modle: %v", err)
+	}
+	// 错误里带那张表的合法键（排查成本要降：不用翻文档就知道能写什么）。
+	for _, want := range []string{"name", "model", "reasoning_effort", "cwd"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息应含 profile 表的合法键 %q: %v", want, err)
+		}
+	}
+}
+
+// TestLoadFileConfigProfilesDuplicateNameFailsClosed：重名 → 装载期拒（同名两张表落哪张
+// 是随机的——当场拒，不静默取后者）。
+func TestLoadFileConfigProfilesDuplicateNameFailsClosed(t *testing.T) {
+	fc, err := LoadFileConfig(writeConfig(t, `
+model = "m"
+
+[[profiles]]
+name = "fast"
+model = "m1"
+
+[[profiles]]
+name = "fast"
+model = "m2"
+`))
+	if err != nil {
+		t.Fatalf("LoadFileConfig: %v", err)
+	}
+	if _, err := fc.ProfileConfigs(); err == nil {
+		t.Fatal("重名 profile 应被拒（fail-close）")
+	}
+}
