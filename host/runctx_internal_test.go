@@ -471,6 +471,11 @@ func standbyWakeRun(t *testing.T, h *Hub, ctx context.Context, sidPeer, sidWait 
 		done <- err
 	}()
 	standbyWaitWaiting(t, h, sidWait, true)
+	// **等一小会儿再叫醒**（竞态口径）：waiting 态是 BeginWait 落的，而 standby 的
+	// "等待前全量收件箱检查"紧接着就做——若消息在那之前落地，standby 会走**早到**
+	// 路径（压根没等 → 不预算豁免 → 截止不动），本用例要考的是"等过之后早醒"的
+	// 结算口径。故等检查过去再发消息。
+	time.Sleep(200 * time.Millisecond)
 	if _, err := h.Broadcast(ctx, agentlink.Identity{SessionID: sidPeer}, agentlink.BroadcastRequest{
 		Target: standbyGateTarget(standbyGate),
 		Text:   msg,

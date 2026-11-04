@@ -47,8 +47,15 @@ type PromptSpec struct {
 	// Prompt 用户 prompt 原文（空 = 拒绝）。
 	Prompt string `json:"prompt"`
 	// Config 是可选的 session 配置变更集（G-c/G-d 首批字段：model / reasoning_effort /
-	// provider{base_url, api_key_env}）。语义见 contracts.ConfigChangedPayload：
-	// 字段出现（含显式空串）= 覆盖、缺失 = 不变、空串 = 清除回 hub 默认。
+	// provider{base_url, api_key_env}；G-e 第二批：tools{only, except}）。语义见
+	// contracts.ConfigChangedPayload：字段出现（含显式空串）= 覆盖、缺失 = 不变、
+	// 空串 = 清除回 hub 默认；tools 组是**整组 LWW**（出现 = 整组覆盖，缺失 = 不变，
+	// tools:{} = 清除回默认）。
+	//
+	// **挂账（G-e）**：/btw fork **不继承**父 session 的 tools 白名单——fork 出来的是
+	// **新 session**，它的配置继承 **hub 默认**（与 model / reasoning_effort 同口径：
+	// fork 不继承父 session 的 per-prompt 配置）。要继承得另开一刀（fork 时显式带上
+	// 父 session 的当前 fold 值）。
 	Config *contracts.ConfigChangedPayload `json:"config,omitempty"`
 }
 
@@ -138,16 +145,17 @@ func (f *configFeed) rebuild(ctx context.Context) error {
 // ② 写路径：校验 + 落 config.changed（经 bus）
 // ---------------------------------------------------------------------------
 
-// validatePromptConfig 校验 per-prompt 配置变更集（**写时 fail-close**，G-c/G-d）。
+// validatePromptConfig 校验 per-prompt 配置变更集（**写时 fail-close**，G-c/G-d/G-e）。
 //
-// 两道闸（契约层只定形状，合法性归 host——契约注释同口径）：
+// 三道闸（契约层只定形状，合法性归 host——契约注释同口径）：
 //
 //  1. reasoning_effort 非空必须过 ValidateReasoningEffort（G14 白名单，**唯一事实源**）
 //     → 不合法返回错误，调用方回 400 / WS error 帧 **bad_config**（校验在落事件**之前**
 //     → 非法配置零事件）；
 //  2. provider 凭据纪律（gap2/G-d）：base_url 出现且非空 → api_key_env 必须**同时显式
 //     给且非空**——不静默把 hub key 发给第三方端点。provider 两字段都空串 = 清除覆盖
-//     （合法，本函数不拦）。
+//     （合法，本函数不拦）；
+//  3. tools 白名单的元素纪律（G-e）：元素非空串 + 数量上限（见 validateToolList）。
 func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 	if cfg == nil {
 		return nil
@@ -163,6 +171,45 @@ func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 			return errors.New("config.provider.base_url 非空时必须同时给出非空的 api_key_env" +
 				"（gap2/G-d 凭据纪律：不静默把 hub 的 key 发给第三方端点；api_key_env 只传" +
 				"环境变量名，凭据值不进请求体/事件/日志）")
+		}
+	}
+	if cfg.Tools != nil {
+		if cfg.Tools.Only != nil {
+			if err := validateToolList("only", *cfg.Tools.Only); err != nil {
+				return err
+			}
+		}
+		if cfg.Tools.Except != nil {
+			if err := validateToolList("except", *cfg.Tools.Except); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// maxToolWhitelistEntries 是 config.tools **单个**数组（only / except）的元素数上限
+// （防滥用：白名单是"点名"语义，点名几千个工具没有意义，只会把事件流灌大）。
+const maxToolWhitelistEntries = 256
+
+// validateToolList 校验一个工具名列表（G-e；写时 fail-close）。
+//
+// 三条口径：
+//
+//  1. 元素必须是**非空串**（去首尾空白后非空）——空名是笔误（点名"什么都没有"）；
+//  2. 数量上限 maxToolWhitelistEntries（防滥用）；
+//  3. **重复可容忍**（不报错）：名单语义是集合，重复项无副作用（fold 侧按集合用）。
+//
+// **不校验工具名是否已注册**：注册表是运行期可变的（工具可注册/注销），且白名单语义
+// 天然容错——点名一个当前不存在的工具 = 该工具不存在（不暴露即不存在），不是错误。
+func validateToolList(field string, list []string) error {
+	if len(list) > maxToolWhitelistEntries {
+		return fmt.Errorf("config.tools.%s 元素数 = %d，超上限 %d（防滥用）",
+			field, len(list), maxToolWhitelistEntries)
+	}
+	for i, name := range list {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("config.tools.%s[%d] 不能是空串（工具名必须非空）", field, i)
 		}
 	}
 	return nil
@@ -201,11 +248,15 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	if cfg == nil {
 		return nil
 	}
-	// F8：**全空变更集**（model / reasoning_effort / provider 全缺失）= 不修改配置 →
-	// **不落事件**、照常受理 prompt（202）。贴"缺失 = 不变"语义：`{"config":{}}` 是
-	// 无操作，落一条 payload `{}` 的 durable 事件只会往唯一事实源里灌噪声（fold 结果
+	// F8：**全空变更集**（model / reasoning_effort / provider / tools 全缺失）= 不修改
+	// 配置 → **不落事件**、照常受理 prompt（202）。贴"缺失 = 不变"语义：`{"config":{}}`
+	// 是无操作，落一条 payload `{}` 的 durable 事件只会往唯一事实源里灌噪声（fold 结果
 	// 也确实不变）。HTTP/WS 两面共用本函数 → 一处判，两面同口径。
-	if cfg.Model == nil && cfg.ReasoningEffort == nil && cfg.Provider == nil {
+	//
+	// **tools 出现即是有变更**（G-e）：`{"config":{"tools":{}}}` = 清除回默认（全部已
+	// 注册工具可见）——这是一次**实打实的配置变更**（清除动作要可审计），必须落事件。
+	// 判据是"tools 对象出现"，不是"tools 里有东西"（tools:{} 也要落）。
+	if cfg.Model == nil && cfg.ReasoningEffort == nil && cfg.Provider == nil && cfg.Tools == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -219,7 +270,21 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	if _, err := h.cfgFeed.catchUp(ctx); err != nil {
 		return fmt.Errorf("host: 落 config.changed 前扫事件流失败（fail-close：不拿不确定的届数造幂等 id）: %w", err)
 	}
-	raw, err := json.Marshal(cfg)
+	// G-e 写路径**回填**（堵死"静默放宽"）：tools 组出现且**至少一个子项**在 →
+	// 把缺失的那个子项**从当前 fold 值回填**进事件——事件于是**自含整组**。
+	//
+	// 为什么必须回填（静默放宽的具体形态）：tools 组是**整组 LWW**（组出现 = 整组
+	// 覆盖）→ 第一次提交 `{"only":["read"]}`、第二次提交 `{"except":["bash"]}`（没带
+	// only）→ 第二次的组 = {except:[bash]}（only 缺失 = 未设置）→ 可见集**静默放宽**
+	// 成"全部工具减 bash"（第一轮的 only:[read] 被整组覆盖掉了）。回填后第二次的
+	// 组 = {only:[read], except:[bash]} → 可见 = {read} 减 bash（与"逐项修改"的
+	// 直觉一致），且**整组 LWW 的折叠语义一字不变**（事件自含整组 → fold 照旧整组
+	// 覆盖）。
+	//
+	// 例外：`tools:{}`（**两子项都缺**）= **清除整组**（回默认）——回填不适用
+	// （"清除"就是"两项都未设置"，不能拿旧值填回去）。
+	cfg = backfillToolsFromFold(cfg, h.cfgTable.Current(sid).Tools)
+	raw, err := json.Marshal(normalizeConfigPayload(cfg))
 	if err != nil {
 		return fmt.Errorf("host: 序列化 config.changed payload: %w", err)
 	}
@@ -245,6 +310,61 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 			"session_id", string(sid), "err", err.Error())
 	}
 	return nil
+}
+
+// backfillToolsFromFold 把 tools 组里**缺失**的子项从当前 fold 值回填进变更集
+// （返回副本；不改调用方的结构体）。
+//
+// 触发条件（G-e 静默放宽的修法）：tools 组出现且**至少一个子项**在。
+// 例外：两子项都缺（`tools:{}`）= 清除整组 → 不回填。
+//
+// fold 侧的口径（core/sessioncfg.ToolsState）：Only/Except 是 StringListField——
+// IsSet() 区分"未设置"与"显式清空（空数组）"；List() 返回副本（未设置 → nil）。
+func backfillToolsFromFold(cfg *contracts.ConfigChangedPayload, cur sessioncfg.ToolsState) *contracts.ConfigChangedPayload {
+	if cfg == nil || cfg.Tools == nil {
+		return cfg
+	}
+	only, except := cfg.Tools.Only, cfg.Tools.Except
+	if only == nil && except == nil {
+		return cfg // tools:{} = 清除整组（回填不适用）
+	}
+	out := *cfg
+	tools := *cfg.Tools
+	if tools.Only == nil && cur.Only.IsSet() {
+		v := contracts.ToolNameList(cur.Only.List()) // 显式清空（空数组）也原样带过去——"清空"≠"未设置"
+		tools.Only = &v
+	}
+	if tools.Except == nil && cur.Except.IsSet() {
+		v := contracts.ToolNameList(cur.Except.List())
+		tools.Except = &v
+	}
+	out.Tools = &tools
+	return &out
+}
+
+// normalizeConfigPayload 规整要落事件的变更集（**不改调用方的结构体**，返回副本）：
+//
+//	tools 的列表项若是 **nil 切片**，规整成**空切片**——json.Marshal 把 nil 切片写成
+//	`null`（不是 `[]`），而 fold 侧把 `null` 读成"该项缺失"。"清空该项"（空数组）与
+//	"该项未设置"（缺失）必须可区分，故这里把 nil 切片落成 `[]`（= 显式清空）。
+//
+// 其余字段原样透传（变更集语义：字段出现 = 覆盖、缺失 = 不变）。
+func normalizeConfigPayload(cfg *contracts.ConfigChangedPayload) *contracts.ConfigChangedPayload {
+	if cfg == nil || cfg.Tools == nil {
+		return cfg
+	}
+	out := *cfg
+	tools := *cfg.Tools
+	out.Tools = &tools
+	if tools.Only != nil && *tools.Only == nil {
+		empty := contracts.ToolNameList{}
+		tools.Only = &empty
+	}
+	if tools.Except != nil && *tools.Except == nil {
+		empty := contracts.ToolNameList{}
+		tools.Except = &empty
+	}
+	return &out
 }
 
 // configChangedEventID 派生 config.changed 事件的确定性 id（内容寻址：session +
@@ -322,14 +442,16 @@ func NewProviderOverride(baseURL, key string) core.Provider {
 }
 
 // RunOverridesFromConfig 把 fold 出的 sessioncfg.SessionConfig 叠成 loop.RunOverrides
-// （G-c/G-d 生效链第二层 → 第三层的**唯一取值口**）：
+// （G-c/G-d/G-e 生效链第二层 → 第三层的**唯一取值口**）：
 //
 //   - model / reasoning_effort：取**生效覆盖**（HasValue）；空 = 返回空值，loop 侧
 //     回退基值（hub 默认 / CLI -model flag——session fold 在其上，与 serve 面同一条
 //     生效链）；
 //   - provider：生效 base_url 非空才算有覆盖（只设了 api_key_env 而没端点 = 没有可
 //     切换的端点 → 维持基值 provider，不猜）；成对纪律与凭据解析经
-//     ResolveProviderCredential（fail-close，绝不回退 hub 的 key）。
+//     ResolveProviderCredential（fail-close，绝不回退 hub 的 key）；
+//   - tools：session 工具白名单（G-e）——**整组 LWW** 的折叠态折成本轮可见性过滤
+//     （见 toolVisibilityFromFold）。
 //
 // newProvider 是 provider 覆盖的构造口（nil = 直造 NewProviderOverride；host 传带
 // 缓存的实现）。**host 的 Run 钩子与 cmd/alasol resume 共用本函数**——三面一条口径，
@@ -341,6 +463,11 @@ func RunOverridesFromConfig(sc sessioncfg.SessionConfig, newProvider func(baseUR
 	}
 	if sc.ReasoningEffort.HasValue() {
 		out.ReasoningEffort = sc.ReasoningEffort.Value
+	}
+	// tools（G-e）：组出现过 = 本轮生效（哪怕组内两项都未设置 = 清除回默认，
+	// 那也是"全部已注册工具可见"——与零值同效果，但语义上是一次显式清除）。
+	if sc.Tools.Touched {
+		out.Tools = toolVisibilityFromFold(sc.Tools)
 	}
 	if !sc.Provider.BaseURL.HasValue() {
 		return out, nil
@@ -361,6 +488,38 @@ func RunOverridesFromConfig(sc sessioncfg.SessionConfig, newProvider func(baseUR
 		out.Provider = NewProviderOverride(baseURL, key)
 	}
 	return out, nil
+}
+
+// toolVisibilityFromFold 把 fold 出的 tools 折叠态折成本轮的工具可见性白名单（G-e）。
+//
+// 三态口径（与 core/sessioncfg 的 ToolsState 一致，一处口径三面同）：
+//
+//	组未出现过（Touched=false） → 零值（不限：全部已注册工具可见）；
+//	only 未设置                 → Only=nil（不限：可见集 = 全部已注册工具）；
+//	only 显式空数组             → Only=[]（**非 nil**！可见集为空 = 一个工具都不暴露）；
+//	except 未设置               → Except=nil（不排除）；except 显式空数组 → Except=[]（不排除）。
+//
+// 工具名去首尾空白（写时校验只拦"全空白"，不静默改写用户写的名字——取值时归一，
+// 与 provider.base_url 的 TrimSpace 口径同款）。
+func toolVisibilityFromFold(ts sessioncfg.ToolsState) loop.ToolVisibility {
+	var vis loop.ToolVisibility
+	if ts.Only.Written {
+		vis.Only = trimToolNames(ts.Only.Value)
+	}
+	if ts.Except.Written {
+		vis.Except = trimToolNames(ts.Except.Value)
+	}
+	return vis
+}
+
+// trimToolNames 去掉工具名首尾空白，**保持非 nil**（空数组 = 显式清空该项，
+// 与"该项未设置"必须可区分——nil vs 空切片）。
+func trimToolNames(list []string) []string {
+	out := make([]string, 0, len(list))
+	for _, n := range list {
+		out = append(out, strings.TrimSpace(n))
+	}
+	return out
 }
 
 // cachedProviderOverride 是 RunOverridesFromConfig 的 newProvider 口（host 侧）：

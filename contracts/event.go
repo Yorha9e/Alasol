@@ -448,7 +448,7 @@ type BtwForkedPayload struct {
 	Question string `json:"question"`
 }
 
-// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}（后续批次只增 tools/context/policy 字段，不预留占位——F7 只增，届时再加）。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
+// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}；第二批字段：tools（工具白名单，G-e）；后续批次只增 context/policy 字段，不预留占位——F7 只增，届时再加。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）；tools 的元素非空串、数量上限由 host 层校验（工具名**不**校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行，白名单语义天然容错）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
 type ConfigChangedPayload struct {
 	// 目标模型名覆盖：出现 = 覆盖为该值；空串 = 清除回 hub 默认；缺失 = 不变。
 	Model *string `json:"model,omitempty"`
@@ -456,7 +456,20 @@ type ConfigChangedPayload struct {
 	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 	// provider 覆盖项变更集：缺失 = 不变；出现 = 按 ProviderConfigChange 的字段语义覆盖或清除。
 	Provider *ProviderConfigChange `json:"provider,omitempty"`
+	// session 工具白名单变更集（G-e，设计 15 §3.5）：缺失 = 不变；出现 = 按 ToolsConfigChange 的语义覆盖（**整组 LWW**：tools 组与 model 等标量字段同口径，后写整组覆盖前一组，不拆子字段跨事件合并）。
+	Tools *ToolsConfigChange `json:"tools,omitempty"`
 }
+
+// session 工具白名单的变更集（config.changed 的 payload.tools）：修改 session 的**工具可见性白名单**（对**已注册**工具的可见性增删，持久化）——**白名单制**（R5/R3：不暴露即不存在；点名白名单外的工具 = **模型看不到**——隐藏的工具仍按 policy/perm 正常判定，**可见≠可执行**，天然无"越权"概念）。**可见 ≠ 可执行**：执行许可归 policy/perm 层（本字段只影响模型可见集，不放宽任何执行侧检查）。与 agent 类型级白名单（spawn 时的类型过滤，W5）**各自独立、互不突破**（两层相交：session 白名单不得绕过类型白名单）。**整组 LWW**：tools 对象**出现** = 该 session 的 tools 配置整组被本次提交覆盖（同一次提交的 only/except 一起落；后写整组覆盖前一组，**不拆子字段跨事件合并**——与 model 等标量字段同口径）；tools 对象**缺失** = 不变；tools 对象**出现且两子字段都缺**（`{}`）= 清除回默认（全部已注册工具可见，仍受类型白名单与策略链管辖）。组内子字段三态：出现 = 覆盖（**空数组 = 清空该项**：only 的空数组 = 一个工具都不暴露；except 的空数组 = 不排除任何工具）；缺失 = 该项未设置（only 未设置 = 不限；except 未设置 = 不排除）。
+type ToolsConfigChange struct {
+	// 可见集 = only ∩ 已注册工具（白名单制）：出现 = 覆盖（空数组 = 可见集为空，一个工具都不暴露）；缺失 = 该项未设置（可见集 = 全部已注册工具，仍受类型白名单与策略链管辖）。
+	Only *ToolNameList `json:"only,omitempty"`
+	// 从可见集里减去的工具名：出现 = 覆盖（空数组 = 不排除任何工具）；缺失 = 该项未设置（不排除）。
+	Except *ToolNameList `json:"except,omitempty"`
+}
+
+// 工具名列表（config.changed 的 payload.tools.only / .except 共用的原语）：元素是工具名（不校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行）；出现与缺失可区分（**空数组 ≠ 缺失**：空数组 = 清空该项，缺失 = 该项未设置）。
+type ToolNameList []string
 
 // provider 覆盖项的变更集（config.changed 的 payload.provider 与 WS command.submit 的 config.provider 同型——一个类型两处 $ref、不复制两份定义）：对象**出现且至少一字段有值** = 覆盖该 session 的 provider 覆盖项；**出现且两字段都空串** = 清除 provider 覆盖；**缺失** = 不变。字段级语义同 ConfigChangedPayload（出现 = 覆盖、缺失 = 不变、空串 = 清除）。凭据纪律（host 层校验）：改 base_url 必须**同时显式**给 api_key_env——不静默把 hub 凭据发给第三方端点；契约层只保证两个字段都在形状里（schema 都定义、都可选），不校验成对出现。api_key_env 只存环境变量名（H15），凭据值不进请求体、不进事件。
 type ProviderConfigChange struct {

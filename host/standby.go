@@ -87,6 +87,31 @@ package host
 //	才能跨进程可见，而那与"挂起期零事件"的约束**冲突**（见文件头 ②）。
 //	故跨容器防掉线**不成立**：记挂账（waiting 落事件流 = 后续单独一刀）。
 //
+// # G-j：event 等待条件（v1 表达式边界）
+//
+//	standby({wait: "event", event_kind: "<kind>", event_scope?: "self"|"any",
+//	         timeout_min, on_timeout})
+//
+//	- **event_kind 必填**（缺 → failed，文案点名）；精确 kind 或**尾缀通配**
+//	  "prefix*"（如 "agent.*"）；
+//	- **event_scope 可选，默认 self**（只匹配本 session 的事件）；"any" = 全事件流
+//	  （任意 session，**注意范围很大**——文档写明）；
+//	- **只认 durable 事件**：非 durable 事件**不入库**（F8）→ 扫得到即落库事实；
+//	- 唤醒/交付语义**全套复用**消息面：候选 = 匹配 kind ∧ seq ∉ 已交付集合 → 早到
+//	  检查 + 增量轮询 + 交付前 fresh 复查 + 取最新；completed = 事件摘要 +
+//	  交付标记（{"delivered_seq":N}，进**同一**交付集合）。
+//
+//	**v1 表达式的边界（更复杂的表达式挂账）**：字段级条件（payload 匹配）、多条件组合
+//	（AND/OR/NOT）、外部 session 的定向过滤等**不做**——v1 = kind（含前缀通配）
+//	+ scope。
+//
+// # 诚实边界：standby 本身是**注册表工具**，会被 session 工具白名单藏掉
+//
+//	G-e 的 config.tools 白名单作用在**模型可见集**上——standby 也在注册表里，于是
+//	"only 不含 standby" → 模型**连等都不能等**（工具压根不在可见集里，模型无从
+//	调用）。这是**预期**（白名单制：不暴露即不存在），不是缺陷；但要知道：**配置
+//	白名单时别把 standby 顺手藏掉**，否则多 agent 协作的"等回话"能力没了。
+//
 // # 诚实边界：交付集合是 **session 级**的
 //
 //	已交付集合按**本 session** 的事件流折（completed 指向同一次调用的 intent 事件
@@ -115,8 +140,10 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -135,8 +162,13 @@ const (
 	standbyWaitMessage = "message"
 	// standbyWaitHandoff 等 agentlink.handoff（对端交接）。
 	standbyWaitHandoff = "handoff"
-	// standbyWaitEvent 等任意事件流条件——**本批未实现**（G-j 第二批才落）。
+	// standbyWaitEvent 等**事件流条件**（G-j v1：kind + scope，见 standbyArgs）。
 	standbyWaitEvent = "event"
+
+	// standbyScopeSelf 是 event 等待的**默认**范围：只匹配本 session 的事件。
+	standbyScopeSelf = "self"
+	// standbyScopeAny 匹配**全事件流**（任意 session）——注意范围很大（文档写明）。
+	standbyScopeAny = "any"
 
 	// standbyOnTimeoutReturn 到点即如实收口（回答"未等到"）。**timeout_min 是超时点**。
 	standbyOnTimeoutReturn = "return"
@@ -224,6 +256,10 @@ const (
 	standbyIntentChunk = 4096
 	// standbyPreviewRunes 是唤醒摘要里消息正文的截断长度（字符）。
 	standbyPreviewRunes = 200
+	// standbyEventPreviewBytes 是事件摘要里 payload 预览的字节上限。
+	standbyEventPreviewBytes = 512
+	// standbyEventCandidateCap 是事件候选的条数上限（只留最新的若干条 → 内存有界）。
+	standbyEventCandidateCap = 32
 	// standbyDeliveryBlobReadLimit 是"经 blob 读回交付标记"的读上限（字节）。
 	//
 	// standby 自己的结果是短文本（几百字节——唤醒摘要最多 200 字预览），1MB 远远够；
@@ -245,15 +281,18 @@ func standbyDescriptor() contracts.Tool {
 	return contracts.Tool{
 		Name: ToolStandby,
 		Description: strPtrStandby(
-			"**待机等待**：挂起本轮，等对端 agent 的消息（或交接）到达再继续——" +
+			"**待机等待**：挂起本轮，等对端 agent 的消息（或交接）、或某个事件到达再继续——" +
 				"多 agent 协作里 A 派完活后用它等 B 的回话，等待期不再轮询模型" +
-				"（省 token，也不怕对端掉线）。参数 wait 选等哪类消息" +
-				"（message=等 agentlink.broadcast；handoff=等 agentlink.handoff）；" +
+				"（省 token，也不怕对端掉线）。参数 wait 选等什么" +
+				"（message=等 agentlink.broadcast；handoff=等 agentlink.handoff；" +
+				"event=等事件流里的某个 kind——此时**必须**给 event_kind：" +
+				"精确如 \"agent.completed\"，或尾缀通配如 \"agent.*\"；" +
+				"可选 event_scope=self（默认，只匹配本 session）或 any（全事件流，注意范围很大））；" +
 				"timeout_min=最多等几分钟（1..30，**只在 on_timeout=return 时适用**）；" +
 				"on_timeout=到点还没等到怎么办" +
 				"（return=立刻如实收口并回答\"未等到\"，timeout_min 是超时点；" +
 				"sleep=等到消息到达或 30 分钟硬上限，**timeout_min 不适用**）。" +
-				"消息一到立刻醒，并把发送方与内容摘要回给模型。"),
+				"消息/事件一到立刻醒，并把发送方或事件摘要回给模型。"),
 		Schema:     json.RawMessage(standbyToolSchema),
 		SideEffect: contracts.SideEffectNone, // 不改任何外部状态（只等）
 		Approvable: false,                    // 等待不需要人审（策略链照走：deny-all 默认要显式放行）
@@ -269,8 +308,17 @@ const standbyToolSchema = `{
   "properties": {
     "wait": {
       "type": "string",
-      "enum": ["message", "handoff"],
-      "description": "等哪一类消息：message=等 agentlink.broadcast（对端广播）；handoff=等 agentlink.handoff（对端交接）。"
+      "enum": ["message", "handoff", "event"],
+      "description": "等什么：message=等 agentlink.broadcast（对端广播）；handoff=等 agentlink.handoff（对端交接）；event=等事件流里的某个 kind（此时必须给 event_kind）。"
+    },
+    "event_kind": {
+      "type": "string",
+      "description": "**wait=\"event\" 时必填**：要等的事件 kind——精确（如 \"agent.completed\"）或尾缀通配（如 \"agent.*\" 匹配 agent.* 前缀的所有 kind）。只认落库事实（durable 事件）。"
+    },
+    "event_scope": {
+      "type": "string",
+      "enum": ["self", "any"],
+      "description": "**wait=\"event\" 时可选**，默认 self：self=只匹配本 session 的事件；any=匹配全事件流（任意 session，注意范围很大）。"
     },
     "timeout_min": {
       "type": "integer",
@@ -292,8 +340,13 @@ func strPtrStandby(s string) *string { return &s }
 
 // standbyArgs 是 standby 的已校验参数。
 type standbyArgs struct {
-	// Wait 是要等的消息种类（message / handoff）。
+	// Wait 是要等什么（message / handoff / event）。
 	Wait string
+	// EventKind 是 event 等待的条件（G-j v1）：精确 kind 或尾缀通配 "prefix*"。
+	// **只在 Wait=event 时有值**。
+	EventKind string
+	// EventScope 是 event 等待的范围（self 默认 / any）。**只在 Wait=event 时有值**。
+	EventScope string
 	// TimeoutMin 是**超时点**（分钟）——**只在 return 模式适用**（sleep 模式不看它，
 	// 见 standbyOnTimeoutSleep）。
 	TimeoutMin int
@@ -355,10 +408,25 @@ type standbyIntentRef struct {
 	Seq int64
 }
 
+// standbyHit 是一次等待命中的"可交付物"（agentlink 消息 **或** 事件流事件）。
+//
+// 为什么统一成一种：唤醒/交付语义**全套复用**（交付集合排除、早到检查、交付前
+// 复查、取最新）——只是"候选从哪来"不同：消息面走 agentlink 的 Inbox（K11 可见性
+// 过滤），事件面走事件流扫描（kind 匹配 + scope 过滤）。
+//
+// Seq 是它在事件流里的 **全局 seq**（消息事件与普通事件同一 seq 空间）→ 交付集合
+// 按它排除：**跨 kind 通用**（等消息与等事件交替时不互相踩，反之亦然）。
+type standbyHit struct {
+	// Seq 是命中物的全局 seq（进交付标记 delivered_seq）。
+	Seq int64
+	// Text 是给模型看的摘要正文（消息 → 唤醒摘要；事件 → 事件摘要）。
+	Text string
+}
+
 // standbyOutcome 是一次等待的结果。
 type standbyOutcome struct {
-	// Msg 是唤醒消息（Woke=true 时有效）。
-	Msg agentlink.Message
+	// Hit 是命中的可交付物（Woke=true 时有效）。
+	Hit standbyHit
 	// Woke 报告是被消息唤醒的，还是等到超时收口的。
 	Woke bool
 	// Early 报告这条消息是**等待开始前**就到达的（等待前的全量收件箱检查命中，
@@ -408,15 +476,15 @@ func (e *standbyExecutor) Execute(ctx context.Context, intent contracts.ToolCall
 		return contracts.ToolResult{}, err
 	}
 	if out.Woke {
-		text := standbyWakeText(out.Msg)
+		text := out.Hit.Text
 		if out.Early {
-			// F1：这条消息在**本次等待开始前**就到了（如实说明，别让模型误以为
+			// F1：这条消息/事件在**本次等待开始前**就到了（如实说明，别让模型误以为
 			// 它是"等了一会儿才来的"）。
 			text += standbyEarlyArrivedMark
 		}
-		// 交付标记（critic P1）：记下本次交付的消息 seq → 下一次 standby 的早到检查
-		// **排除**它（旧消息不重复交付）。
-		return standbyResult(text, out.Msg.Seq), nil
+		// 交付标记（critic P1）：记下本次交付的 seq → 下一次 standby 的早到检查
+		// **排除**它（旧消息不重复交付；消息与事件同一集合）。
+		return standbyResult(text, out.Hit.Seq), nil
 	}
 	// 超时收口：没有交付任何消息 → delivered_seq=0（**不进集合**：之后到达的消息
 	// 仍能被下一次早到检查捞到）。
@@ -436,6 +504,10 @@ func (e *standbyExecutor) Execute(ctx context.Context, intent contracts.ToolCall
 //	- 跨 kind 天然正确：handoff 早到未交付 → 不在集合里 → 等 handoff 时能捞到；
 //	- 同 kind 多条未交付 → 最新先交付，旧的**下次有资格**（不再被永久盖住）；
 //	- 重复交付被排除（在集合里）。
+//
+//	集合装的是"**交付过的 seq**"——消息（agentlink.broadcast/handoff 的事件 seq）与
+//	事件流事件**同一全局 seq 空间** → **同一个集合天然通用**：等消息与等事件交替
+//	时不会互相踩（反之亦然）。
 //
 // # 认领键：**CausationID**（critic P2）
 //
@@ -600,12 +672,12 @@ func (e *standbyExecutor) wait(ctx context.Context, ref standbyIntentRef, args s
 	if err != nil {
 		return standbyOutcome{}, err
 	}
-	arrived, arrivedMsg, err := e.checkArrived(ctx, ref, args, delivered)
+	arrived, arrivedHit, err := e.checkArrived(ctx, ref, args, delivered)
 	if err != nil {
 		return standbyOutcome{}, err
 	}
 	if arrived {
-		return standbyOutcome{Msg: arrivedMsg, Woke: true, Early: true}, nil
+		return standbyOutcome{Hit: arrivedHit, Woke: true, Early: true}, nil
 	}
 
 	start := time.Now()
@@ -663,7 +735,7 @@ func (e *standbyExecutor) wait(ctx context.Context, ref standbyIntentRef, args s
 		}
 		// 等待 ctx 从执行 ctx 派生（run ctx 取消 → 立刻中止）。
 		waitCtx, cancel := context.WithTimeout(ctx, time.Until(end))
-		msg, next, found, err := e.pollUntil(waitCtx, ref, args, cursor, delivered)
+		hit, next, found, err := e.pollUntil(waitCtx, ref, args, cursor, delivered)
 		// 本段是否已到点（软检查点/硬上限）：**看 ctx 本身**而不是错误文案——
 		// 到点那一刻正在跑的读会被打断，驱动报的是"interrupted"一类，
 		// 按错误类型判会把"到点"误当成"失败"（如驱动不回 ctx.Err() 时）。
@@ -682,31 +754,31 @@ func (e *standbyExecutor) wait(ctx context.Context, ref standbyIntentRef, args s
 			return standbyOutcome{}, fmt.Errorf("standby: 等待失败: %w", err)
 		}
 		if found {
-			return standbyOutcome{Msg: msg, Woke: true}, nil
+			return standbyOutcome{Hit: hit, Woke: true}, nil
 		}
 		cursor = next
 	}
 }
 
 // pollUntil 在一段等待里轮询唤醒条件（命中即返回）。
-func (e *standbyExecutor) pollUntil(ctx context.Context, ref standbyIntentRef, args standbyArgs, cursor int64, delivered map[int64]bool) (agentlink.Message, int64, bool, error) {
+func (e *standbyExecutor) pollUntil(ctx context.Context, ref standbyIntentRef, args standbyArgs, cursor int64, delivered map[int64]bool) (standbyHit, int64, bool, error) {
 	ticker := time.NewTicker(standbyPollInterval())
 	defer ticker.Stop()
 	for {
 		// 首次立即查（不等第一个 tick），之后每 standbyPollInterval() 一次。
-		found, msg, next, err := e.checkOnce(ctx, ref, args, cursor, delivered)
+		found, hit, next, err := e.checkOnce(ctx, ref, args, cursor, delivered)
 		if err != nil {
-			return agentlink.Message{}, cursor, false, err
+			return standbyHit{}, cursor, false, err
 		}
 		if found {
-			return msg, next, true, nil
+			return hit, next, true, nil
 		}
 		cursor = next
 		select {
 		case <-ctx.Done():
-			return agentlink.Message{}, cursor, false, ctx.Err()
+			return standbyHit{}, cursor, false, ctx.Err()
 		case <-e.deps.hubDone:
-			return agentlink.Message{}, cursor, false, errStandbyHubClosed
+			return standbyHit{}, cursor, false, errStandbyHubClosed
 		case <-ticker.C:
 		}
 	}
@@ -721,34 +793,33 @@ func (e *standbyExecutor) pollUntil(ctx context.Context, ref standbyIntentRef, a
 //
 // 选取口径 = **取最新**那条（seq 最大、未交付的）——与早到检查**同一口径**
 // （critic P2-3：早到取最新、轮询取最旧是口径不一致 → 统一成最新）。
-func (e *standbyExecutor) checkOnce(ctx context.Context, ref standbyIntentRef, args standbyArgs, cursor int64, delivered map[int64]bool) (bool, agentlink.Message, int64, error) {
-	res, err := e.inbox(ctx, ref, cursor)
+func (e *standbyExecutor) checkOnce(ctx context.Context, ref standbyIntentRef, args standbyArgs, cursor int64, delivered map[int64]bool) (bool, standbyHit, int64, error) {
+	cands, next, err := e.candidates(ctx, ref, args, cursor, delivered)
 	if err != nil {
-		return false, agentlink.Message{}, cursor, err
+		return false, standbyHit{}, cursor, err
 	}
-	cands := standbyCandidates(res.Messages, args.Wait, delivered)
 	if len(cands) == 0 {
-		return false, agentlink.Message{}, res.NextSeq, nil
+		return false, standbyHit{}, next, nil
 	}
 	// **交付前复查**（并发可见性，critic P2-1；与早到检查同款）。
 	fresh, err := e.deliveredSeqs(ctx, ref)
 	if err != nil {
-		return false, agentlink.Message{}, cursor, err
+		return false, standbyHit{}, cursor, err
 	}
-	for _, m := range cands {
-		if fresh[m.Seq] {
+	for _, c := range cands {
+		if fresh[c.Seq] {
 			continue // 刚被别的 standby 交付了 → 跳过（取下一条）
 		}
-		return true, m, res.NextSeq, nil
+		return true, c, next, nil
 	}
-	return false, agentlink.Message{}, res.NextSeq, nil
+	return false, standbyHit{}, next, nil
 }
 
-// checkArrived 查"**已经到达**"的同类消息（等待开始前的收件箱检查，F1 + critic P1）。
+// checkArrived 查"**已经到达**"的同类消息/事件（等待开始前的检查，F1 + critic P1）。
 //
 // 口径：**宽范围**（SinceSeq=0 → 全流）+ **交付集合排除**（seq ∈ delivered 的
-// 跳过）→ 过滤条件与增量路径**完全一致**（wait 的 kind 过滤 + K11 addressedTo）→
-// 只认"投递给本 session 的同类消息"。
+// 跳过）→ 过滤条件与增量路径**完全一致**（消息面：wait 的 kind 过滤 + K11
+// addressedTo；事件面：event_kind 匹配 + scope 过滤）。
 //
 // **为什么是集合排除而不是水位**（critic 终验）：水位（"已交付的最大 seq"）是
 // 个**不准的代理**——它把"已交付"约成了"seq ≤ 某值"：别的 kind 的旧消息（handoff）
@@ -762,47 +833,304 @@ func (e *standbyExecutor) checkOnce(ctx context.Context, ref standbyIntentRef, a
 // **交付前复查**（并发可见性，critic P2-1）：delivered 是**等待开始时的快照**——
 // 另一个 standby 可能在我们等待期间交付了同一条消息 → 命中后再折一次集合，
 // 已交付的不再交付（并发 standby 不重复交付同一条）。
-func (e *standbyExecutor) checkArrived(ctx context.Context, ref standbyIntentRef, args standbyArgs, delivered map[int64]bool) (bool, agentlink.Message, error) {
-	res, err := e.inbox(ctx, ref, 0) // 宽范围（SinceSeq=0 → 全流）
+func (e *standbyExecutor) checkArrived(ctx context.Context, ref standbyIntentRef, args standbyArgs, delivered map[int64]bool) (bool, standbyHit, error) {
+	cands, _, err := e.candidates(ctx, ref, args, 0, delivered)
 	if err != nil {
-		return false, agentlink.Message{}, err
+		return false, standbyHit{}, err
 	}
-	cands := standbyCandidates(res.Messages, args.Wait, delivered)
 	if len(cands) == 0 {
-		return false, agentlink.Message{}, nil
+		return false, standbyHit{}, nil
 	}
 	// **交付前复查**（并发可见性，critic P2-1）：delivered 是**等待开始时的快照**——
 	// 另一个 standby 可能在我们等待期间交付了同一条消息 → 交付前再折一次集合，
 	// 已交付的不再交付（并发 standby 不重复交付同一条）。
 	fresh, err := e.deliveredSeqs(ctx, ref)
 	if err != nil {
-		return false, agentlink.Message{}, err
+		return false, standbyHit{}, err
 	}
-	for _, m := range cands {
-		if fresh[m.Seq] {
+	for _, c := range cands {
+		if fresh[c.Seq] {
 			continue // 刚被别的 standby 交付了 → 跳过（取下一条）
 		}
-		return true, m, nil
+		return true, c, nil
 	}
-	return false, agentlink.Message{}, nil
+	return false, standbyHit{}, nil
 }
 
-// standbyCandidates 从收件箱结果里挑候选：kind 匹配 ∧ 不在已交付集合里，
-// **按 seq 降序**（最新在前——早到检查与轮询**同一口径**：都交付最新那条）。
-func standbyCandidates(msgs []agentlink.Message, wait string, delivered map[int64]bool) []agentlink.Message {
-	want := standbyWantKind(wait)
-	out := make([]agentlink.Message, 0, len(msgs))
-	for _, m := range msgs {
+// candidates 取本次等待的候选（**按 seq 降序**：最新在前）+ 下一轮的扫描位置
+// （next：增量轮询的游标起点）。
+//
+// 两个来源（按 wait 分派）：
+//
+//	① message / handoff → agentlink 的 Inbox（K11 addressedTo 可见性过滤）；
+//	② event（G-j v1）→ 事件流扫描（event_kind 匹配 + event_scope 范围）。
+//
+// 两者**同款**过滤：kind 匹配 ∧ 不在已交付集合里 → 交付集合跨 kind 通用
+// （消息与事件同一全局 seq 空间 → 交替等不互相踩）。
+func (e *standbyExecutor) candidates(ctx context.Context, ref standbyIntentRef, args standbyArgs, sinceSeq int64, delivered map[int64]bool) ([]standbyHit, int64, error) {
+	if args.Wait == standbyWaitEvent {
+		// **早到窗口**（critic P1）：事件面的"早到"只认**本轮内**到达的事件——
+		// 窗口 = (本轮 model.turn 的 seq, 本次 intent 的 seq]。
+		//
+		// 为什么消息面不收窄（**两面定义不同**）：
+		//
+		//	消息面：早到 = **外部事实**（对端的回话）**还没被交付过** → 早于本轮也该
+		//	捞到（"B 的回话在 A 决定等之前就到了"正是消息面的核心价值）；
+		//	事件面：早到 = **本轮内**到达的事件 → 上一轮自己的 model.turn /
+		//	tool.call.* / 旧 agent.completed 是**历史**，不是"早到"（否则第二轮
+		//	standby 等 model.turn 会被上一轮的 model.turn 秒唤醒）。
+		//
+		// "需要历史事件"属**更复杂的表达式/查询面**（按历史条件检索），v1 不做 → 挂账。
+		if sinceSeq == 0 {
+			// 早到检查（宽范围那一次）：窗口收窄到本轮。
+			start, err := e.turnWindowStart(ctx, ref)
+			if err != nil {
+				return nil, 0, err
+			}
+			return e.eventCandidates(ctx, ref, args, start, ref.Seq, delivered)
+		}
+		// 增量轮询：游标 = 本次 intent 的 seq（**不变**）。
+		return e.eventCandidates(ctx, ref, args, sinceSeq, 0, delivered)
+	}
+	return e.messageCandidates(ctx, ref, args, sinceSeq, delivered)
+}
+
+// turnWindowStart 返回本 session **本轮**最近一条 model.turn 的 seq（严格小于
+// ref.Seq）；找不到 → 0（= 不设下界）。
+//
+// 用途（critic P1）：事件面早到窗口的**下界**——本轮模型"决定要等"的那一刻。
+// 往回扫用 ReadSlice（闭区间，倒着找最近的一条）→ 代价与"往回找一条"同量级，
+// 不扫全历史。
+func (e *standbyExecutor) turnWindowStart(ctx context.Context, ref standbyIntentRef) (int64, error) {
+	if e.deps.store == nil {
+		return 0, errors.New("standby: 事件流读面缺失——无法定位本轮的 model.turn")
+	}
+	hi := ref.Seq - 1
+	if hi < 1 {
+		return 0, nil // 没有更早的事件 → 不设下界
+	}
+	// 实现认得 SliceReader（core 的只读增量面）→ **倒着**找最近的一条 model.turn
+	//（分块扫，代价与"往回找一条"同量级）。
+	if sr, ok := e.deps.store.(core.SliceReader); ok {
+		lo := hi - standbyIntentChunk + 1
+		if lo < 1 {
+			lo = 1
+		}
+		for {
+			evs, err := sr.ReadSlice(ctx, &ref.SessionID, lo, hi, standbyIntentChunk)
+			if err != nil {
+				return 0, fmt.Errorf("standby: 读事件流失败（找本轮的 model.turn）: %w", err)
+			}
+			for i := len(evs) - 1; i >= 0; i-- {
+				if evs[i].Kind == loop.KindModelTurn && evs[i].Seq != nil {
+					return *evs[i].Seq, nil
+				}
+			}
+			if lo == 1 {
+				return 0, nil // 扫到流头都没有 model.turn → 不设下界
+			}
+			hi = lo - 1
+			lo = hi - standbyIntentChunk + 1
+			if lo < 1 {
+				lo = 1
+			}
+		}
+	}
+	// 兜底：实现不认 SliceReader → 正向扫（记住最后一条 model.turn；代价高一档，
+	// 但**行为同口径**——core 的纪律：消费方用类型断言探测，不认的实现自动退回）。
+	from := int64(1)
+	var last int64
+	for from <= hi {
+		evs, err := e.deps.store.ReadFrom(ctx, &ref.SessionID, from, standbyIntentChunk)
+		if err != nil {
+			return 0, fmt.Errorf("standby: 读事件流失败（找本轮的 model.turn）: %w", err)
+		}
+		if len(evs) == 0 {
+			break
+		}
+		stop := false
+		for i := range evs {
+			if evs[i].Seq == nil {
+				continue
+			}
+			if *evs[i].Seq > hi {
+				stop = true
+				break
+			}
+			if evs[i].Kind == loop.KindModelTurn {
+				last = *evs[i].Seq
+			}
+		}
+		if stop {
+			break
+		}
+		if len(evs) < standbyIntentChunk {
+			break
+		}
+		from = *evs[len(evs)-1].Seq + 1
+	}
+	return last, nil
+}
+
+// messageCandidates 从收件箱里挑候选（消息面）：kind 匹配 ∧ 不在已交付集合里，
+// **按 seq 降序**（早到检查与轮询**同一口径**：都交付最新那条）。
+func (e *standbyExecutor) messageCandidates(ctx context.Context, ref standbyIntentRef, args standbyArgs, sinceSeq int64, delivered map[int64]bool) ([]standbyHit, int64, error) {
+	res, err := e.inbox(ctx, ref, sinceSeq)
+	if err != nil {
+		return nil, sinceSeq, err
+	}
+	want := standbyWantKind(args.Wait)
+	out := make([]standbyHit, 0, len(res.Messages))
+	for _, m := range res.Messages {
 		if m.Kind != want {
 			continue // 等 message 不被 handoff 唤醒（反之亦然）
 		}
 		if delivered[m.Seq] {
 			continue // 已交付过 → 不重复交付（集合排除）
 		}
-		out = append(out, m)
+		out = append(out, standbyHit{Seq: m.Seq, Text: standbyWakeText(m)})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq > out[j].Seq })
-	return out
+	return out, res.NextSeq, nil
+}
+
+// eventCandidates 从**事件流**里挑候选（事件面，G-j v1）：event_kind 匹配 ∧
+// scope 范围内 ∧ 不在已交付集合里，**按 seq 降序**。
+//
+// 口径：
+//
+//   - **只认 durable 事件**：非 durable 事件**根本不入库**（F8：store 的 Append
+//     直接拒收非 durable 事件）→ 扫得到的事件恒是落库事实；
+//   - **scope=self**（默认）→ 只扫本 session 的事件；**scope=any** → 扫全流
+//     （任意 session，注意范围很大）；
+//   - **不把本次 intent 自己**当候选（否则 event_kind="tool.call.*" 会自己叫醒
+//     自己——那条 intent 落在流里、seq = ref.Seq）。
+//
+// 扫描口径：sinceSeq 是**排他**下界（与消息面同款："严格大于"），upperSeq 是**含**
+// 上界（0 = 无上界；早到检查用 ref.Seq 封顶）。
+//
+// 内存：**扫描块 O(块)** + **候选缓冲固定 32 条**（流式固定缓冲 → 候选内存 O(1)）。
+func (e *standbyExecutor) eventCandidates(ctx context.Context, ref standbyIntentRef, args standbyArgs, sinceSeq, upperSeq int64, delivered map[int64]bool) ([]standbyHit, int64, error) {
+	if e.deps.store == nil {
+		return nil, sinceSeq, errors.New("standby: 事件流读面缺失——无法等事件条件（wait=\"event\"）")
+	}
+	// scope=self（默认）→ 只看本 session；any → 全流。
+	var sid *contracts.Ulid
+	if args.EventScope != standbyScopeAny {
+		sid = &ref.SessionID
+	}
+	from := sinceSeq
+	if from > 0 {
+		from++ // 与消息面同款口径：SinceSeq 是**严格大于**
+	}
+	out := make([]standbyHit, 0, standbyEventCandidateCap)
+	last := sinceSeq
+	for {
+		evs, err := e.deps.store.ReadFrom(ctx, sid, from, standbyIntentChunk)
+		if err != nil {
+			return nil, sinceSeq, fmt.Errorf("standby: 读事件流失败（等事件条件）: %w", err)
+		}
+		if len(evs) == 0 {
+			break // 流尾
+		}
+		for i := range evs {
+			ev := &evs[i]
+			if ev.Seq == nil {
+				continue
+			}
+			last = *ev.Seq
+			if upperSeq > 0 && last > upperSeq {
+				// 过了上界（早到窗口的封顶）→ 本块及之后都不看。
+				return out, last, nil
+			}
+			if last == ref.Seq {
+				continue // 本次 intent 自己 → 不当候选
+			}
+			if !standbyKindMatch(args.EventKind, ev.Kind) {
+				continue // kind 不匹配
+			}
+			if delivered[last] {
+				continue // 已交付过 → 不重复交付（集合排除，跨 kind 通用）
+			}
+			out = standbyPushHit(out, standbyHit{Seq: last, Text: standbyEventText(ev)})
+		}
+		if len(evs) < standbyIntentChunk {
+			break // 这批不满 → 流尾
+		}
+		if last < from {
+			break // 没有前进 → 停（防死循环）
+		}
+		from = last + 1
+	}
+	// 缓冲里是最新的 N 条（升序）→ **降序**输出（最新的在前：与消息面同款口径）。
+	// 排序的元素数恒 ≤ standbyEventCandidateCap → 内存 O(1) 候选。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Seq > out[j].Seq })
+	return out, last, nil
+}
+
+// standbyPushHit 把一条候选推进**固定容量**的缓冲（只留最新的 N 条）。
+//
+// 为什么要"流式固定缓冲"（critic P2-2）：候选条数**不封顶**的话，匹配事件一多
+// （scope=any + 宽 kind）候选列表就线性涨 → 内存不是 O(1)。这里恒定只留最新的
+// standbyEventCandidateCap 条：**最新的先交付**（与消息面同款），更早的未交付事件
+// **下次仍有资格**（逐条补交——交付集合排除只挡"已交付过的"）。
+func standbyPushHit(buf []standbyHit, h standbyHit) []standbyHit {
+	buf = append(buf, h)
+	if len(buf) <= standbyEventCandidateCap {
+		return buf
+	}
+	// 满了 → 丢掉**最旧**的那条（buf 按 seq 升序推进：最旧 = 第一个）。
+	copy(buf, buf[1:])
+	return buf[:standbyEventCandidateCap]
+}
+
+// standbyKindMatch 报告 event_kind 是否匹配某个事件 kind：精确匹配，或**尾缀**
+// 通配（"prefix*" 匹配该前缀的所有 kind）。
+func standbyKindMatch(pattern, kind string) bool {
+	if strings.HasSuffix(pattern, "*") {
+		return strings.HasPrefix(kind, strings.TrimSuffix(pattern, "*"))
+	}
+	return pattern == kind
+}
+
+// validateStandbyEventKind 校验 event_kind（精确 kind 或尾缀通配 "prefix*"）。
+func validateStandbyEventKind(kind string) error {
+	if i := strings.IndexByte(kind, '*'); i >= 0 {
+		if i != len(kind)-1 {
+			return fmt.Errorf(
+				"standby: event_kind 的通配符只支持**尾缀**（\"prefix*\"）（收到 %q）", kind)
+		}
+		if len(kind) == 1 {
+			return errors.New(
+				"standby: event_kind 不能只是 \"*\"（那会匹配整个事件流——请给更具体的 kind 或前缀）")
+		}
+	}
+	return nil
+}
+
+// standbyEventText 拼事件摘要：kind + 归属 session + seq + ts + payload 预览。
+func standbyEventText(ev *contracts.Event) string {
+	seq := int64(0)
+	if ev.Seq != nil {
+		seq = *ev.Seq
+	}
+	return fmt.Sprintf("收到事件 %s（session=%s seq=%d ts=%s）：%s",
+		ev.Kind, string(ev.SessionID), seq, ev.TS, standbyEventPreview(ev.Payload))
+}
+
+// standbyEventPreview 截 payload 预览（按字节上限 + **rune 边界**回退，不切坏 UTF-8）。
+func standbyEventPreview(payload []byte) string {
+	if len(payload) == 0 {
+		return "（无 payload）"
+	}
+	if len(payload) <= standbyEventPreviewBytes {
+		return string(payload)
+	}
+	cut := standbyEventPreviewBytes
+	for cut > 0 && !utf8.RuneStart(payload[cut]) {
+		cut-- // 回退到 rune 边界
+	}
+	return string(payload[:cut]) + "…（已截断）"
 }
 
 // standbyDelivery 是 standby 结果里的**交付标记**（结构化载荷，程序化消费）。
@@ -852,7 +1180,8 @@ func (e *standbyExecutor) inbox(ctx context.Context, ref standbyIntentRef, curso
 	return res, nil
 }
 
-// standbyWantKind 取"等哪类消息"对应的 agentlink kind。
+// standbyWantKind 取"等哪类消息"对应的 agentlink kind（**只用于消息面**——事件面
+// 走 event_kind 匹配，见 eventCandidates）。
 func standbyWantKind(wait string) string {
 	if wait == standbyWaitHandoff {
 		return agentlink.KindHandoff
@@ -1083,14 +1412,60 @@ func parseStandbyArgs(raw json.RawMessage) (standbyArgs, error) {
 	}
 	switch wait {
 	case standbyWaitMessage, standbyWaitHandoff:
+		// 不该带 event 等待的参数（fail-close：参数给错了要**点名**，不静默忽略）。
+		if _, ok := fields["event_kind"]; ok {
+			return standbyArgs{}, errors.New(
+				"standby: wait=\"message\"/\"handoff\" 时不该给 event_kind" +
+					"（event_kind 只在 wait=\"event\" 时有意义）")
+		}
+		if _, ok := fields["event_scope"]; ok {
+			return standbyArgs{}, errors.New(
+				"standby: wait=\"message\"/\"handoff\" 时不该给 event_scope" +
+					"（event_scope 只在 wait=\"event\" 时有意义）")
+		}
 		out.Wait = wait
 	case standbyWaitEvent:
-		return standbyArgs{}, errors.New(
-			"standby: wait=\"event\" 本批未实现（等任意事件流条件是 G-j 第二批的活）——" +
-				"本批只支持 wait=\"message\"（等 agentlink.broadcast）与 wait=\"handoff\"（等 agentlink.handoff）")
+		out.Wait = wait
+		// event_kind：**必填**（G-j v1 的条件就是它）。
+		rawKind, ok := fields["event_kind"]
+		if !ok {
+			return standbyArgs{}, errors.New(
+				"standby: wait=\"event\" 时必须给 event_kind（要等的事件 kind：" +
+					"精确如 \"agent.completed\"，或尾缀通配如 \"agent.*\"（匹配 agent.* 前缀的所有 kind））")
+		}
+		var kind string
+		if err := json.Unmarshal(rawKind, &kind); err != nil {
+			return standbyArgs{}, fmt.Errorf("standby: event_kind 必须是字符串: %w", err)
+		}
+		kind = strings.TrimSpace(kind)
+		if kind == "" {
+			return standbyArgs{}, errors.New(
+				"standby: event_kind 不能为空（精确 kind，或尾缀通配 \"prefix*\"）")
+		}
+		if err := validateStandbyEventKind(kind); err != nil {
+			return standbyArgs{}, err
+		}
+		out.EventKind = kind
+		// event_scope：可选，**默认 self**（只匹配本 session 的事件）。
+		out.EventScope = standbyScopeSelf
+		if rawScope, ok := fields["event_scope"]; ok {
+			var scope string
+			if err := json.Unmarshal(rawScope, &scope); err != nil {
+				return standbyArgs{}, fmt.Errorf("standby: event_scope 必须是字符串: %w", err)
+			}
+			scope = strings.TrimSpace(scope)
+			switch scope {
+			case standbyScopeSelf, standbyScopeAny:
+				out.EventScope = scope
+			default:
+				return standbyArgs{}, fmt.Errorf(
+					"standby: event_scope 只认 \"self\"（默认，只匹配本 session 的事件）"+
+						"或 \"any\"（全事件流，注意范围很大）（收到 %q）", scope)
+			}
+		}
 	default:
 		return standbyArgs{}, fmt.Errorf(
-			"standby: wait 只认 \"message\" 或 \"handoff\"（收到 %q）", wait)
+			"standby: wait 只认 \"message\"、\"handoff\" 或 \"event\"（收到 %q）", wait)
 	}
 	// timeout_min：1..30 的整数。
 	rawTimeout, ok := fields["timeout_min"]

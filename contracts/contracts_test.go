@@ -454,6 +454,37 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.ReasoningEffort != nil && *p.ReasoningEffort == "" {
 				t.Errorf("line %d: config.changed reasoning_effort 带了就不该是空串（空串 = 清除，样本应演示覆盖）", lineNo)
 			}
+			// G-e 工具白名单：样本钉住 tools 的真实形状（only + except 两项都带，
+			// 且**空数组 ≠ 缺失**——出现 = 覆盖，空数组 = 清空该项）。
+			if p.Tools == nil {
+				t.Errorf("line %d: config.changed 应带 tools 白名单（G-e）", lineNo)
+				break
+			}
+			if p.Tools.Only == nil {
+				t.Errorf("line %d: config.changed tools.only 应出现（出现 = 覆盖；缺失 = 该项未设置）", lineNo)
+			} else if len(*p.Tools.Only) == 0 {
+				t.Errorf("line %d: config.changed tools.only 不该是空数组（样本演示覆盖形状）", lineNo)
+			}
+			if p.Tools.Except == nil {
+				t.Errorf("line %d: config.changed tools.except 应出现（出现 = 覆盖；缺失 = 该项未设置）", lineNo)
+			} else if len(*p.Tools.Except) == 0 {
+				t.Errorf("line %d: config.changed tools.except 不该是空数组（样本演示覆盖形状）", lineNo)
+			}
+			// 工具名非空（空名 = 点名"什么都没有"，host 层校验也会拒）。
+			if p.Tools.Only != nil {
+				for i, name := range *p.Tools.Only {
+					if strings.TrimSpace(name) == "" {
+						t.Errorf("line %d: config.changed tools.only[%d] 不能是空串", lineNo, i)
+					}
+				}
+			}
+			if p.Tools.Except != nil {
+				for i, name := range *p.Tools.Except {
+					if strings.TrimSpace(name) == "" {
+						t.Errorf("line %d: config.changed tools.except[%d] 不能是空串", lineNo, i)
+					}
+				}
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}

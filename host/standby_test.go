@@ -857,7 +857,11 @@ func TestStandbyInvalidArgs(t *testing.T) {
 		args string
 		want []string
 	}{
-		{"wait=event 未实现", `{"wait":"event","timeout_min":1,"on_timeout":"return"}`, []string{"G-j", "wait"}},
+		{"wait=event 缺 event_kind", `{"wait":"event","timeout_min":1,"on_timeout":"return"}`, []string{"event_kind"}},
+		{"wait=event 的 event_kind 为空", `{"wait":"event","event_kind":"  ","timeout_min":1,"on_timeout":"return"}`, []string{"event_kind"}},
+		{"wait=event 的通配符不在尾缀", `{"wait":"event","event_kind":"agent.*.x","timeout_min":1,"on_timeout":"return"}`, []string{"event_kind", "尾缀"}},
+		{"wait=event 的 event_scope 未知", `{"wait":"event","event_kind":"agent.*","event_scope":"other","timeout_min":1,"on_timeout":"return"}`, []string{"event_scope"}},
+		{"wait=message 却给了 event_kind", `{"wait":"message","event_kind":"agent.*","timeout_min":1,"on_timeout":"return"}`, []string{"event_kind"}},
 		{"timeout_min=0", `{"wait":"message","timeout_min":0,"on_timeout":"return"}`, []string{"timeout_min", "1..30"}},
 		{"timeout_min=31", `{"wait":"message","timeout_min":31,"on_timeout":"return"}`, []string{"timeout_min", "1..30"}},
 		{"wait 未知取值", `{"wait":"whatever","timeout_min":1,"on_timeout":"return"}`, []string{"wait", "message"}},

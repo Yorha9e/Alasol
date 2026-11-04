@@ -572,6 +572,11 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// 兜底用**父本轮生效模型**（modelFor(st)，F1——不是 hub 基值）。ReasoningEffort /
 		// Provider 随快照走——覆盖生效时父子同档位、同端点（不出现"父走覆盖端点、
 		// 子走 hub 端点"的分叉）。
+		//
+		// Tools（G-e）随快照走：session 工具白名单是**session 级**的（父子同 session，
+		// K25）——子 agent 的可见集 = 它的类型白名单 ∩ session 白名单（两层相交，谁也
+		// 突破不了谁）。不传 = 子 agent 不受 session 白名单约束（父收窄了、子还看得见
+		// 全部工具 = 白名单形同虚设）。
 		RunOverrides: func(context.Context) (RunOverrides, error) {
 			if st == nil {
 				return RunOverrides{}, nil // 纵深防御：没快照就用 loop 基值（与不挂钩子等价）
@@ -579,6 +584,7 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 			return RunOverrides{
 				ReasoningEffort: st.overrides.ReasoningEffort,
 				Provider:        st.overrides.Provider,
+				Tools:           st.overrides.Tools,
 			}, nil
 		},
 		// D4（G2e，v4-3-A）：大 payload 外置的**仓库与阈值透传给子 agent**。

@@ -142,7 +142,8 @@ type Config struct {
 	//
 	// 每次 Run（**轮 = 一个 prompt 的 Run**）开头调一次：返回的空字段/nil = 用 loop
 	// 基值；非空 = 本轮覆盖（model 进 ModelRequest.Model 与 model.turn、reasoning_
-	// effort 进 ModelRequest.ReasoningEffort、Provider 替换本轮的 provider.Run 调用方）。
+	// effort 进 ModelRequest.ReasoningEffort、Provider 替换本轮的 provider.Run 调用方、
+	// Tools 过滤本轮的模型可见集——G-e 的 session 工具白名单）。
 	// **运行中修改配置不影响已冻结的本轮**（钩子只在 Run 开头调一次），下一个 prompt
 	// 的 Run 重取 fold → 设计 §3.1"当前轮结束后下一轮生效"。
 	//
@@ -243,6 +244,53 @@ type RunOverrides struct {
 	// base_url + api_key_env 构造（凭据值只在宿主侧从环境变量取出，H12/H15/H19：
 	// 绝不进事件/请求体/日志）。
 	Provider core.Provider
+	// Tools 本轮 session 工具白名单（G-e；零值 = 不限 = 全部已注册工具可见，
+	// 与本字段引入前的行为逐字节等价）。
+	Tools ToolVisibility
+}
+
+// ToolVisibility 是**本轮**的工具可见性白名单（G-e；设计 15 §3.5 白名单语义）。
+//
+// **语义**：修改 session 的工具白名单 = 对**已注册**工具的可见性增删（持久化在
+// config.changed 事件里，折叠口径见 core/sessioncfg）。
+//
+//   - **白名单制**（R5/R3：不暴露即不存在）：点名白名单外的工具 = **模型看不到**
+//     （隐藏的工具仍按 policy/perm 正常判定——可见≠可执行），天然无"越权"概念；
+//   - **可见 ≠ 可执行**：本结构只决定"哪些工具出现在模型可见集里"，**不放宽任何
+//     执行侧检查**——执行许可归 policy/perm 层（判定发生在调用时刻，M9）；
+//   - 与 agent 类型级白名单（spawn 时的类型过滤，W5）**各自独立、互不突破**：两层
+//     相交，session 白名单不得绕过类型白名单。
+//
+// 作用域：只治理**已注册**工具（registry 里的条目）；生命周期工具（spawn / complete）
+// 与上下文框架工具（recall / stage / ledger）**不由它治理**——它们由 agent 类型白名单
+// 与策略链裁决（框架工具同样过类型白名单，见 visibleTools）。
+type ToolVisibility struct {
+	// Only 非 nil = 可见集 = Only ∩ 已注册工具（**空数组 = 一个工具都不暴露**）；
+	// nil = 该面不设限（全部已注册工具可见，仍受类型白名单与策略链管辖）。
+	Only []string
+	// Except = 从可见集里减去的工具名（nil / 空 = 不减）。
+	Except []string
+}
+
+// allows 报告工具名是否落在本白名单内（only 面：nil = 不限；except 面：在名单里就排除）。
+func (v ToolVisibility) allows(name string) bool {
+	if v.Only != nil && !containsToolName(v.Only, name) {
+		return false
+	}
+	if len(v.Except) > 0 && containsToolName(v.Except, name) {
+		return false
+	}
+	return true
+}
+
+// containsToolName 报告名单里有没有这个名字。
+func containsToolName(list []string, name string) bool {
+	for _, n := range list {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Loop 是一次会话内的 agent loop 状态机。
@@ -784,9 +832,20 @@ func (l *Loop) request(history []core.Message, ot *onlineTable, st *runState) co
 		Model:           l.modelFor(st), // G-c/G-d：本轮快照覆盖优先，空 = loop 基值
 		System:          l.system,
 		Messages:        msgs,
-		Tools:           l.visibleTools(strategyToolsOf(st)), // 框架工具（策略 + ledger）
-		ReasoningEffort: l.reasoningEffortPtr(st),            // 思维链档位（G14；nil = 不传）
+		Tools:           l.visibleTools(strategyToolsOf(st), toolVisibilityOf(st)), // 框架工具（策略 + ledger）
+		ReasoningEffort: l.reasoningEffortPtr(st),                                  // 思维链档位（G14；nil = 不传）
 	}
+}
+
+// toolVisibilityOf 取本次 Run 生效的 session 工具白名单（G-e；nil 安全）。
+//
+// 白名单来自**本轮快照**（st.overrides.Tools，Run 开始时冻结）——运行中落的
+// config.changed 不影响本轮，下一个 prompt 的 Run 重取即生效（同 model/effort 的口径）。
+func toolVisibilityOf(st *runState) ToolVisibility {
+	if st == nil {
+		return ToolVisibility{}
+	}
+	return st.overrides.Tools
 }
 
 // modelFor 取本次 Run **生效的模型名**（G-c/G-d 生效链第三层）：本轮快照覆盖非空 →
@@ -828,7 +887,7 @@ func (l *Loop) reasoningEffortPtr(st *runState) *string {
 //     的总量护栏（F2：两个预算各自放行会相加超窗）；
 //   - 本轮模型可见的工具名 → 策略据此决定摘要条目要不要附 recall 说明（F27）。
 func (l *Loop) requestWithStrategy(ctx context.Context, history []core.Message, ot *onlineTable, turn int, st *runState) (core.ModelRequest, []contracts.ContextPart) {
-	tools := l.visibleTools(st.strategyTools)
+	tools := l.visibleTools(st.strategyTools, toolVisibilityOf(st))
 	if setter, ok := st.assembler.(compaction.BaseOverheadSetter); ok {
 		// 在线表也是本轮上下文的一部分（loop 追加在末尾，策略看不见）→ 计入固定开销，
 		// 否则总量护栏会漏算它。
@@ -934,11 +993,20 @@ func (l *Loop) collectStrategyTools(a compaction.Assembler) (map[string]compacti
 // 免检通道——"不暴露即不存在"对它们一样成立。要豁免就把工具名写进该 agent 类型的
 // tools 列表（显式豁免，不许静默绕过）。
 //
+// **session 工具白名单（G-e，最后一道）**：注册表工具过了 State → 类型白名单 → 策略
+// deny 三道之后，再叠 session 白名单（可见集 = only ∩ 已注册 - except；only 缺省 =
+// 不限）。两层白名单**各自独立、互不突破**：类型白名单不许被 session 白名单放宽，
+// session 白名单也不放宽类型白名单（**相交**，不是并集）。白名单只管**已注册**工具的
+// 可见性；生命周期工具（spawn / complete）与框架工具不由它治理（见 ToolVisibility）。
+// **可见 ≠ 可执行**：这里只改"模型看到什么"，执行许可链（policy/perm）一字不改。
+//
 // strategyTools 是本次 Run 的上下文策略注入的框架工具（v2-S1：recall / stage；per-Run，
 // 由调用方从 runState 传入；nil = 无策略框架工具）。可见集**按名字去重**（F12）：
 // 同一个名字只出现一次（执行侧的解析优先级与可见集保持一致：策略框架工具优先，
 // 但同名在装配期就已 fail-close 拒绝，见 collectStrategyTools）。
-func (l *Loop) visibleTools(strategyTools map[string]compaction.FrameworkTool) []contracts.Tool {
+//
+// vis 是本轮生效的 session 工具白名单（G-e；零值 = 不限 = 与本字段引入前逐字节等价）。
+func (l *Loop) visibleTools(strategyTools map[string]compaction.FrameworkTool, vis ToolVisibility) []contracts.Tool {
 	var (
 		typeFilter map[string]bool // 非 nil 时按类型 Tools 收窄注册工具
 		canSpawn   bool
@@ -971,6 +1039,9 @@ func (l *Loop) visibleTools(strategyTools map[string]compaction.FrameworkTool) [
 		}
 		if !l.toolVisible(e.Tool.Name) {
 			continue // H4：被 deny 的工具移出模型可见集
+		}
+		if !vis.allows(e.Tool.Name) {
+			continue // G-e：session 工具白名单（only ∩ 已注册 - except；白名单制：不暴露即不存在）
 		}
 		if seen[e.Tool.Name] {
 			continue // F12：可见集按名字去重

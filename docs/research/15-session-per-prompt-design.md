@@ -123,6 +123,7 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
 - 现状只有两层**静态**：hub 启动级（`-allow` / 策略规则 / 审批模式四档）+ agent 树 H22 perm（子级权限不超出父级）。**无任何运行时/per-prompt 修改面**。
 - 按 §3 语义应为 `config.policy` 维度（改了持久生效）。
 - **开工 G-g 前必须单独拍板的安全语义**：per-prompt/运行时**放宽**权限要不要受限（谁能改、能不能降审批档位、放宽是否要审批）。
+- **拍板（2026-11-03 用户）：不做运行时权限修改面**——权限维持现状（两层静态），`config.policy` 字段**不实现**。理由：subagent 频繁弹审批伤体验；实际部署基本 always-allow/全开，运行时修改面只有摩擦没有收益。如将来要做，F7 只增随时可补 policy 字段（届时随 v4 鉴权面一起设计放宽语义）。
 
 ## 6. 施工缺口与批次
 
@@ -134,7 +135,7 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
 | G-d | 模型面字段（model / reasoning_effort / provider） | 2 |
 | G-f | standby 工具（waiting 态 + message/timeout + 三交互点） | 2 |
 | G-e | config.tools 工具白名单修改 | 3 |
-| G-g | 权限面（config.policy）——开工前拍安全语义 | 3 |
+| G-g | 权限面（config.policy）——**已拍板不做（2026-11-03 用户）**：运行时权限修改面取消，权限维持两层静态现状；理由与 F7 预留见 §5 尾条 | 3 |
 | G-j | standby 的 `event` 等待条件（等任意事件流条件的表达式与匹配） | 3（G-f 本体之后） |
 | G-h | 上下文面（context_strategy/注入区配置化） | 4 |
 | G-i | profile 机制（命名装配模板）+ 执行面（cwd/worktree/remote） | 4/后置 |

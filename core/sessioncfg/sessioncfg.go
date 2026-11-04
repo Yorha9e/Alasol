@@ -62,6 +62,66 @@ type ProviderState struct {
 	APIKeyEnv Field
 }
 
+// StringListField 是一个**字符串列表**字段的折叠态（Field 的列表版；**三态**，
+// 与批次2 的 Field 同口径，只是"清除"的载体从空串换成空数组）：
+//
+//	未写过    Written=false           → 该项未设置（生效值由调用方取默认：不限 / 不排除）；
+//	显式清空  Written=true, Value=[]  → 空数组清除记录（only = 可见集为空；
+//	                                     except = 不排除任何工具）；
+//	显式覆盖  Written=true, Value≠[]  → 生效值 = Value。
+//
+// 关键：**空数组 ≠ 缺失**（这是 tools 的"清空该项"与"该项未设置"必须可区分的原因）。
+type StringListField struct {
+	// Written 报告该列表字段是否出现过显式覆盖记录（含空数组清除）。
+	Written bool
+	// Value 是覆盖值（Written=true 时有效；空数组 = 显式清空该项）。
+	Value []string
+}
+
+// IsSet 报告该项是否**被显式设置过**（含空数组清除记录——"清空"也是一次设置，
+// 与"未设置"必须可区分：only 的空数组 = 一个工具都不暴露）。
+//
+// 刻意**不叫** HasValue：Field.HasValue 的口径是"有非空覆盖"，而列表字段的
+// "空数组 = 清空该项"也是一次有效设置（口径不同，名字也不同，免得读混）。
+func (f StringListField) IsSet() bool { return f.Written }
+
+// List 返回覆盖值的副本（nil = 未设置；非 nil 的空切片 = 显式清空）。
+func (f StringListField) List() []string {
+	if !f.Written {
+		return nil
+	}
+	out := make([]string, len(f.Value))
+	copy(out, f.Value)
+	return out
+}
+
+// copy 返回该字段的副本（切片另拷一份——Current 返回的值类型不该与表内状态共享
+// 底层数组，调用方改了返回值也不会污染 fold 表）。
+func (f StringListField) copy() StringListField {
+	return StringListField{Written: f.Written, Value: f.List()}
+}
+
+// ToolsState 是 session 工具白名单（G-e，设计 15 §3.5）的折叠态。
+//
+// **整组 LWW**：tools 组在 fold 表里是**一个字段**——与 model 等标量字段同口径：
+// 同一次提交的 only/except 一起落，后写**整组**覆盖前一组的 tools 配置，**不拆子字段
+// 跨事件合并**。于是组内子字段的"缺失 = 不变"只在**组内**成立：本次提交里没带的
+// 子项 = 该项**未设置**（不是"沿用上一条事件的旧值"）。
+//
+// 组的三态：
+//
+//	组缺失（payload 里没有 tools）   → 整组不变（Touched 保持原值）；
+//	组出现且两子项都缺（tools: {}）  → 整组被覆盖成"两项都未设置" = 清除回默认
+//	                                  （全部已注册工具可见，仍受类型白名单与策略链管辖）；
+//	组出现且带子项                    → 整组被覆盖成该组的内容（子项三态见 StringListField）。
+type ToolsState struct {
+	// Touched 表示 tools 组曾出现过（含"清除"记录：组出现但两子项都缺）。
+	Touched bool
+	// Only / Except 是组内两个子项的折叠态（三态见 StringListField）。
+	Only   StringListField
+	Except StringListField
+}
+
 // SessionConfig 是一个 session 的配置 fold 结果（**值类型**：Current 返回副本，
 // 调用方读它不持有表锁）。生效值 = 各字段 HasValue() 的 Value，否则由调用方叠
 // hub 默认（生效链第一层在 host/loop 装配里）。
@@ -69,6 +129,8 @@ type SessionConfig struct {
 	Model           Field
 	ReasoningEffort Field
 	Provider        ProviderState
+	// Tools 是 session 工具白名单（G-e）的折叠态（整组 LWW，见 ToolsState）。
+	Tools ToolsState
 }
 
 // fieldState 是表内单字段的折叠态（值 + LWW 戳）。
@@ -124,10 +186,39 @@ type sessionState struct {
 	keyEnv  fieldState
 	// providerSeen 表示 provider 对象出现过（含清除记录；只增不减——"出现过"是事实）。
 	providerSeen bool
+	// tools 是工具白名单组（G-e）的折叠态（**整组 LWW**：组自带戳，整组覆盖）。
+	tools toolsState
 	// seen 是已折叠的 config.changed 事件 id 集合（Generation 的计数源：按事件 id
 	// 去重 → 幂等重放不重数、乱序投递不漏数）。id 为空的事件不计（纵深防御：拿不到
 	// 稳定判别位就不拿它推进"届数"，避免所有无 id 事件挤成一个计数）。
 	seen map[contracts.Ulid]struct{}
+}
+
+// toolsState 是表内 tools 组的折叠态（**整组 LWW**：戳挂在组上，不挂子项）。
+//
+// 为什么戳挂组不挂子项：tools 在 fold 表里是**一个字段**（与 model 等标量字段同口径）——
+// 后写整组覆盖前一组，**不拆子字段跨事件合并**。若戳挂子项，就会退化成"子项各自 LWW +
+// 跨事件合并"（后一条只带 only 时，上一条的 except 会被沿用），那不是 tools 的语义。
+type toolsState struct {
+	// set 表示 tools 组出现过（含"清除"记录：组出现但两子项都缺）。
+	set bool
+	// seq / ts 是组的 LWW 戳（与 fieldState 同款：seq 优先、ts 兜底）。
+	seq int64
+	ts  string
+	// only / except 是组内两个子项的三态（随整组一起被覆盖）。
+	only   StringListField
+	except StringListField
+}
+
+// listFieldOf 把契约里的列表字段折成三态（nil = 缺失 = 该项未设置；非 nil = 覆盖，
+// **空数组 = 清空该项**——空数组 ≠ 缺失，故必须能区分）。
+func listFieldOf(list *contracts.ToolNameList) StringListField {
+	if list == nil {
+		return StringListField{}
+	}
+	out := make([]string, len(*list))
+	copy(out, *list)
+	return StringListField{Written: true, Value: out}
 }
 
 // Table 是 per-prompt 配置 fold 表（G-c）：core 内纯状态组件。并发安全（一把 RWMutex）。
@@ -199,6 +290,20 @@ func (t *Table) Apply(ev *contracts.Event) {
 			st.keyEnv.apply(*p.Provider.APIKeyEnv, seq, ev.TS)
 		}
 	}
+	// tools 组（G-e）：**整组 LWW**——组出现 = 整组被本次提交覆盖（同一次提交的
+	// only/except 一起落，后写覆盖前一组，不拆子字段跨事件合并）；组缺失 = 不变。
+	// 组内的子项三态（出现=覆盖、空数组=清空该项、缺失=该项未设置）由 listFieldOf 折。
+	if p.Tools != nil {
+		if !st.tools.set || newerStamp(seq, ev.TS, st.tools.seq, st.tools.ts) {
+			st.tools = toolsState{
+				set:    true,
+				seq:    seq,
+				ts:     ev.TS,
+				only:   listFieldOf(p.Tools.Only),
+				except: listFieldOf(p.Tools.Except),
+			}
+		}
+	}
 }
 
 // Current 返回某 session 的配置 fold 结果（值类型副本；未知 session → 零值 =
@@ -220,6 +325,11 @@ func (t *Table) Current(sessionID contracts.Ulid) SessionConfig {
 			Touched:   st.providerSeen,
 			BaseURL:   st.baseURL.field(),
 			APIKeyEnv: st.keyEnv.field(),
+		},
+		Tools: ToolsState{
+			Touched: st.tools.set,
+			Only:    st.tools.only.copy(),
+			Except:  st.tools.except.copy(),
 		},
 	}
 }
