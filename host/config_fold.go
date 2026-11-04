@@ -303,27 +303,7 @@ func (h *Hub) validateContextEffective(cp *loop.ContextParams, kind string) erro
 // kind ≠ tiered（追加式）→ 只校百分比，**不**校窗口与布局（追加式不挂策略，窗口与
 // 注入区预算本就不参与装配——不为不参与的东西拒人）。
 func validateContextEffectiveParams(base compaction.Params, cp *loop.ContextParams, kind string) error {
-	p := base
-	if p.Window <= 0 {
-		p.Window = compaction.DefaultWindow // 0 = 缺省（compaction 的归一口径）
-	}
-	if cp != nil {
-		if cp.Window > 0 {
-			p.Window = cp.Window
-		}
-		if cp.L1Pct > 0 {
-			p.L1TargetPct = cp.L1Pct
-		}
-		if cp.L2Pct > 0 {
-			p.L2TargetPct = cp.L2Pct
-		}
-		if cp.RulesBudget > 0 {
-			p.RulesBudget = cp.RulesBudget
-		}
-		if cp.CommonSenseBudget > 0 {
-			p.CommonSenseBudget = cp.CommonSenseBudget
-		}
-	}
+	p := effectiveContextParams(base, cp)
 	l1 := p.L1TargetPct
 	if l1 <= 0 {
 		l1 = compaction.DefaultL1TargetPct
@@ -345,6 +325,39 @@ func validateContextEffectiveParams(base compaction.Params, cp *loop.ContextPara
 		return fmt.Errorf("config.context 生效布局不合法: %w", err)
 	}
 	return nil
+}
+
+// effectiveContextParams 把**宿主默认** base 与**覆盖** cp 合成生效参数（唯一事实源）。
+//
+// 合并口径（三态，与 sessioncfg 的数值三态同款）：**零值 = 不覆盖** → 生效上用默认；
+// 非零 = 覆盖值。窗口 0 = 缺省（compaction 的归一口径，1M）。
+//
+// **唯一一处合并逻辑**：写时校验（validateContextEffectiveParams）与只读面
+// （GET /api/sessions/{id}/config 的生效值回显）共用本函数——两处各算各的，
+// 面板显示的数就会和实际装配的数对不上。
+func effectiveContextParams(base compaction.Params, cp *loop.ContextParams) compaction.Params {
+	p := base
+	if p.Window <= 0 {
+		p.Window = compaction.DefaultWindow // 0 = 缺省（compaction 的归一口径）
+	}
+	if cp != nil {
+		if cp.Window > 0 {
+			p.Window = cp.Window
+		}
+		if cp.L1Pct > 0 {
+			p.L1TargetPct = cp.L1Pct
+		}
+		if cp.L2Pct > 0 {
+			p.L2TargetPct = cp.L2Pct
+		}
+		if cp.RulesBudget > 0 {
+			p.RulesBudget = cp.RulesBudget
+		}
+		if cp.CommonSenseBudget > 0 {
+			p.CommonSenseBudget = cp.CommonSenseBudget
+		}
+	}
+	return p
 }
 
 // validateContextChange 校验上下文装配面变更集（G-h；**写时 fail-close**）。
@@ -777,6 +790,40 @@ func NewProviderOverride(baseURL, key string) core.Provider {
 	return openai.New(openai.Options{BaseURL: strings.TrimSpace(baseURL), APIKey: key, Stream: true})
 }
 
+// ProviderOverride 是 provider 覆盖的**取值态**（G-d）：端点 + 凭据**变量名**。
+//
+// **绝不含凭据值**（H15）：值只在 RunOverridesFromConfig 解析后交给 provider，
+// 不进事件 / 日志 / 视图（本类型就是"可安全回显"的形状）。
+type ProviderOverride struct {
+	// BaseURL provider 端点（非空 = 有端点覆盖）。
+	BaseURL string
+	// APIKeyEnv 凭据的环境变量名（**只存名字**）。
+	APIKeyEnv string
+}
+
+// providerOverrideFromFold 从 fold 态解析 provider 覆盖（**不解析凭据值**）。
+//
+// 口径（与 RunOverridesFromConfig 同源，**唯一一处**）：**生效 base_url 非空才算有覆盖**
+// （只设了 api_key_env 而没端点 = 没有可切换的端点 → 维持基值 provider，不猜）；
+// 空串 / 纯空白 base_url = 无端点覆盖（含"显式清除"记录）。
+//
+// 取值态与凭据解析**分开**的原因：只读面（GET /api/sessions/{id}/config）要回显
+// "当前生效的端点 + 凭据变量名"，但**不该**在读的时候去解析凭据（env 无值就报错，
+// 那是运行期 fail-close 的事，不该让一个只读端点 500）。
+func providerOverrideFromFold(sc sessioncfg.SessionConfig) (ProviderOverride, bool) {
+	if !sc.Provider.BaseURL.HasValue() {
+		return ProviderOverride{}, false
+	}
+	baseURL := strings.TrimSpace(sc.Provider.BaseURL.Value)
+	if baseURL == "" {
+		return ProviderOverride{}, false // 空/纯空白 base_url = 无端点覆盖（含"显式清除"记录）
+	}
+	return ProviderOverride{
+		BaseURL:   baseURL,
+		APIKeyEnv: strings.TrimSpace(sc.Provider.APIKeyEnv.Value),
+	}, true
+}
+
 // RunOverridesFromConfig 把 fold 出的 sessioncfg.SessionConfig 叠成 loop.RunOverrides
 // （G-c/G-d/G-e/G-h 生效链第二层 → 第三层的**唯一取值口**）：
 //
@@ -816,23 +863,21 @@ func RunOverridesFromConfig(sc sessioncfg.SessionConfig, newProvider func(baseUR
 	// 是 host/resume 共用的取值口——CLI 那条链没有宿主默认（挂不起上下文策略），
 	// kind 由宿主钩子解析（Hub.resolveContextKind）。CLI 侧 kind 恒为 ""（追加式）。
 	out.Context = contextParamsFromFold(sc.Context)
-	if !sc.Provider.BaseURL.HasValue() {
+	// provider（G-d）：取值态与凭据解析**分开**（providerOverrideFromFold）——只读面
+	// 用取值态回显"生效的端点 + 凭据变量名"，运行期在这里才解析凭据（fail-close）。
+	ov, ok := providerOverrideFromFold(sc)
+	if !ok {
 		return out, nil
 	}
-	baseURL := strings.TrimSpace(sc.Provider.BaseURL.Value)
-	if baseURL == "" {
-		return out, nil // 空/纯空白 base_url = 无端点覆盖（含"显式清除"记录）
-	}
 	// 成对纪律 + 凭据解析（空 keyEnv → 成对错误；env 无值 → fail-close）。
-	key, err := ResolveProviderCredential(strings.TrimSpace(sc.Provider.APIKeyEnv.Value))
+	key, err := ResolveProviderCredential(ov.APIKeyEnv)
 	if err != nil {
 		return loop.RunOverrides{}, err
 	}
-	keyEnv := strings.TrimSpace(sc.Provider.APIKeyEnv.Value)
 	if newProvider != nil {
-		out.Provider = newProvider(baseURL, keyEnv, key)
+		out.Provider = newProvider(ov.BaseURL, ov.APIKeyEnv, key)
 	} else {
-		out.Provider = NewProviderOverride(baseURL, key)
+		out.Provider = NewProviderOverride(ov.BaseURL, key)
 	}
 	return out, nil
 }

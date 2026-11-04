@@ -25,6 +25,7 @@ package host
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -67,6 +68,10 @@ type ProfileContextConfig struct {
 type ProfileConfig struct {
 	// Name profile 名（唯一；重名 → 装载期 fail-close）。
 	Name string
+	// Description 是**可选的人读描述**（GUI 的下拉里显示；空 = 不显示）。
+	//
+	// 纯注释性字段：不参与任何判定（展开/叠放/校验都不看它）——它只是给人看的。
+	Description string
 	// Model 模型名覆盖（空 = 这张 profile 不覆盖模型）。
 	Model string
 	// ReasoningEffort 思维链档位覆盖（空 = 不覆盖）。
@@ -280,4 +285,174 @@ func sortedProfileNames(profiles map[string]ProfileConfig) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// 只读面：GET /api/profiles（GUI 的 profile 选择器）
+// ---------------------------------------------------------------------------
+
+// 本节是 profile 表的**只读回显面**（GUI 联调缺口：选择器此前只能手输 profile 名）。
+//
+// # 形状（嵌套分组 + omitempty 全开）
+//
+//	{"profiles":[{"name":"deep-work",
+//	              "config":{"model":"…","reasoning_effort":"…",
+//	                        "provider":{"base_url":"…","api_key_env":"…"},
+//	                        "tools":{"only":[…],"except":[…]},
+//	                        "context":{"kind":"tiered","window":1000000,"l1_pct":10,
+//	                                  "l2_pct":1,"rules_budget":20000,
+//	                                  "common_sense_budget":30000}},
+//	              "exec":{"cwd":"…","worktree":"…","run_id":"…","remote_host":"…"}}]}
+//
+// **空表 → {"profiles":[]}**（不是 null——前端 forEach 不必判空；与 /api/sessions 同口径）。
+// **按 name 升序**（确定性：map 遍历顺序随机，不能直接吐给前端）。
+//
+// # 凭据纪律（H15）
+//
+// provider 面只出 api_key_env **变量名**，**绝不含 key 值**——profile 表里本来就不存值
+// （ProfileProviderConfig.APIKeyEnv 是名字；值只在解析后交给 provider）。
+//
+// # 空 = 不覆盖（profile 是模板，不是"清除"指令）
+//
+// 空串 / 0 / 空列表的项**不出现**在视图里（出现 = 覆盖；缺失 = 不覆盖）——与展开成
+// config.changed 变更集时的口径一致（见 profileConfigPayload）。
+
+// ProfilesView 是 GET /api/profiles 的响应形状（顶层只有一个分组键）。
+type ProfilesView struct {
+	// Profiles 是命名 profile 表（按 name 升序；空表 = [] 不是 null）。
+	Profiles []ProfileView `json:"profiles"`
+}
+
+// ProfileView 是一张命名 profile 的只读视图（G-i）。
+type ProfileView struct {
+	// Name profile 名（**表键** = 按名引用的那个；同名两张表在装载期就被拒了）。
+	Name string `json:"name"`
+	// Description 可选的人读描述（没写 = 省略；不参与任何判定）。
+	Description string `json:"description,omitempty"`
+	// Config 是**配置面**（模型/档位/端点/工具/上下文）——展开成 config.changed 的那半。
+	Config ProfileConfigView `json:"config"`
+	// Exec 是**执行面**（会话创建参数：cwd / worktree / run_id / remote_host 声明）。
+	Exec ProfileExecView `json:"exec"`
+}
+
+// ProfileConfigView 是 profile 的**配置面**视图（G-d/G-e/G-h 同款）。
+type ProfileConfigView struct {
+	// Model 模型名覆盖（空 = 这张 profile 不覆盖模型）。
+	Model string `json:"model,omitempty"`
+	// ReasoningEffort 思维链档位覆盖（空 = 不覆盖）。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// Provider 端点覆盖（两项都空 = 整组不覆盖 → 省略）。
+	Provider *ProfileProviderView `json:"provider,omitempty"`
+	// Tools 工具白名单覆盖（两项都空 = 整组不覆盖 → 省略）。
+	Tools *ProfileToolsView `json:"tools,omitempty"`
+	// Context 上下文装配面覆盖（六项都零值 = 整组不覆盖 → 省略）。
+	Context *ProfileContextView `json:"context,omitempty"`
+}
+
+// ProfileProviderView 是 profile 的 provider 面视图（端点 + 凭据**变量名**）。
+//
+// **绝不含 key 值**（H15）：这里只有 api_key_env 这个**名字**。
+type ProfileProviderView struct {
+	// BaseURL provider 端点（空 = 不覆盖）。
+	BaseURL string `json:"base_url,omitempty"`
+	// APIKeyEnv 凭据的环境变量名（空 = 不覆盖；**只名字**）。
+	APIKeyEnv string `json:"api_key_env,omitempty"`
+}
+
+// ProfileToolsView 是 profile 的工具白名单面视图（G-e 同款）。
+type ProfileToolsView struct {
+	// Only 可见集（空 = 不限）。
+	Only []string `json:"only,omitempty"`
+	// Except 排除集（空 = 不排除）。
+	Except []string `json:"except,omitempty"`
+}
+
+// ProfileContextView 是 profile 的上下文装配面视图（G-h 同款：六项旋钮）。
+type ProfileContextView struct {
+	// Kind 上下文策略 kind（"" = 不覆盖；"append" / "tiered" 显式值）。
+	Kind string `json:"kind,omitempty"`
+	// Window 上下文窗口预算 W（token；0 = 不覆盖）。
+	Window int64 `json:"window,omitempty"`
+	// L1Pct / L2Pct L1/L2 目标残留百分比（0 = 不覆盖）。
+	L1Pct float64 `json:"l1_pct,omitempty"`
+	L2Pct float64 `json:"l2_pct,omitempty"`
+	// RulesBudget / CommonSenseBudget 注入区 token 上限（0 = 不覆盖）。
+	RulesBudget       int64 `json:"rules_budget,omitempty"`
+	CommonSenseBudget int64 `json:"common_sense_budget,omitempty"`
+}
+
+// ProfileExecView 是 profile 的**执行面**视图（会话创建参数）。
+type ProfileExecView struct {
+	// CWD 工作目录（空 = 用 hub 级默认）。
+	CWD string `json:"cwd,omitempty"`
+	// Worktree 绑定的 worktree 名（空 = 不绑）。
+	Worktree string `json:"worktree,omitempty"`
+	// RunID 工作流运行 id（空 = 不加 workflow gate）。
+	RunID string `json:"run_id,omitempty"`
+	// RemoteHost 远程执行主机的**声明**（v1：只留痕、不校验）。
+	RemoteHost string `json:"remote_host,omitempty"`
+}
+
+// serveProfiles 服务 GET /api/profiles（GUI profile 选择器的数据源；**只读**）。
+//
+//	200 → ProfilesView：{"profiles":[…]}（按 name 升序；空表 → {"profiles":[]} 不是 null）
+//
+// **凭据纪律（H15）**：provider 面只回显 api_key_env **变量名**，**绝不含 key 值**
+// （profile 表里本来就不存值——见 ProfileProviderConfig.APIKeyEnv）。
+//
+// 路由恒注册（不像 vectors/docs 那样"未启用就不注册"）：profile 表是**宿主配置**，
+// 没有"启用/禁用"开关——没有 profile 就是一个空表（前端下拉空着，不是 404）。
+func (h *Hub) serveProfiles(w http.ResponseWriter, r *http.Request) {
+	view := ProfilesView{Profiles: []ProfileView{}}
+	if h != nil {
+		for _, name := range sortedProfileNames(h.cfg.Profiles) {
+			view.Profiles = append(view.Profiles, profileViewOf(name, h.cfg.Profiles[name]))
+		}
+	}
+	writeJSONBody(w, http.StatusOK, view)
+}
+
+// profileViewOf 把一张 profile 折成只读视图（name 取**表键**——按名引用用的是表键）。
+//
+// 空字段 = 不覆盖 → 视图里**不出现**（与 profileConfigPayload 展开变更集时同口径）：
+// provider / tools / context 三组只要整组为空就整组省略。
+func profileViewOf(name string, p ProfileConfig) ProfileView {
+	v := ProfileView{
+		Name:        name,
+		Description: p.Description,
+		Config: ProfileConfigView{
+			Model:           p.Model,
+			ReasoningEffort: p.ReasoningEffort,
+		},
+		Exec: ProfileExecView{
+			CWD:        p.CWD,
+			Worktree:   p.Worktree,
+			RunID:      p.RunID,
+			RemoteHost: p.RemoteHost,
+		},
+	}
+	if p.Provider.BaseURL != "" || p.Provider.APIKeyEnv != "" {
+		v.Config.Provider = &ProfileProviderView{
+			BaseURL:   p.Provider.BaseURL,
+			APIKeyEnv: p.Provider.APIKeyEnv,
+		}
+	}
+	if len(p.Tools.Only) > 0 || len(p.Tools.Except) > 0 {
+		v.Config.Tools = &ProfileToolsView{
+			Only:   append([]string(nil), p.Tools.Only...),
+			Except: append([]string(nil), p.Tools.Except...),
+		}
+	}
+	if p.Context.Kind != "" || p.Context.Window != 0 || p.Context.L1Pct != 0 ||
+		p.Context.L2Pct != 0 || p.Context.RulesBudget != 0 || p.Context.CommonSenseBudget != 0 {
+		v.Config.Context = &ProfileContextView{
+			Kind:              p.Context.Kind,
+			Window:            p.Context.Window,
+			L1Pct:             p.Context.L1Pct,
+			L2Pct:             p.Context.L2Pct,
+			RulesBudget:       p.Context.RulesBudget,
+			CommonSenseBudget: p.Context.CommonSenseBudget,
+		}
+	}
+	return v
 }

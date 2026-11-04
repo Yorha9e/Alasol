@@ -172,6 +172,15 @@ func (p Params) normalized() Params {
 	return p
 }
 
+// Normalized 返回把 0/非法值解析成缺省后的参数副本（**导出给只读面**）。
+//
+// 用途：回显"当前**生效**的上下文装配数值"时用同一份归一口径——窗口 0 → 1M、
+// 百分比 ≤0 → 缺省、注入区预算 ≤0 → 布局默认（前缀 15k / 常识区 30k）。
+//
+// **与内部 normalized() 同一实现**（唯一事实源，D21）：只读面不许另抄一份缺省值
+// （抄一份 = 布局常量漂移，面板显示的数与实际装配的数对不上）。
+func (p Params) Normalized() Params { return p.normalized() }
+
 // L1TargetTokens 返回 L1 摘要的目标 token 数 = Window × L1TargetPct%（J9）。
 func (p Params) L1TargetTokens() int64 {
 	p = p.normalized()

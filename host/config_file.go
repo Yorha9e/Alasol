@@ -610,6 +610,7 @@ func (c FileConfig) AgentTypeConfigs() []contracts.AgentType {
 //
 //	[[profiles]]
 //	name = "review-fast"              # profile 名（唯一；重名 → 装载期拒）
+//	description = "快审模板"           # 可选的人读描述（纯注释性字段；不参与判定）
 //	model = "gpt-4o-mini"             # 配置面：模型（空 = 不覆盖）
 //	reasoning_effort = "low"          # 配置面：思维链档位（空 = 不覆盖）
 //	cwd = "D:\work\review"            # 执行面：工作目录（会话创建时进 SessionSpec）
@@ -638,6 +639,8 @@ func (c FileConfig) AgentTypeConfigs() []contracts.AgentType {
 type ProfileFileConfig struct {
 	// Name profile 名（唯一；空名 / 重名 → 装载期 fail-close）。
 	Name string `toml:"name"`
+	// Description 可选的人读描述（空 = 不显示；纯注释性字段，不参与任何判定）。
+	Description string `toml:"description"`
 	// Model 模型名（空 = 不覆盖）。
 	Model string `toml:"model"`
 	// ReasoningEffort 思维链档位（空 = 不覆盖）。
@@ -711,6 +714,7 @@ func (c FileConfig) ProfileConfigs() (map[string]ProfileConfig, error) {
 		}
 		out[name] = ProfileConfig{
 			Name:            name,
+			Description:     strings.TrimSpace(pf.Description),
 			Model:           strings.TrimSpace(pf.Model),
 			ReasoningEffort: strings.TrimSpace(pf.ReasoningEffort),
 			Provider: ProfileProviderConfig{

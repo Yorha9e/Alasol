@@ -139,6 +139,15 @@ var httpLog = slog.Default()
 //	  判据 = **树存在即 200**（树是 session 活状态，loop 失效不影响它）：没开 multi_agent 或
 //	  还没建树 → 空列表 []；既没树也不由本进程托管 → 404 unknown_session）
 //
+// GUI 只读面（GUI 联调缺口：选择器手输 → 列表端点）：
+//
+//	GET /api/profiles                       → {"profiles":[…]}（命名 profile 表，按 name 升序；
+//	  空表 → {"profiles":[]} 不是 null；provider 只出 api_key_env **变量名**，绝不含 key 值）
+//	GET /api/sessions/{session_id}/config   → SessionConfigView（该 session 当前**生效**配置
+//	  = hub 默认叠加 session fold，外加 overridden_fields：哪些字段是 session 级覆盖。
+//	  404 unknown_session = 事件流里没见过这个 session；**不校验托管**——别的进程建的
+//	  历史 session 一样读得到）
+//
 // 其它方法/路径 → **405 / 404，一律 JSON 错误体**（前端统一按 JSON 解）：
 // /api/* 未命中具体路由时，路径认得但方法不符 → 405（带 Allow），路径不认得 → 404
 // ——不再掉进静态通配报"没有这个静态资源"（G7）。
@@ -264,6 +273,12 @@ func (h *Hub) Handler() http.Handler {
 	// （GUI 派活面；判据 = 树存在即 200 —— 树是 session 活状态，loop 失效不影响它；
 	//  无 MultiAgent/还没建树 → 空列表；既没树也不由本进程托管 → 404）。
 	reg("GET", "/api/sessions/{session_id}/agents", h.serveSessionAgents)
+
+	// GUI 只读面：命名 profile 表（选择器改成下拉）+ session 当前生效配置（配置面板种子）。
+	// 两个端点都是**只读**的（不写事件、不改任何状态）——写面仍是 POST /prompt 的
+	// config 槽位与 POST /api/sessions 的 profile 槽位。
+	reg("GET", "/api/profiles", h.serveProfiles)
+	reg("GET", "/api/sessions/{session_id}/config", h.serveSessionConfig)
 
 	// /api/* 回退面（G7）：未命中具体路由时，按 probe+tbl 判 405 / 404，一律 JSON 错误体。
 	mux.HandleFunc("/api/", h.serveAPIFallback(tbl, probe))

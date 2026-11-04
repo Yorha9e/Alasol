@@ -235,6 +235,23 @@ func (p *projection) snapshot(sid contracts.Ulid) (json.RawMessage, bool) {
 	return raw, true
 }
 
+// hasSession 报告该 session 是否**在事件流里见过**（投影口径）。
+//
+// 判据 = 事实流：任何带该 session_id 的事件都算（不限 kind）——"这个 session 存在过"
+// 是事件流的事实，**不是**本进程是否托管它（托管是进程内活状态，见 hostsSession）。
+//
+// 用途：只读面的存在性判据（GET /api/sessions/{id}/config：没见过它 → 404
+// unknown_session）。**不**用它判在线表行（那里有伪 session / fork 的过滤口径）。
+func (p *projection) hasSession(sessionID contracts.Ulid) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.sessions[sessionID]
+	return ok
+}
+
 // scanWatermark 返回投影已扫到的全局 seq（诊断用）。
 func (p *projection) scanWatermark() int64 {
 	p.mu.Lock()
