@@ -218,12 +218,16 @@ func (l *Loop) publishUserPrompt(ctx context.Context, prompt string) {
 //
 // G14：reasoning（思维链整段）**provider 上报才带**——解析不到就是空串，空串不留字段
 // （不拿空串占位，"缺省"才是"没有"的诚实表示）。
-func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResult) {
+//
+// G-c/G-d：model 字段取**本轮快照生效的模型名**（st.overrides.Model 覆盖优先，空 =
+// loop 基值）——per-prompt 换模型后 model.turn 的 model 随之是新模型（契约零改动，
+// 该字段本就带 model；成本统计按模型分组因此也分对组）。
+func (l *Loop) publishModelTurn(ctx context.Context, turn int, mr core.ModelResult, st *runState) {
 	payload := contracts.ModelTurnPayload{
 		Text: mr.Text,
 		// model 名随事件落库（成本统计按模型分组用，J21）：它**不是凭据**（模型名可安全
 		// 进事件/日志），仅用于聚合口径。
-		Model: strPtr(l.model),
+		Model: strPtr(l.modelFor(st)),
 		Usage: &contracts.ModelTurnUsage{
 			InputTokens:  mr.Usage.InputTokens,
 			OutputTokens: mr.Usage.OutputTokens,

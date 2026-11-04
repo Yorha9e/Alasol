@@ -38,6 +38,8 @@ const scanBatch = 500
 //     事件 ts 的 RFC3339 串，**与 updated_at 同源同值**（updated_at 是索引/排序口径的
 //     命名，last_activity 是在线语义的命名，值都是同一条最后事件的 ts；无事件 = ""）。
 //     HTTP 面只增不改义。
+//   - waiting：**G-f standby 挂起态**（算活跃、豁免活跃窗口、不刷最后事件 ts）。同在
+//     Hub.Sessions 出口处补（发现表进程本地计数，投影只留零值 = 未挂起）。HTTP 面只增。
 type SessionRow struct {
 	SessionID  string `json:"session_id"`
 	FirstSeq   int64  `json:"first_seq"`
@@ -52,6 +54,10 @@ type SessionRow struct {
 	Online       bool   `json:"online"`
 	Running      bool   `json:"running"`
 	LastActivity string `json:"last_activity"`
+	// Waiting 是 G-f standby 挂起期的 waiting 态（算活跃、豁免活跃窗口、不刷最后事件
+	// ts；HTTP 面只增）。与 Online/Running 同款**出口处补**（投影不认识发现表），零值 =
+	// 未挂起。
+	Waiting bool `json:"waiting"`
 }
 
 // sessionState 是投影里单个 session 的累积状态。

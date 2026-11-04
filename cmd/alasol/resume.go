@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
@@ -15,6 +16,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/sessioncfg"
 	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/host"
 	"github.com/Yorha9e/alasol/runtime"
@@ -24,6 +26,28 @@ import (
 	"github.com/Yorha9e/alasol/runtime/store/walfile"
 	"github.com/Yorha9e/alasol/runtime/verify"
 )
+
+// resumeCapText 把恢复上界说成人话（分钟 / 秒 / 毫秒；测试调小后不至于说"0 分钟"）。
+func resumeCapText(d time.Duration) string {
+	switch {
+	case d >= time.Minute:
+		return fmt.Sprintf("%d 分钟", int(d/time.Minute))
+	case d >= time.Second:
+		return fmt.Sprintf("%d 秒", int(d/time.Second))
+	default:
+		return fmt.Sprintf("%d 毫秒", int(d/time.Millisecond))
+	}
+}
+
+// resumeReplayCap 是**恢复路径重放**的上界（critic F4）。
+//
+// 为什么要有：standby 的重放 = 重新挂起，最长挂到硬上限（30 分钟）。恢复 ctx 原本
+// 是 context.Background()（**无上界**）→ 一条永远等不到消息的 standby 会让
+// `alasol resume` **静默挂 30 分钟**（看着像卡死，人不知道它在等什么）。
+//
+// 上界 = standby 硬上限（30 分钟）+ 余量（5 分钟）= 35 分钟：够一次正常重挂
+// （含收尾），又不至于无界。**测试可调小**（见 resume_standby_test.go）。
+var resumeReplayCap = 35 * time.Minute
 
 // resumeMain 是 `alasol resume -session <id> [-db ...]`：跑 X4 的恢复流程并打印报告（处置明细）。
 //
@@ -147,6 +171,42 @@ func resumeMain(args []string) int {
 		defer func() { _ = sbEnv.Close() }()
 	}
 
+	// 大 payload 外置 blob（v4-3-A，G2e/D4）：只走文件配置面（TOML `[blob]`，与 run 同口径）。
+	// dir 空 = 关 = 零行为变化；非空则建 blobfs——**重放路径落下的 completed 同样外置**
+	// （loop 侧口径，见 core/loop/replay.go）。
+	//
+	// **位置**：必须在 standby 装配**之前**建好——standby 的交付标记被外置时要经它
+	// 读回（host/standby.go 的 deliverySeqOf；critic P2：外置丢标记 → 集合退化）。
+	var blobStore storage.Blob
+	if dir := strings.TrimSpace(fc.Blob.Dir); dir != "" {
+		bs, berr := blobfs.New(dir)
+		if berr != nil {
+			fmt.Fprintln(os.Stderr, "建 blob 外置存储:", berr)
+			return 1
+		}
+		blobStore = bs
+	}
+
+	// standby 待机工具（G-f）：恢复路径也要能**重放**它。
+	//
+	// 崩溃时 standby 的 tool.call.intent 已落、completed 还没落 → 恢复流程把它当
+	// in-flight op（Replay=safe = 重放 = 重新执行 = 重新挂起）。重放走的是
+	// *core/loop.Loop：它按 op.Intent.ToolName 去**注册表**取执行器——standby 此前
+	// 只在 hub 里注册（hub 没有恢复入口），这里的注册表只有内置工具 → 查不到执行器
+	// → 重放 fail-close（落 failed、处置结论 "replayed_failed = 需人工重做"）。
+	//
+	// 这里补上：把**同一个执行器**注册进恢复路径的注册表（host/standby_resume.go）→
+	// 重放带**原 tool_call_id** 执行 → 执行器回查事件流里那条原 intent → 重放游标
+	// = 原 intent 的 seq → **中断期间到达的消息能被看见**：已到 → 立即 completed
+	// （如实收口）；未到 → 重新挂起（有界，到点如实收口"未等到"）。
+	//
+	// 对**续跑**（-continue）零影响：模型可见集由策略闸门定（resume 的策略引擎
+	// 默认空 = fail-close deny → 工具不进可见集），standby 与内置工具同口径。
+	if err := host.RegisterStandbyForResume(reg, st, sid, blobStore); err != nil {
+		fmt.Fprintln(os.Stderr, "装配待机工具（恢复路径）:", err)
+		return 1
+	}
+
 	// MCP client（v3-S1，N1）：resume 的**重放路径真的执行**工具调用，所以被重放的
 	// op 若引用 `mcp__<server>__<tool>`，那个 server 必须在这儿连上——否则重放会
 	// 撞上"工具未注册"而失败（fail-close 但不可用）。
@@ -197,19 +257,6 @@ func resumeMain(args []string) int {
 		return 1
 	}
 	agentID := durable.PrimaryAgentID(events)
-
-	// 大 payload 外置 blob（v4-3-A，G2e/D4）：只走文件配置面（TOML `[blob]`，与 run 同口径）。
-	// dir 空 = 关 = 零行为变化；非空则建 blobfs——**重放路径落下的 completed 同样外置**
-	// （loop 侧口径，见 core/loop/replay.go）。
-	var blobStore storage.Blob
-	if dir := strings.TrimSpace(fc.Blob.Dir); dir != "" {
-		bs, berr := blobfs.New(dir)
-		if berr != nil {
-			fmt.Fprintln(os.Stderr, "建 blob 外置存储:", berr)
-			return 1
-		}
-		blobStore = bs
-	}
 
 	// WAL 预写日志（v4-4-B）：只走文件配置面（TOML `[wal]`）。dir 空 = 关 = 零行为变化。
 	//
@@ -265,6 +312,28 @@ func resumeMain(args []string) int {
 	// allow，否则 spawn 被 fail-close deny 挡掉、续跑路径派不出子 agent（接线即死）。
 	policyRules := runnerMultiAgentPolicyRules(fc.MultiAgent)
 
+	// G-c（F7）：折叠该 session 的 config.changed——设计 §3.1"持久化影响**后续所有轮**"，
+	// CLI 续跑（-continue）也是轮：不接生效链的话，被改过配置的 session 续跑会悄悄用回
+	// -model/环境变量那层的默认值。core/sessioncfg 是纯状态机：把该 session 的事件喂
+	// 进去即得当前配置（事件流是唯一事实源，F5；上面 ReplaySession 已读整场事件）。
+	// CLI 单进程、无并发写者、续跑只有一轮 → **折一次即可**（host 面才需要每次 Run
+	// 重取 fold）。纯恢复（不带 -continue）不调 Run → 钩子不触发，折了也无害。
+	cfgTable := sessioncfg.New()
+	for i := range events {
+		cfgTable.Apply(&events[i])
+	}
+	// 取值口径与 serve 面**同源**（host.RunOverridesFromConfig = 唯一取值口：model/
+	// effort 取生效覆盖，provider 覆盖凭据只从 env 取、缺失 fail-close 绝不回退——
+	// gap2/G-d）。覆盖优先于 -model flag：flag 属"hub 默认"层，session fold 在其上
+	// （与 serve 同一条生效链）。nil newProvider = 直造覆盖 provider（CLI 无 hub 缓存）。
+	runOverrides := func(context.Context) (loop.RunOverrides, error) {
+		ov, oerr := host.RunOverridesFromConfig(cfgTable.Current(sid), nil)
+		if oerr != nil {
+			return loop.RunOverrides{}, fmt.Errorf("session %s 的配置覆盖（G-c 生效链）: %w", sid, oerr)
+		}
+		return ov, nil
+	}
+
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	//
 	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
@@ -277,7 +346,9 @@ func resumeMain(args []string) int {
 		AgentID:         agentID, // 真实主 agent（续跑事件的归属）
 		Model:           modelName,
 		ReasoningEffort: reasoningEffortVal,
-		Store:           st,
+		RunOverrides:    runOverrides,
+		// G-c（F7）：续跑也走生效链——Run 开头冻结 fold 的覆盖（优先于上面的基值）。
+		Store: st,
 		// D4：大 payload 外置（v4-3-A，G2e）——重放落下的 completed 与续跑那一轮的
 		// completed 同口径外置（否则"大 payload 不进事件流"在 resume 路径上失效）。
 		BlobSink:      blobStore,
@@ -306,7 +377,20 @@ func resumeMain(args []string) int {
 		return 2
 	}
 
-	rep, err := durable.Resume(ctx, st, sid, opts)
+	// standby 重挂要**先报一行**（critic F4）：恢复路径会重新挂起（最长 30 分钟的
+	// 硬上限），不报的话人只看到"命令卡住了"——不知道它在等消息、还能等多久。
+	//
+	// 判据 = **事实面**：事件流里"有 intent、没结果"的 standby 调用（host 的
+	// 折叠口径，与 WAL 报告用的是同一份事实）。
+	if pending := host.StandbyPendingToolCalls(events); len(pending) > 0 {
+		fmt.Fprintf(os.Stderr, "[resume] standby 重挂中（最多 %s）\n", resumeCapText(resumeReplayCap))
+	}
+
+	// 恢复 ctx **有上界**（critic F4）：重放（含 standby 重新挂起）不能无界——
+	// 上界到了就如实收场（重放失败 → 需人工重做），不许静默挂半小时。
+	replayCtx, cancelReplay := context.WithTimeout(ctx, resumeReplayCap)
+	defer cancelReplay()
+	rep, err := durable.Resume(replayCtx, st, sid, opts)
 	if err != nil {
 		// 重放/落盘断裂：报告已处理的部分仍打印到 stderr 供诊断，退出码 1。
 		dumpReport(os.Stderr, rep)

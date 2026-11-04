@@ -87,7 +87,7 @@
 | F4 | loop 形态 | v0 控制流 + 完整事件记录：`core/loop` 是同步控制流状态机，但每轮落 `context.assembled`、每次工具调用落 intent/completed/failed 三段，事件流完整可回放；v1 再事件化（契约不变，纯增量）。先控制流是因为写路径形状（三段事件、X1 的"intent 先落盘"）比驱动模型更关键，控制流更易保证该不变式（实现：core/loop） | 直接事件驱动 | ✅ |
 | F5 | 状态来源 | ✅ **唯一事实源**：一切状态由事件流 fold 得出，**不另设可变状态源**（含 ledger 与黑板，见 G23） | ✅ |
 | F6 | 历史不可重写 | 压缩/修复只追加事件。**验证（2026-10-29 v2-S1）**：深度压缩只影响装配视图 + 追加 context.compacted 事件，历史事件不可变、refs 永不指摘要（实现：core/compaction） | — | ✅ |
-| F7 | **契约演进铁律** | ✅ **只增不删、不改义**；弃用字段标 `x-deprecated`；事件 envelope 加版本字段 `v`。外部消费者据此判断兼容 | ✅ |
+| F7 | **契约演进铁律** | ✅ **只增不删、不改义**；弃用字段标 `x-deprecated`；事件 envelope 加版本字段 `v`。外部消费者据此判断兼容 **落地注记（2026-11-03 批次2）**：`config.changed` 按全链走通（schema/event.json → codegen → INVENTORY §2 → 样本 → TS 三件套，durable=true；transport.json 的 CommandSubmit 只增 config 槽位跨文件 $ref 同一 ConfigChangedPayload）——七点链路 + 双向 kind 集钉 + durable 列钉全绿 | ✅ |
 | F8 | **非 durable 流事件语义** | ✅ `durable=false` 的流事件（`model.delta` 等）**不入库、不占 seq**（总线直发订阅者）；**回放对象只有事实事件** **落地（2026-10-30 v3-S4）**：/api/events 回放只含 durable 事实事件（流事件丢了就是丢了），不做 K11 过滤（可见性读走 /api/inquiry） | ✅ |
 
 ## G. 存储
@@ -430,6 +430,8 @@
 ---
 
 > **2026-11-03 批次1 落地回填（G-a 在线表三态 + G-b 默认接管）**：**无新增/删除决策条目，合计不动**（206/74/280）；K11/K14/K15/F1/G25 行内补落地注记。落地面：core/discovery 活跃判定一处（activeLocked：running ∨ 最后事件 ts ≤ 窗口；窗口挂 onlineTableConfig.activity_window 单源下发）+ 四消费方同刀（注入行集 / peers ∩ 活跃 / presence / GET /api/sessions 三列 + ?online= 先过滤后截断）；G-b 协议面懒接管（Claim 冲突唯一拒绝线 409 host_conflict；hub.alert 留痕 metric session.takeover，判据 = HostOf 易主 && created；Claim 先拿权后发布 + 双检锁修并发绕过）；RunPrompt 每轮折叠历史（主 agent 视角，多轮同源）。**评审**：critic 三轮（一轮 P0 并发绕过 + P1 截断次序/历史缺失/跨进程口径；二轮 F1 多 agent 污染 + F2 gate 自愈 + F3 留痕假阳性 + F4 无上限口径；三轮放行）；变异自证五处（P0/P1-2/P1-3/F1/F2 破坏→红→恢复）。**挂账**：跨进程 Claim 检测不到（durable claim 记 F7）；FoldConversation 孤儿 tool_call（resume/fork 多 agent 必踩，另刀）；主轮次历史无上限（append 基线，封顶走 tiered/G-h）。
+
+> **2026-11-03 批次2 落地回填（G-c per-prompt 配置 + G-d 模型面 + G-f standby）**：**无新增/删除决策条目，合计不动**（206/74/280）；F7 行补 config.changed 全链落地注记。落地面：①G-c——`core/sessioncfg` 逐字段 LWW fold（三态：未写/清除/覆盖）+ 生效链（hub 默认 → session fold → 本轮快照 Run 开始冻结）+ `config.changed` 事件（bus.Publish、确定性 id 含届数）+ PromptSpec（HTTP/WS 同源，CommandSubmit.config 跨文件引用）+ 空变更集不落事件 + CLI resume 同链（RunOverridesFromConfig 共用）；②G-d——model/reasoning_effort（G14 白名单）/provider{base_url,api_key_env}（gap2 成对纪律、值只从 env 取绝不回退 hub key）经 per-Run 钩子冻结进 runState（Loop 无可变状态不变式不动）；③G-f——standby 工具（waiting 态豁免窗口、在线表 [waiting] 标注、轮询事件流唤醒（跨进程）、return/sleep 两态、30min 硬上限、X1 三段路径零改动、交付集合去重（CausationID 认领 + blob 读回 + 分块扫）、runClock 预借+实占结算（预算暂停语义）、resume 重放带原 id（消息已到如实收口/未到重挂）、WAL facts 侧排除不误报）。**评审**：critic 轮次——G-c/G-d 一轮（F1 子 agent 模型兜底等 8 条全修）；G-f 四轮（P1 假阴性/猜 session/sleep 空转/预算语义/早到下界/跨 kind 水位/整场读 → 机制两度重构：水位→交付集合，终验"机制成立"）；变异自证 20+ 处。**挂账**：跨容器 waiting 不成立（进程本地，一库一 hub 内有效）；交付集合只增不减/并发复查窄窗；503 半成功窗口（文案已明）；客户端重试落第二条等价事件（需契约幂等键）；telemetry model 未随覆盖；blob 外置时计划噪音；`wait="event"` 留 G-j。
 
 ## 相关文档
 

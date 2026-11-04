@@ -448,6 +448,24 @@ type BtwForkedPayload struct {
 	Question string `json:"question"`
 }
 
+// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}（后续批次只增 tools/context/policy 字段，不预留占位——F7 只增，届时再加）。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
+type ConfigChangedPayload struct {
+	// 目标模型名覆盖：出现 = 覆盖为该值；空串 = 清除回 hub 默认；缺失 = 不变。
+	Model *string `json:"model,omitempty"`
+	// 思维链档位覆盖（G14）：出现 = 覆盖；空串 = 清除回默认；缺失 = 不变。非空取值白名单 low/medium/high/xhigh 由 host 层 ValidateReasoningEffort 校验——契约层只定形状，不校验取值。
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	// provider 覆盖项变更集：缺失 = 不变；出现 = 按 ProviderConfigChange 的字段语义覆盖或清除。
+	Provider *ProviderConfigChange `json:"provider,omitempty"`
+}
+
+// provider 覆盖项的变更集（config.changed 的 payload.provider 与 WS command.submit 的 config.provider 同型——一个类型两处 $ref、不复制两份定义）：对象**出现且至少一字段有值** = 覆盖该 session 的 provider 覆盖项；**出现且两字段都空串** = 清除 provider 覆盖；**缺失** = 不变。字段级语义同 ConfigChangedPayload（出现 = 覆盖、缺失 = 不变、空串 = 清除）。凭据纪律（host 层校验）：改 base_url 必须**同时显式**给 api_key_env——不静默把 hub 凭据发给第三方端点；契约层只保证两个字段都在形状里（schema 都定义、都可选），不校验成对出现。api_key_env 只存环境变量名（H15），凭据值不进请求体、不进事件。
+type ProviderConfigChange struct {
+	// provider 端点覆盖：出现 = 覆盖；空串 = 清除；缺失 = 不变。
+	BaseURL *string `json:"base_url,omitempty"`
+	// api key 的环境变量名（只存变量名，值不进事件，H15）：出现 = 覆盖；空串 = 清除；缺失 = 不变。
+	APIKeyEnv *string `json:"api_key_env,omitempty"`
+}
+
 // workflow.activated —— 一个 session 激活一个工作流**能力包**的事实记录（v3-S3 工作流引擎，W1/W3/W11）。durable=true 进事件流（F7 只增）：工作流是能力包（哲学 + agent_types + context_strategy + gates/grants），**不是流程、非强制**（W1/W2）——激活只是把能力包的哲学文本注入 system prompt 供主 agent 选择（W3），框架**不校验**编排序列（W21）。偏离/自造流程记入事件流（W11 动态性）。payload 记激活的能力包 id、触发命令与注入的哲学原文（审计：事后可复盘当时注入了什么）。envelope.session_id/agent_id = 激活方的该 session 主 agent。
 type WorkflowActivatedPayload struct {
 	// 被激活的工作流能力包 id（如 build / tower）。

@@ -92,11 +92,12 @@ func walWarn(msg string, args ...any) { slog.Default().Warn(msg, args...) }
 // walTurnBegin 在 provider.Run **之前**记一轮的开始（turn.begin）。
 //
 // 写在请求组装完、模型调用发起前：此刻"这一轮要干什么"完全确定（模型、消息数、可见
-// 工具数），正是崩溃后要读出来的现场。
+// 工具数），正是崩溃后要读出来的现场。model 取 **req.Model**（G-c/G-d：本轮快照覆盖
+// 生效后的模型名——WAL 记"这一轮实际要打到哪个模型"，不是 loop 基值）。
 func (l *Loop) walTurnBegin(turn int, req core.ModelRequest) {
 	l.walAppend(core.KindWalTurnBegin, core.WalTurnBeginPayload{
 		Turn:     turn,
-		Model:    l.model,
+		Model:    req.Model,
 		Messages: len(req.Messages),
 		Tools:    len(req.Tools),
 	})

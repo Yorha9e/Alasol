@@ -2,11 +2,13 @@ package host
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
 	"github.com/Yorha9e/alasol/core"
+	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/runtime/store/walfile"
 )
 
@@ -86,13 +88,75 @@ func (h *Hub) WALReport(ctx context.Context, sessionID contracts.Ulid) (walfile.
 	if err != nil {
 		return walfile.Report{}, fmt.Errorf("host: 读 session %s 的事件流: %w", sessionID, err)
 	}
-	rep, rerr := walfile.ReconcileSession(h.wal.Dir(), sessionID, walfile.FactsFromEvents(events))
+	rep, rerr := walfile.ReconcileSession(h.wal.Dir(), sessionID, walFacts(events))
 	if rerr != nil {
 		// 读坏了也返回部分报告（崩溃恢复的第一步不该被一行坏数据堵死）——错误一并带回，
 		// 调用方决定是当失败还是"用部分结果 + 说明"。
 		return rep, fmt.Errorf("host: 对账 WAL: %w", rerr)
 	}
 	return rep, nil
+}
+
+// walFacts 折本次对账用的**事件流事实**（walfile.Facts）。
+//
+// 口径只定义一次（host 与 cmd 共用）：completed / failed 两类由 walfile.FactsFromEvents
+// 折（它不认工具名）；"已知在飞"（standby 待机中）由本包折——**walfile 不认识工具名**
+// （依赖方向：宿主折事实，本包只对账）。
+func walFacts(events []contracts.Event) walfile.Facts {
+	f := walfile.FactsFromEvents(events)
+	f.PendingToolCalls = StandbyPendingToolCalls(events)
+	return f
+}
+
+// StandbyPendingToolCalls 从事件流折出"**未收口的 standby**"的 tool_call_id 集合：
+// intent 已落、completed/failed 还没落的 standby 调用（= 待机中或崩在半路）。
+//
+// 为什么需要它（WAL 不误报，G-f）：
+//
+//   - standby 待机中（intent 有、completed 没有）是**正在等**消息，不是崩溃残留——
+//     报成"疑似崩溃残留"是误报（使用者据此以为丢了东西）；
+//   - standby 的结果是短文本（量级几百字节，默认阈值下不外置；即便外置，blob 也是
+//     等待**结束后**才写的）→ 等待期没有 blob 写出来 → 那条计划不可能对应一份孤儿
+//     blob（那个名单的含义是"结果可能已写成 blob、引用没落"）。
+//
+// 口径：按 tool_call_id 配对（X1 的键）；坏载荷跳过（宽容，不猜）。
+func StandbyPendingToolCalls(events []contracts.Event) map[string]bool {
+	out := map[string]bool{}
+	// ① standby 的 intent（工具名对上的才看）。
+	for i := range events {
+		if events[i].Kind != loop.KindToolCallIntent {
+			continue
+		}
+		var p contracts.ToolCallIntentPayload
+		if json.Unmarshal(events[i].Payload, &p) != nil {
+			continue // 坏载荷：跳过（D7 宽容）
+		}
+		if p.ToolName != ToolStandby || p.ToolCallID == "" {
+			continue
+		}
+		out[string(p.ToolCallID)] = true
+	}
+	if len(out) == 0 {
+		return out
+	}
+	// ② 有结果（completed/failed）→ 已收口 → 不再是"在飞"。
+	for i := range events {
+		switch events[i].Kind {
+		case loop.KindToolCallCompleted:
+			var p contracts.ToolCallCompletedPayload
+			if json.Unmarshal(events[i].Payload, &p) != nil {
+				continue
+			}
+			delete(out, string(p.ToolCallID))
+		case loop.KindToolCallFailed:
+			var p contracts.ToolCallFailedPayload
+			if json.Unmarshal(events[i].Payload, &p) != nil {
+				continue
+			}
+			delete(out, string(p.ToolCallID))
+		}
+	}
+	return out
 }
 
 // closeWAL 收口 hub 建过的所有 WAL Writer（Close 里调；幂等）。

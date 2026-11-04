@@ -3,6 +3,7 @@ package walfile
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/Yorha9e/alasol/contracts"
@@ -44,6 +45,19 @@ import (
 //     binary_ref** → 两种情况混在一起辨不细（ Put 失败 fail-open 原样内联 vs 阈值变了），
 //     如实单列一类，不谎报成孤儿。
 //
+//  4. **未收口的 standby 调用**：事件流里那个 tool_call 有 intent、**没有**
+//     completed 也没有 failed，且调用方认定它**不是崩溃残留**
+//     （Facts.PendingToolCalls：standby 正在等消息或崩在半路）——照实单列一类，
+//     不进孤儿候选。
+//     为什么这么判：standby 的结果是短文本（等待**结束后**才产生）→ 等待期没有 blob
+//     写出来 → 那条计划不可能对应一份孤儿 blob；而"待机"报成"疑似崩溃残留"是误报
+//     （使用者据此以为丢了东西）。
+//
+//     **列示从事实面出发**（critic F8）：名单来自 Facts.PendingToolCalls（宿主从事件流
+//     折出来的"未收口"），**不依赖 blob.plan**——blob 关（默认）时 WAL 里根本没有
+//     计划，若把列示挂在计划循环里，未收口的 standby 调用在报告里就**一言不发**
+//     （藏证据：明明有个调用没收口，报告却说"没有"）。
+//
 // **诚实边界（计划写在 intent 之前的代价）**：blob.plan 挪到 intent **之前**后（critic F1：
 // 写点全在三段窗口外），计划里**没有结果体量**（结果那时还不存在）→ 对账分不出"这个
 // 工具调用本来就不大"与"本来要外置但 Put 失败了"。故：
@@ -83,6 +97,19 @@ type Facts struct {
 	// 根本没产出结果、更没写 blob——把它算成"孤儿候选"是误报（还会让 Crashed() 假阳性：
 	// 一次策略拒绝被报成"疑似崩溃残留"）。
 	FailedToolCalls map[string]bool
+	// PendingToolCalls 是**未收口**（intent 已落、结果还没落）的 tool_call_id 集合，
+	// 且调用方认定它**不是崩溃残留**（standby：正在等消息或崩在半路）。
+	//
+	// 为什么需要它（不误报）：blob.plan 是**每个**工具调用一条（写在 intent 之前，
+	// 见 core/loop/blob.go 的 planExternalize），而"孤儿候选"名单的含义是"结果**可能**
+	// 已写成 blob、引用没落"（可手动清理）。standby 的结果是短文本（量级几百字节，
+	// 默认阈值下不外置；即便外置，blob 也是等待**结束后**才写的）→ 等待期没有 blob
+	// 写出来 → 那条计划**不可能**对应一份孤儿 blob；而"待机"报成"疑似崩溃残留"是误报
+	// （使用者据此以为丢了东西）。
+	//
+	// 口径由**调用方**给（walfile 不认识工具名——依赖方向：宿主折事实，本包只对账）：
+	// 宿主从事件流折出"未收口的 standby"填进来。
+	PendingToolCalls map[string]bool
 }
 
 // FactsFromEvents 从一批事件折出对账事实（host/cmd 共用，口径只定义一次）。
@@ -202,6 +229,15 @@ type Report struct {
 	// StaleBlobPlans 是**作废计划**：plan 在 WAL、completed 落了但没 binary_ref
 	//（Put 失败 fail-open 或阈值变化；与孤儿辨不细，如实单列）。
 	StaleBlobPlans []string `json:"stale_blob_plans,omitempty"`
+	// PendingToolCalls 是**未收口的 standby 调用**的 tool_call_id（intent 已落、
+	// completed/failed 还没落——它**正在等**或崩在半路）。
+	//
+	// 为什么照实列出来（不藏证据）：把它们从孤儿候选里摘掉是为了**不误报**（待机不是
+	// 崩溃），但"这个调用还没收口"这件事本身要看得见——藏证据（假阴性）比误报更坏。
+	//
+	// **列示来自事实面**（Facts.PendingToolCalls，critic F8）：与 blob.plan 无关
+	// ——blob 关（默认）时也有名单（"未收口"是事件流的事实，不是 WAL 的事实）。
+	PendingToolCalls []string `json:"pending_tool_calls,omitempty"`
 }
 
 // Crashed 报告是否显示"疑似崩溃残留"（有在飞轮次或孤儿）。
@@ -223,6 +259,11 @@ func (r Report) Summary() string {
 		if len(r.StaleBlobPlans) > 0 {
 			out += fmt.Sprintf("；另有 %d 个作废外置计划（completed 落了但没 binary_ref）", len(r.StaleBlobPlans))
 		}
+		// 未收口的 standby 调用（待机中或崩在半路）：不是崩溃残留，但要看得见（不藏证据）。
+		if len(r.PendingToolCalls) > 0 {
+			out += fmt.Sprintf("；另有 %d 个未收口的 standby 调用（待机中或崩在半路：%s）",
+				len(r.PendingToolCalls), strings.Join(r.PendingToolCalls, ", "))
+		}
 		return out
 	}
 	var b strings.Builder
@@ -240,6 +281,10 @@ func (r Report) Summary() string {
 	}
 	if len(r.StaleBlobPlans) > 0 {
 		fmt.Fprintf(&b, "%d 个作废外置计划；", len(r.StaleBlobPlans))
+	}
+	if len(r.PendingToolCalls) > 0 {
+		fmt.Fprintf(&b, "%d 个未收口的 standby 调用（待机中或崩在半路：%s）；",
+			len(r.PendingToolCalls), strings.Join(r.PendingToolCalls, ", "))
 	}
 	b.WriteString("（恢复报告是观察面不是写回面：delta 不自动补进事件流，孤儿可手动清理）")
 	return b.String()
@@ -412,10 +457,28 @@ func Reconcile(scan ScanResult, sessionID contracts.Ulid, facts Facts) Report {
 		rep.InFlightTurn.Reasoning, rep.InFlightTurn.ReasoningTruncated = capText(inFlight.reason.String())
 	}
 
+	// 未收口的 standby 调用：**从事实面列示**（critic F8）。
+	//
+	// 为什么不能挂在 blob.plan 的名单循环里：blob **关**（默认）时 WAL 里根本没有
+	// 计划 → 那个循环一次都不跑 → 未收口的 standby 调用在报告里**一言不发**
+	// （= 藏证据：明明有个调用没收口，报告却说"没有"）。列示必须从事实面
+	// （facts.PendingToolCalls = 宿主从事件流折出来的"未收口"）出发，与 blob 无关。
+	//
+	// 排序：map 迭代序不确定 → 按 id 升序（确定性输出，审计友好）。
+	for _, id := range pendingOrder(facts) {
+		rep.PendingToolCalls = append(rep.PendingToolCalls, id)
+	}
+
 	// blob 对账：plan 在 WAL，事件流说了算（不误报）。
 	for _, id := range planOrder {
 		switch {
 		case !facts.CompletedToolCalls[id] && !facts.FailedToolCalls[id]:
+			if facts.PendingToolCalls[id] {
+				// 已知在飞（standby 待机中：正在等消息）→ **不是崩溃残留**，也不进孤儿
+				// 候选（等待期没有 blob 写出来 → 不可能有孤儿 blob）。
+				// 照实列进 PendingToolCalls（上面已按事实面列过，不重复列）。
+				continue
+			}
 			// 既没 completed 也没 failed = 这个工具调用**没走完**（崩在半路）：结果可能
 			// 已写成 blob、引用没落 → 孤儿候选（人工核对）。
 			//
@@ -428,6 +491,22 @@ func Reconcile(scan ScanResult, sessionID contracts.Ulid, facts Facts) Report {
 		}
 	}
 	return rep
+}
+
+// pendingOrder 列出事实面里"未收口"的 tool_call_id（升序；已收口的剔除）。
+//
+// 口径：**只有既没 completed 也没 failed 的才算未收口**——事实面给的是宿主折出来的
+// "已知在飞"集合，但报告不替宿主猜：真的收了口的（completed/failed）不该再列。
+func pendingOrder(facts Facts) []string {
+	out := []string{}
+	for id := range facts.PendingToolCalls {
+		if facts.CompletedToolCalls[id] || facts.FailedToolCalls[id] {
+			continue // 已收口 → 不是"未收口"
+		}
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // decodePayload 解一条记录的 payload（解不动 → false：按损坏行跳过，不猜）。

@@ -23,6 +23,7 @@ import (
 	"github.com/Yorha9e/alasol/core/loop"
 	"github.com/Yorha9e/alasol/core/policy"
 	"github.com/Yorha9e/alasol/core/registry"
+	"github.com/Yorha9e/alasol/core/sessioncfg"
 	"github.com/Yorha9e/alasol/core/storage"
 	"github.com/Yorha9e/alasol/core/workflow"
 	"github.com/Yorha9e/alasol/runtime"
@@ -73,6 +74,17 @@ type Hub struct {
 	// 发现表（K10）：core 内存活状态 + 拉式扫描喂它的事件流（host/discovery.go）。
 	disc     *discovery.Table
 	discFeed *discoveryFeed
+	// cfgTable / cfgFeed 是 G-c per-prompt 配置的 fold 表与其拉式扫描（host/
+	// config_fold.go；core/sessioncfg 纯状态机 + discoveryFeed 同款喂养）：当前配置 =
+	// config.changed 折叠（生效链第二层）。启动时全量重放播种（重启后配置仍生效），
+	// 每个 prompt 的 Run 钩子先 catchUp 再取 Current(sid)（轮 = Run 开始重取）。
+	cfgTable *sessioncfg.Table
+	cfgFeed  *configFeed
+	// provMu / provCache 是 G-d provider 覆盖的构造缓存（同 (base_url, key) 复用一个
+	// openai.Provider）。独立锁（provMu）：钩子在 Run 路径上取它，不与
+	// h.mu 的 map 操作互抢。见 host/config_fold.go 的 cachedProviderOverride。
+	provMu    sync.Mutex
+	provCache map[string]core.Provider
 	// onlineConfig / onlineSource 支撑 v1-S4 在线表注入（K14/K15）。onlineConfig 是 hub 共享的
 	// 活配置（运行期经 /api/online-table/config 调，所有 loop 下一轮读它立即生效）；onlineSource
 	// 把发现表的可见面折成 loop.OnlineTableSource（self + gate 相交的对端主 agent，K11）。
@@ -455,6 +467,10 @@ func New(cfg Config) (*Hub, error) {
 	b := bus.New(st)
 	disc := discovery.New()
 	discFeed := newDiscoveryFeed(st, disc)
+	// G-c per-prompt 配置 fold（core/sessioncfg 纯状态机）+ 拉式扫描喂养（照
+	// discoveryFeed 样板）：启动播种与每次 Run 的钩子都经 cfgFeed.catchUp 追平。
+	cfgTable := sessioncfg.New()
+	cfgFeed := newConfigFeed(st, cfgTable)
 	// 在线表配置（K14/K15）：默认值（N=50 / 每行 ≤100 token / summary）落进活配置对象，
 	// Config 里的覆盖项经 Update 生效（0/"" = 保持默认）。数据源 = 发现表可见面。
 	onlineCfg := loop.NewOnlineTableConfig()
@@ -628,6 +644,8 @@ func New(cfg Config) (*Hub, error) {
 		proj:              proj,
 		disc:              disc,
 		discFeed:          discFeed,
+		cfgTable:          cfgTable,
+		cfgFeed:           cfgFeed,
 		cwd:               cwd,
 		hubID:             string(core.NewUlid()),
 		ws:                transport.NewServer(b),
@@ -697,6 +715,14 @@ func New(cfg Config) (*Hub, error) {
 		assembled = true
 		return nil, fmt.Errorf("host: 播种发现表失败: %w", err)
 	}
+	// 播种配置 fold（G-c）：config.changed 全量重放 → **重启后 per-prompt 配置仍生效**
+	//（设计 15 §3.1）。失败 **fail-close**（与播种发现表同口径）：当前配置折不出来，
+	// 就别拿一个错的/缺的配置去跑模型（可能把请求打到错的端点）。
+	if _, err := h.cfgFeed.catchUp(context.Background()); err != nil {
+		_ = h.Close()
+		assembled = true
+		return nil, fmt.Errorf("host: 播种配置 fold 失败: %w", err)
+	}
 
 	// agentlink（K18）：reader 直接就是 store（core.Store.ReadFrom 与
 	// agentlink.EventWindowReader 同签名——不加适配层）；sink 经 bus 发布 + 回读拿 seq。
@@ -705,6 +731,30 @@ func New(cfg Config) (*Hub, error) {
 		Reader: st,
 		Sink:   agentlinkSink{bus: b, store: st},
 	})
+
+	// standby 待机工具（G-f）：**hub 级常驻**（形态同 vector_search / git_status：
+	// 经**同一个** reg.RegisterTool 入口注册 → 同一条 X1 三段写路径、同一套策略链
+	// 与 R5 可见性；生产默认仍是 deny-all，要放行得显式 allow = ["standby"]）。
+	//
+	// 装配期注入四样宿主能力：
+	//   - 事件流读面（回查本次 tool.call.intent：拿归属 session 与重放游标）；
+	//   - agentlink（K11 addressedTo 唤醒过滤：只认投递给本 session 的消息）；
+	//   - 发现表（waiting 态的 BeginWait/EndWait 配平）；
+	//   - hub 生命周期（关库即中止待机，不挂死）。
+	//
+	// 放在 h.link 建好之后：唤醒判定要经 agentlink 读收件箱。
+	if err := reg.RegisterTool(standbyDescriptor(), newStandbyExecutor(standbyDeps{
+		store:   st,
+		link:    h.link,
+		disc:    disc,
+		catchUp: discFeed.catchUp,
+		hubDone: lifeCtx.Done(),
+		blob:    h.blob, // 交付标记被外置时经它读回（critic P2）
+	})); err != nil {
+		_ = h.Close()
+		assembled = true
+		return nil, fmt.Errorf("host: 注册待机工具 %s: %w", ToolStandby, err)
+	}
 
 	// 后台索引器：派生表（sessions / ledger / board / cost_stats / cost_tokens）的**唯一写者**。
 	h.ixCtx, h.ixCancel = context.WithCancel(context.Background())
@@ -1146,7 +1196,12 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		System:          system,
 		MaxTurns:        h.cfg.MaxTurns,
 		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位（G14；空 = 不传）
-		ContextBudget:   h.contextBudgetFor(strategyKind),
+		// G-c/G-d 生效链第三层：per-Run 覆盖钩子——每个 prompt 的 Run 开头重取
+		// config.fold（扫平事件流）+ 叠 hub 默认 → 冻结进 runState（轮 = Run 开始
+		// 重取；运行中变更不影响已冻结的本轮，下一轮生效）。无配置事件时返回零值
+		// 覆盖（等价于不挂），代价只是每次 Run 多一次增量扫描。
+		RunOverrides:  h.runOverridesHook(sessionID),
+		ContextBudget: h.contextBudgetFor(strategyKind),
 		// W15 逐轮预算制动（v4-4-B 缺口 5）：BudgetMaxTokens<=0 → nil 钩子（零查询、
 		// 零行为变化）；>0 → 每轮 provider.Run 前读一次累计成本（checkBudget 同款
 		// fail-open：查询失败不拒本轮，warn 留痕）。per-Run 的 checkBudget（RunPrompt
@@ -1439,6 +1494,7 @@ func (h *Hub) sessionsFiltered(ctx context.Context, only *bool) ([]SessionRow, e
 		if dr, ok := h.disc.Session(contracts.Ulid(rows[i].SessionID)); ok {
 			rows[i].Online = dr.Online
 			rows[i].Running = dr.Running
+			rows[i].Waiting = dr.Waiting
 		}
 		rows[i].LastActivity = rows[i].UpdatedAt
 	}

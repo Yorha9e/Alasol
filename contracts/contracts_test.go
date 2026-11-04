@@ -427,6 +427,33 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Milestone == "" {
 				t.Errorf("line %d: workflow.milestone milestone 不能为空（里程碑名）", lineNo)
 			}
+		case "config.changed":
+			var p ConfigChangedPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Errorf("line %d: unmarshal into ConfigChangedPayload: %v", lineNo, err)
+				break
+			}
+			// G-c per-prompt 配置：变更集语义 = 字段出现即覆盖。样本钉住首批字段的
+			// 真实形状：model + provider 两件套（provider 凭据纪律：改 base_url 必须
+			// 同时给 api_key_env——契约层只保证两个字段都在，成对性由 host 层校验）。
+			if p.Model == nil || *p.Model == "" {
+				t.Errorf("line %d: config.changed 应带非空 model（出现 = 覆盖）", lineNo)
+			}
+			if p.Provider == nil {
+				t.Errorf("line %d: config.changed 应带 provider 覆盖项", lineNo)
+				break
+			}
+			if p.Provider.BaseURL == nil || *p.Provider.BaseURL == "" {
+				t.Errorf("line %d: config.changed provider.base_url 应带非空值", lineNo)
+			}
+			if p.Provider.APIKeyEnv == nil || *p.Provider.APIKeyEnv == "" {
+				t.Errorf("line %d: config.changed provider.api_key_env 应带非空值（凭据纪律：改 base_url 必须同时显式给 api_key_env）", lineNo)
+			}
+			// reasoning_effort 带了就必须非空（空串 = 清除回默认是合法语义，
+			// 但样本演示的是覆盖形状，不该拿空串占位——与 model.turn reasoning 同判）。
+			if p.ReasoningEffort != nil && *p.ReasoningEffort == "" {
+				t.Errorf("line %d: config.changed reasoning_effort 带了就不该是空串（空串 = 清除，样本应演示覆盖）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}
@@ -454,6 +481,7 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 		"agentlink.broadcast", "agentlink.handoff", "context.compacted",
 		"review.recorded", "conflict.predicted", "hub.alert",
 		"btw.forked", "workflow.activated", "workflow.milestone",
+		"config.changed",
 	} {
 		if kinds[kind] == 0 {
 			t.Errorf("sample has no %q event", kind)

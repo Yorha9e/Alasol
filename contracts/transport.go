@@ -48,6 +48,8 @@ type CommandSubmit struct {
 	SessionID *Ulid `json:"session_id,omitempty"`
 	// 用户 prompt 原文（空 = 拒绝，400/error）。
 	Prompt string `json:"prompt"`
+	// 可选：本轮要应用的 session 配置变更（G-c per-prompt 配置，HTTP 面 = POST /prompt body 的 config——两处入口**同源同型**，引用同一个变更集类型、不复制两份定义）。缺省 = 不修改配置；形状与语义见 ConfigChangedPayload（字段出现 = 覆盖、缺失 = 不变、空串 = 清除回 hub 默认）。
+	Config *ConfigChangedPayload `json:"config,omitempty"`
 }
 
 // kind=command.accepted 的载荷：command.submit 的受理回执（reply_to 指向原 command.submit）。带回生效的 session id（客户端未提供时是服务端新建的那个）与运行状态；**受理不等于跑完**——结果经事件流异步回流。

@@ -78,6 +78,9 @@ type OnlineTableRow struct {
 	LastKind  string `json:"last_kind,omitempty"`
 	LastSeq   int64  `json:"last_seq"`
 	UpdatedAt string `json:"updated_at,omitempty"`
+	// Waiting 标记该 session 正处 G-f standby 挂起态（算活跃、豁免活跃窗口、不刷最后
+	// 事件 ts——数据源侧从发现表行补，渲染见 waitingMark）。
+	Waiting bool `json:"waiting"`
 }
 
 // OnlineTableSource 提供某 session 的在线表行（self + gate 相交的对端主 agent，K11）。
@@ -348,8 +351,8 @@ func renderOnlineRow(r OnlineTableRow, view OnlineTableView) string {
 
 // renderRowSummary 一行摘要（短 id），受 LineTokenBudget 截断（K15：每行 ≤100 token）。
 func renderRowSummary(r OnlineTableRow, view OnlineTableView) string {
-	line := fmt.Sprintf("- [%s] session=%s main=%s gates=[%s] doing=%s @%s",
-		selfLabel(r), shortID(r.SessionID), shortID(r.MainAgentID),
+	line := fmt.Sprintf("- %s[%s] session=%s main=%s gates=[%s] doing=%s @%s",
+		waitingMark(r), selfLabel(r), shortID(r.SessionID), shortID(r.MainAgentID),
 		strings.Join(r.Gates, ","), orDash(r.LastKind), orDash(r.UpdatedAt))
 	return truncateToTokens(line, view.LineTokenBudget) + "\n"
 }
@@ -357,7 +360,7 @@ func renderRowSummary(r OnlineTableRow, view OnlineTableView) string {
 // renderRowWindowed level=n：身份行 + 若干事实行，总行数受 WindowLines 限制（K14 窗口行数）。
 func renderRowWindowed(r OnlineTableRow, view OnlineTableView) string {
 	lines := []string{
-		fmt.Sprintf("- [%s] session=%s main=%s", selfLabel(r), shortID(r.SessionID), shortID(r.MainAgentID)),
+		fmt.Sprintf("- %s[%s] session=%s main=%s", waitingMark(r), selfLabel(r), shortID(r.SessionID), shortID(r.MainAgentID)),
 		fmt.Sprintf("    gates: [%s]", strings.Join(r.Gates, ",")),
 		fmt.Sprintf("    doing: %s (seq %d) @%s", orDash(r.LastKind), r.LastSeq, orDash(r.UpdatedAt)),
 	}
@@ -376,12 +379,24 @@ func renderRowWindowed(r OnlineTableRow, view OnlineTableView) string {
 // renderRowFull level=full：全字段 + 全 id（26 字符）、不截断、不限行（K14：full 需显式）。
 func renderRowFull(r OnlineTableRow) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "- [%s] session=%s main=%s\n", selfLabel(r), orDash(r.SessionID), orDash(r.MainAgentID))
+	fmt.Fprintf(&b, "- %s[%s] session=%s main=%s\n", waitingMark(r), selfLabel(r), orDash(r.SessionID), orDash(r.MainAgentID))
 	fmt.Fprintf(&b, "    gates: [%s]\n", strings.Join(r.Gates, ","))
 	fmt.Fprintf(&b, "    last_kind: %s\n", orDash(r.LastKind))
 	fmt.Fprintf(&b, "    last_seq: %d\n", r.LastSeq)
 	fmt.Fprintf(&b, "    updated_at: %s\n", orDash(r.UpdatedAt))
 	return b.String()
+}
+
+// waitingMark 返回 G-f waiting 态的行内标记（waiting → "[waiting] "，否则 ""）。
+//
+// 放**行首**（`- ` 之后、状态括号之前）：summary 等级受 LineTokenBudget 截断，而
+// truncateToTokens 保留头部——标记放行尾会被截没；n / full 等级不截断，同一位置即可
+// （n 等级落在身份行：WindowLines=1 时只渲染该行，标记仍在）。
+func waitingMark(r OnlineTableRow) string {
+	if r.Waiting {
+		return "[waiting] "
+	}
+	return ""
 }
 
 func selfLabel(r OnlineTableRow) string {

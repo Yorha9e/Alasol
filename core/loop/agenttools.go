@@ -113,6 +113,10 @@ type runState struct {
 	// ledger 是本次 Run 的 goal ledger 写入器（J19/X6；nil = 未开 GoalLedger 或无 store）。
 	// per-Run 持有（LedgerWriter 非并发安全，一个 session 一个 turn 内单写者）。
 	ledger *durable.LedgerWriter
+	// overrides 是本次 Run 开始时冻结的 **per-Run 覆盖**（G-c/G-d 生效链第三层"本轮
+	// 快照"；零值 = 无覆盖 = 全部用 loop 基值）。Run 局部 → 并发 Run 各持各的只读
+	// 快照；**运行中修改配置不回写它**（轮 = 一个 prompt 的 Run，下一轮 Run 重取）。
+	overrides RunOverrides
 }
 
 // taintAcc 累积一次 Run 的最高污点级（"" = 未观测 = clean）。
@@ -282,7 +286,7 @@ func (l *Loop) runSpawn(ctx context.Context, turn int, tc core.ToolCallReq, st *
 
 	// 起子 loop（同 Bus/Registry/Provider/SessionID；AgentID=child.ID；Model/System/tools 取自 type）。
 	childType, _ := l.agents.Tree.TypeOf(child.ID)
-	childLoop, buildErr := l.buildChildLoop(child, childType, sa.Task)
+	childLoop, buildErr := l.buildChildLoop(child, childType, sa.Task, st)
 	var (
 		childRes Result
 		childErr error
@@ -486,7 +490,8 @@ func (l *Loop) emitAgentFailed(ctx context.Context, causation *contracts.Ulid, c
 //
 //	透传：Provider / Bus / Registry / Policy / Approver / SessionID / SessionEnv /
 //	      MaxTurns（每层各自的上限）/ **TurnBudget**（逐轮预算闸门）/ ReasoningEffort /
-//	      BlobSink+BlobMaxInline（大 payload 外置）/ Agents（共享树）
+//	      BlobSink+BlobMaxInline（大 payload 外置）/ Agents（共享树）/
+//	      **RunOverrides 快照**（G-c/G-d：子 loop 复用父 Run 冻结的本轮覆盖——见 cfg）
 //	不跟：OnlineTable（只有主 agent 参与水平可见性）/ GoalLedger（账本由主 agent 写）/
 //	      **WalSink**（WAL 是 per-session 一个文件，父子同 session 且轮次号各自从 1 起
 //	      → 混在一起归属说不清；/btw 旁支有自己的 session，不受此限）
@@ -497,10 +502,13 @@ func (l *Loop) emitAgentFailed(ctx context.Context, causation *contracts.Ulid, c
 // 身份造 per-Run 工厂）。钩子缺失/造不出，或**声明了却 kind 为空** → **fail-close**：
 // 返回错误，runSpawn 把它当 childErr 收口成 agent.failed（不静默降级成 append——"声明了
 // 非 append 却跑 append"比失败更糟，策略语义会悄悄变味）。
-func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, task string) (*Loop, error) {
+func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, task string, st *runState) (*Loop, error) {
 	model := strings.TrimSpace(childType.Model)
 	if model == "" {
-		model = l.model // 类型未绑定模型 → 继承父模型（兜底）
+		// 类型未绑定模型 → 继承**父本轮生效模型**（G-c/G-d F1：不是 l.model 基值——
+		// 父 Run 若有 model 覆盖，用 hub 基值兜底会让子 agent 拿默认模型打**覆盖端点**
+		// （模型/端点错配）。钩子刻意不覆盖子的 Model（见下），兜底就是唯一取值口）。
+		model = l.modelFor(st)
 	}
 	system := childType.Prompt
 	if strings.TrimSpace(task) != "" {
@@ -554,6 +562,25 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		// 子 loop 不带它 → 子 agent 的每轮请求都不带 reasoning_effort → 端点用默认档。
 		// 那就是"父 agent 开了 high、子 agent 静默退回默认档"的能力漂移（用户看不出来）。
 		ReasoningEffort: l.reasoningEffort,
+		// G-c/G-d per-Run 覆盖：子 loop **复用父 Run 冻结的本轮快照**（st.overrides），
+		// **不重取 fold**——轮 = 一个 prompt 的 Run，子 agent 是同一轮的一部分，运行中
+		// 落的 config.changed 不得穿透进子 agent（生效链口径：钩子只在 Run 开头取一次）。
+		//
+		// Model **留空**（钩子不覆盖子的 Model）：子 agent 的模型归类型绑定
+		// （childType.Model），session 级 model 覆盖不改写类型绑定的模型（改写会让"这个
+		// 类型用这个模型"的声明被 per-prompt 覆盖悄悄推翻）；类型**未**绑定时由上面的
+		// 兜底用**父本轮生效模型**（modelFor(st)，F1——不是 hub 基值）。ReasoningEffort /
+		// Provider 随快照走——覆盖生效时父子同档位、同端点（不出现"父走覆盖端点、
+		// 子走 hub 端点"的分叉）。
+		RunOverrides: func(context.Context) (RunOverrides, error) {
+			if st == nil {
+				return RunOverrides{}, nil // 纵深防御：没快照就用 loop 基值（与不挂钩子等价）
+			}
+			return RunOverrides{
+				ReasoningEffort: st.overrides.ReasoningEffort,
+				Provider:        st.overrides.Provider,
+			}, nil
+		},
 		// D4（G2e，v4-3-A）：大 payload 外置的**仓库与阈值透传给子 agent**。
 		//
 		// 为什么必须透传：外置是**跨 agent 的一致口径**——父 agent 的工具大输出外置进 blob、

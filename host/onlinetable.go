@@ -58,6 +58,7 @@ func (s *discoveryOnlineSource) OnlineRows(ctx context.Context, sessionID contra
 			LastKind:    self.LastKind,
 			LastSeq:     self.LastSeq,
 			UpdatedAt:   self.UpdatedAt,
+			Waiting:     self.Waiting, // G-f：发现表行现算的 waiting 态
 		})
 	}
 	for _, p := range s.table.VisiblePeers(sessionID) {
@@ -66,14 +67,20 @@ func (s *discoveryOnlineSource) OnlineRows(ctx context.Context, sessionID contra
 		if s.feed != nil && s.feed.isFork(contracts.Ulid(p.SessionID)) {
 			continue
 		}
-		out = append(out, loop.OnlineTableRow{
+		// G-f：对端行补 waiting（VisiblePeers 的 PeerRow 不带它——行出口在 SessionRow，
+		// 这里回查同一行取现算值，与 self 行同源）。
+		row := loop.OnlineTableRow{
 			SessionID:   p.SessionID,
 			MainAgentID: p.MainAgentID,
 			Gates:       p.Gates, // 与查询方相交的 gate（K11：不泄漏对端全部 gate）
 			LastKind:    p.LastKind,
 			LastSeq:     p.LastSeq,
 			UpdatedAt:   p.UpdatedAt,
-		})
+		}
+		if pr, ok := s.table.Session(contracts.Ulid(p.SessionID)); ok {
+			row.Waiting = pr.Waiting
+		}
+		out = append(out, row)
 	}
 	return out
 }

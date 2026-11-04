@@ -115,7 +115,11 @@ func walReportFor(ctx context.Context, st core.Store, dir string, sid contracts.
 		return walfile.Report{SessionID: string(sid), WALExists: false},
 			fmt.Errorf("读 session %s 的事件流: %w", sid, err)
 	}
-	return walfile.ReconcileSession(dir, sid, walfile.FactsFromEvents(events))
+	// 事实：completed / failed 由 walfile 折；"已知在飞"（standby 待机中）由 host 折
+	//（工具名是 host 的知识：walfile 不认识工具名）。
+	facts := walfile.FactsFromEvents(events)
+	facts.PendingToolCalls = host.StandbyPendingToolCalls(events)
+	return walfile.ReconcileSession(dir, sid, facts)
 }
 
 // walResumeSummary 是 resume 时自动打印的**一行** WAL 摘要（v4-4-B：崩溃后跑 resume 就能

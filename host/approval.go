@@ -377,6 +377,10 @@ func strPtrApproval(s string) *string { return &s }
 // runPromptAsync 在后台跑一轮 prompt（带 promptRunTimeout 上界——**整轮**上限：
 // 这一轮的所有 turn 与其中的审批等待共用这份预算）。
 //
+// 上界是**软时钟**（newRunClock，见 host/runctx.go）：到点照常掐（无 standby 的轮次
+// 与 context.WithTimeout 等价），但 G-f 的 standby 可在待机前把截止只增不减地推后
+// （预算豁免：待机时长另计）——ctx 的内建 deadline 不可延长，只能做成软时钟。
+//
 // **ctx 派生自 hub 生命周期**（h.lifeCtx，Close 时取消）：hub 关掉 → 这一轮立刻收场
 // （fail-close：取消即 deny），不会在**事件库关掉之后**才醒过来往已关的库写事件。
 //
@@ -392,8 +396,8 @@ func (h *Hub) runPromptAsync(sid contracts.Ulid, prompt string) {
 	if parent == nil {
 		parent = context.Background() // 兜底：没装配生命周期的 Hub（不该发生）
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
+	ctx, clock := newRunClock(parent, timeout)
+	defer clock.Stop()
 	res, err := h.RunPrompt(ctx, sid, prompt)
 	if err != nil {
 		hubLog.Warn("host: 协议面 prompt 跑失败（事件流已留痕到断裂点）",
@@ -445,13 +449,16 @@ func (h *Hub) startPromptAsync(sid contracts.Ulid, prompt string) bool {
 
 // servePrompt 服务 POST /api/sessions/{session_id}/prompt（G1 对话发起）。
 //
-//	请求体：{"prompt":"…"}（空 = 400）
+//	请求体：{"prompt":"…","config":{…}}（PromptSpec；prompt 空 = 400；config 可选 =
+//	      G-c per-prompt 配置修改——**该 session** 的配置，本轮生效 + 持久 + 重启生效）
 //	202 → {"session_id":…,"status":"running"}（**异步**：受理即返回，结果经事件流回流；
 //	      含 G-b 懒接管成功后的受理——接管本身同步完成，留痕已落库）
-//	400 → session_id 非法 / 体坏 / prompt 空
+//	400 → session_id 非法 / 体坏 / prompt 空 / **config 非法（bad_config**：effort 不在
+//	      G14 白名单、base_url 缺 api_key_env——写时 fail-close，零事件）
 //	409 → Claim 冲突（host_conflict；**唯一拒绝线**）：该 session 正由另一个 hub 托管，
 //	      拒绝接管（G25：一个 session 的事件只由其宿主进程 append）
-//	500 → 懒接管失败（takeover_failed）：loopFor 建 loop/装配等技术故障，err 文本带细节
+//	500 → 懒接管失败（takeover_failed）：loopFor 建 loop/装配等技术故障，err 文本带细节；
+//	      或 **配置事件落库失败（config_write_failed**——fail-close：不带未持久化的配置开跑）
 //	503 → hub 已关闭（hub_closed，不再受理）
 //
 // 托管口径（P2-2 + G-b 懒接管，见 host/takeover.go）：本端点仍是**托管型写面**，但
@@ -460,20 +467,23 @@ func (h *Hub) startPromptAsync(sid contracts.Ulid, prompt string) bool {
 // /api/gates/join、/api/agentlink/* 仍同源（那些**读面**对野 session 照旧 404）。
 // 协议面**开新会话**走 WS command.submit（不带 session_id → 服务端新建，本进程即宿主）
 // 或 POST /api/sessions（v3-S5 ① REST 入口，同源同口径）。
+//
+// **config 写路径顺序**（G-c，与 WS command.submit 同源同型）：
+// ensureHosted（G-b 懒接管，主 agent id 靠它落定）→ 校验（fail-close）→ 落
+// config.changed（经 bus）→ startPromptAsync → 202。落事件失败 → 500
+// config_write_failed（**不带未持久化的配置开跑**）。
 func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 	sid, err := parseSessionID(r.PathValue("session_id"))
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad_session_id", err.Error())
 		return
 	}
-	var body struct {
-		Prompt string `json:"prompt"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, maxPromptBody)).Decode(&body); err != nil {
+	var spec PromptSpec
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxPromptBody)).Decode(&spec); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "bad_body", "请求体不是合法 JSON 对象: "+err.Error())
 		return
 	}
-	if strings.TrimSpace(body.Prompt) == "" {
+	if strings.TrimSpace(spec.Prompt) == "" {
 		writeJSONError(w, http.StatusBadRequest, "empty_prompt", "prompt 不能为空（空 prompt 等于浪费一次模型调用）")
 		return
 	}
@@ -502,8 +512,45 @@ func (h *Hub) servePrompt(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("懒接管 session %s 失败（G-b）: %v", sid, err))
 		return
 	}
-	if !h.startPromptAsync(sid, body.Prompt) {
+	// G-c/G-d：配置变更集（与 WS command.submit 同源同型，见 PromptSpec）。
+	// 顺序按设计定稿：ensureHosted（上面）→ **校验**（fail-close，非法零事件）→
+	// **落 config.changed**（经 bus；失败 500 config_write_failed，不带未持久化的配置
+	// 开跑）→ startPromptAsync → 202。全空变更集（config:{}）= 无操作、不落事件、
+	// 照常受理（F8，判在 recordConfigChanged 里——两面共用一处）。hub 关闭的前置检查
+	// 在上面（与接管检查同一处，之间的并发关闭窗口与 P2-5 同类，startPromptAsync
+	// 还会再拦一次——那句 503 的文案在 Config 非空时会点明"配置已持久化"）。
+	if spec.Config != nil {
+		if err := validatePromptConfig(spec.Config); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "bad_config", err.Error())
+			return
+		}
+		// 主 agent id：ensureHosted → loopFor 已落定（取不到 = 装配残缺，按写失败回）。
+		agentID, ok := h.mainAgentOf(sid)
+		if !ok {
+			writeJSONError(w, http.StatusInternalServerError, "config_write_failed",
+				fmt.Sprintf("session %s 没有主 agent，无法落 config.changed（装配残缺）", sid))
+			return
+		}
+		if err := h.recordConfigChanged(r.Context(), sid, agentID, spec.Config); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, "config_write_failed",
+				fmt.Sprintf("落 config.changed 失败（fail-close：不带未持久化的配置开跑）: %v", err))
+			return
+		}
+	}
+	if !h.startPromptAsync(sid, spec.Prompt) {
 		// hub 在上面两步之间刚关（并发 Close）：不受理（受理了也不会真跑）。
+		//
+		// **半成功窗口（F6，有意接受、不改顺序）**：spec.Config 非空时 config.changed
+		// 已在上面**同步落库持久化**——顺序按本轮生效语义定（先持久化再起跑；反过来
+		// 会留下"跑起来了、配置没落"的更坏半态：下一轮静默回退）。于是这里可能
+		// "配置已生效、本轮没跑"：文案必须把这半句说清，否则调用方按纯失败去回滚/
+		// 重试的认知会与事件流里的 config.changed 对不上。
+		if spec.Config != nil {
+			writeJSONError(w, http.StatusServiceUnavailable, "hub_closed",
+				"hub 正在关闭，本轮 prompt 未受理；但本次提交的配置变更已生效并持久化"+
+					"（config.changed 已落库，下一轮/重启后照常生效）")
+			return
+		}
 		writeJSONError(w, http.StatusServiceUnavailable, "hub_closed", "hub 正在关闭，不受理新的协议面 prompt")
 		return
 	}
@@ -602,6 +649,9 @@ var _ transport.InboundHandler = (*Hub)(nil)
 //     Claim 冲突 → kind=error（错误帧 code=host_conflict，与 HTTP 409 同码同文案——
 //     **唯一拒绝线**，G25 防双写）；接管技术故障 → kind=error（错误经 transport 回帧）。
 //     没给 → 服务端新建（本进程即宿主，这是协议面开新会话的入口）。
+//   - command.submit 的 **config**（G-c/G-d）：与 HTTP POST /prompt 的 config 同源同型
+//     （PromptSpec.Config）——托管/建 loop → 校验 → 落 config.changed → 起跑；校验/写
+//     失败回既有 error 帧形状（code 与 HTTP 的 bad_config / config_write_failed 同码）。
 //   - approval.respond：decision 必须是 allow|deny（非法 → kind=error，且**不消费**
 //     挂起的审批——乱批不该吃掉等着人审的那一条）；没有挂起的审批 → kind=error。
 func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (*contracts.TransportMessage, error) {
@@ -665,8 +715,52 @@ func (h *Hub) HandleInbound(ctx context.Context, m contracts.TransportMessage) (
 				return nil, fmt.Errorf("懒接管 session %s 失败（G-b）: %w", sid, err)
 			}
 		}
+		// G-c/G-d：配置变更集（与 HTTP POST /prompt 的 config 同源同型，见 PromptSpec）。
+		// 顺序与 HTTP 面一致：托管/建 loop（上面 explicit 路径已 ensureHosted；**新建
+		// 会话**路径先 loopFor——不走 ensureHosted：懒接管留痕只属于"已有 session 的
+		// 接管"，本进程自己新建的会话不是接管）→ 校验（fail-close，非法零事件）→ 落
+		// config.changed（经 bus）→ 起跑。校验/写失败回**既有 error 帧形状**（code 与
+		// HTTP 的 bad_config / config_write_failed 同码；连接不关，D7）。
+		if cs.Config != nil {
+			if h.hubClosedForPrompt() {
+				return nil, errors.New("hub 正在关闭，不受理新的协议面 prompt")
+			}
+			if !h.hostsSession(sid) {
+				if _, _, err := h.loopFor(ctx, sid); err != nil {
+					return nil, fmt.Errorf("为新会话建 loop（写配置前）: %w", err)
+				}
+			}
+			if err := validatePromptConfig(cs.Config); err != nil {
+				reply, merr := transport.NewErrorMessage(&m.ID, "bad_config", err.Error())
+				if merr != nil {
+					return nil, merr
+				}
+				return &reply, nil
+			}
+			agentID, ok := h.mainAgentOf(sid)
+			if !ok {
+				return nil, fmt.Errorf("session %s 没有主 agent，无法落 config.changed（装配残缺）", sid)
+			}
+			if err := h.recordConfigChanged(ctx, sid, agentID, cs.Config); err != nil {
+				reply, merr := transport.NewErrorMessage(&m.ID, "config_write_failed",
+					fmt.Sprintf("落 config.changed 失败（fail-close：不带未持久化的配置开跑）: %v", err))
+				if merr != nil {
+					return nil, merr
+				}
+				return &reply, nil
+			}
+		}
 		if !h.startPromptAsync(sid, cs.Prompt) {
 			// hub 已关闭（正在收尾）：不受理（受理了也不会真跑）。
+			//
+			// **半成功窗口（F6，同 HTTP 面）**：cs.Config 非空时 config.changed 已在
+			// 上面同步落库持久化（顺序按本轮生效语义定，不改）——文案点明"配置已生效、
+			// 本轮没受理"，别让调用方按纯失败回滚认知与事件流对不上。错误帧形状不变
+			//（transport 对返回的 error 统一回 kind=error，连接不关，D7）。
+			if cs.Config != nil {
+				return nil, errors.New("hub 正在关闭，本轮 prompt 未受理；但本次提交的配置变更" +
+					"已生效并持久化（config.changed 已落库，下一轮/重启后照常生效）")
+			}
 			return nil, errors.New("hub 正在关闭，不受理新的协议面 prompt")
 		}
 		reply, err := transport.NewMessage(transport.KindCommandAccepted,

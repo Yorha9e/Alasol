@@ -134,6 +134,22 @@ type Config struct {
 	// 语义成立的前提：钩子闭包绑的 session id 对父子**是同一个**（父子同 session，
 	// K25 单流多 agent）→ 查的是同一份账。
 	TurnBudget func(ctx context.Context) error
+	// RunOverrides 是 **per-Run 覆盖钩子**（G-c/G-d 生效链的取值口，设计 15 §3.3）：
+	//
+	//	hub 启动默认（Config.Model / ReasoningEffort / Provider）
+	//	  → session 配置（config.changed 折叠，宿主的 sessioncfg.Table）
+	//	    → **本轮快照**（本钩子在 Run 开始时取一次，冻结进 runState）
+	//
+	// 每次 Run（**轮 = 一个 prompt 的 Run**）开头调一次：返回的空字段/nil = 用 loop
+	// 基值；非空 = 本轮覆盖（model 进 ModelRequest.Model 与 model.turn、reasoning_
+	// effort 进 ModelRequest.ReasoningEffort、Provider 替换本轮的 provider.Run 调用方）。
+	// **运行中修改配置不影响已冻结的本轮**（钩子只在 Run 开头调一次），下一个 prompt
+	// 的 Run 重取 fold → 设计 §3.1"当前轮结束后下一轮生效"。
+	//
+	// 返回 error = 本轮 fail-close（不带未定配置开跑，如覆盖的环境变量缺失）。
+	// **nil = 不挂**（默认，零行为变化）：fork / resume / cmd 直连的 loop 不挂它，
+	// 调用方签名零改动。宿主在 loopFor 装配时绑 session 闭包（host/config_fold.go）。
+	RunOverrides func(ctx context.Context) (RunOverrides, error)
 	// ReasoningEffort 思维链强度档位（G14；空 = **不传**给 provider）。
 	// 原样进每轮 core.ModelRequest.ReasoningEffort，由 provider 透传给端点
 	// （取值如 low/medium/high/xhigh；档位集随网关演进，loop 不校验）。
@@ -210,6 +226,25 @@ type Config struct {
 	TelemetrySink core.Sink
 }
 
+// RunOverrides 是一次 Run 的**本轮快照**覆盖（G-c/G-d 生效链第三层，设计 15 §3.3）。
+//
+// 由 Config.RunOverrides 钩子在 **Run 开始时**取一次并冻结进 runState（轮 = 一个
+// prompt 的 Run）：空字段 / nil provider = 用 loop 基值（Config.Model / Config.
+// ReasoningEffort / Config.Provider）。冻结后本轮所有轮次的请求组装、model.turn 的
+// model 字段、provider.Run 的调用方都只读快照——**运行中落的 config.changed 不影响
+// 本轮，下一个 prompt 的 Run 重取**（设计 §3.1"当前轮结束后下一轮生效"）。
+type RunOverrides struct {
+	// Model 本轮模型名覆盖（空 = 用 loop 基值）。
+	Model string
+	// ReasoningEffort 本轮思维链档位覆盖（空 = 用 loop 基值；写时已过 G14 白名单校验，
+	// loop 不再校验——与 Config.ReasoningEffort 同口径）。
+	ReasoningEffort string
+	// Provider 本轮 provider 覆盖（nil = 用 loop 基值）。非 nil 时由宿主按覆盖的
+	// base_url + api_key_env 构造（凭据值只在宿主侧从环境变量取出，H12/H15/H19：
+	// 绝不进事件/请求体/日志）。
+	Provider core.Provider
+}
+
 // Loop 是一次会话内的 agent loop 状态机。
 //
 // 并发：Loop 本身无可变状态（每轮历史、污点累积、spawn 缓存都是 Run 的局部变量）→ 同一个
@@ -269,6 +304,10 @@ type Loop struct {
 	// Config.TurnBudget 与 RunWithHistory 轮次循环里的调用点。它是**无状态闭包**
 	//（宿主侧绑定 session id），并发 Run 只读共享，不破坏 Loop 的并发不变式。
 	turnBudget func(ctx context.Context) error
+	// runOverrides 是 per-Run 覆盖钩子（G-c/G-d 生效链取值口；nil = 不挂 = 零行为
+	// 变化）。见 Config.RunOverrides 与 RunWithHistory 开头的冻结点。同样是**无状态
+	// 闭包**（宿主绑定 session id），并发 Run 只读共享。
+	runOverrides func(ctx context.Context) (RunOverrides, error)
 }
 
 // Result 是一次 Run 的产出。
@@ -392,6 +431,7 @@ func New(cfg Config) (*Loop, error) {
 		wal:             newWalWriter(cfg.WalSink),
 		tel:             newTelWriter(cfg.TelemetrySink),
 		turnBudget:      cfg.TurnBudget,
+		runOverrides:    cfg.RunOverrides,
 	}, nil
 }
 
@@ -524,6 +564,25 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 	// 重建完整对话）。旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。
 	l.publishUserPrompt(ctx, prompt)
 
+	// G-c/G-d 生效链第三层：**本轮快照在 Run 开始冻结**（轮 = 一个 prompt 的 Run）。
+	//
+	// 钩子每次 Run 重取（宿主侧：扫平事件流 → sessioncfg fold → 叠 hub 默认），取到的
+	// 覆盖冻结进 st.overrides——本轮之后所有轮次的请求组装、model.turn 的 model 字段、
+	// provider.Run 的调用方都只读这份快照。于是**运行中落的 config.changed 不影响本轮**，
+	// 下一个 prompt 的 Run 重取即生效（设计 15 §3.1"当前轮结束后下一轮生效"）。
+	//
+	// 放在 user.prompt **之后**：冻结失败（fail-close，如覆盖的环境变量缺失）时本轮的
+	// prompt 已是事件流里的事实——下一轮 fold 历史仍看得到用户说过什么，不会因为一次
+	// 配置错误把用户的话丢出对话。取快照失败以错误终止本轮（不带未定配置开跑）。
+	// nil 钩子 = 不挂（fork/resume/cmd 直连的 loop）→ 零行为变化。
+	if l.runOverrides != nil {
+		ov, oerr := l.runOverrides(ctx)
+		if oerr != nil {
+			return res, fmt.Errorf("loop: 取本轮覆盖配置失败（fail-close，不带未定配置开跑）: %w", oerr)
+		}
+		st.overrides = ov
+	}
+
 	// L2/D19 telemetry：run.begin（user.prompt 之后、第一轮之前）+ deferred run.end
 	//（正常/出错/截断都发）。发点全在 X1 三段写路径**之外**；nil sink = 关 = 零行为变化。
 	// defer 注册在 publishUserPrompt **之后**：setup 期失败（策略/ledger）没有 run.begin，
@@ -592,7 +651,15 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 因此重试口径收敛在 provider 一处（runtime/provider/openai 的 providerRetryPolicy），
 		// 工具调用侧的重试另走 X1 三段写路径 + 契约 Idempotent/Replay 声明（M7），
 		// 不由本方法代劳。
-		mr, err := l.provider.Run(ctx, req, l.emitFunc(ctx, turn, runID))
+		// G-d provider 覆盖：本轮用快照里的覆盖 provider（宿主按 base_url +
+		// api_key_env 构造；凭据值只在宿主侧从环境变量取），没有覆盖（nil）→ 用
+		// loop 基值 provider（hub 的单 provider，现行为）。快照在 Run 开头冻结 →
+		// 运行中换端点不影响本轮。
+		prov := l.provider
+		if st.overrides.Provider != nil {
+			prov = st.overrides.Provider
+		}
+		mr, err := prov.Run(ctx, req, l.emitFunc(ctx, turn, runID))
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				// 取消导致的失败按取消处理（不要把"被取消"包装成模型错误）。
@@ -614,7 +681,7 @@ func (l *Loop) RunWithHistory(ctx context.Context, history []core.Message, promp
 		// 每轮 provider 返回后落一条 model.turn（F1：模型响应入事件流；含 usage 只做成本记录，J21）。
 		// 旁路观测——best-effort、不计 Result.Events、不改控制流（见 events.go）。在判定本轮是否
 		// 收敛**之前**落，故收敛轮（最终答复）与工具调用轮都各有一条。
-		l.publishModelTurn(ctx, turn, mr)
+		l.publishModelTurn(ctx, turn, mr, st)
 
 		// v4-4-B：turn.end——model.turn **durable 落盘之后**写 WAL（"这轮的事实已进事件流"）。
 		// 顺序是有意的：反过来写会让"两者之间崩溃"被报告成干净收场（假阴性比漏报更坏），
@@ -714,19 +781,34 @@ func (l *Loop) request(history []core.Message, ot *onlineTable, st *runState) co
 		msgs = append(msgs, ot.message)
 	}
 	return core.ModelRequest{
-		Model:           l.model,
+		Model:           l.modelFor(st), // G-c/G-d：本轮快照覆盖优先，空 = loop 基值
 		System:          l.system,
 		Messages:        msgs,
 		Tools:           l.visibleTools(strategyToolsOf(st)), // 框架工具（策略 + ledger）
-		ReasoningEffort: l.reasoningEffortPtr(),              // 思维链档位（G14；nil = 不传）
+		ReasoningEffort: l.reasoningEffortPtr(st),            // 思维链档位（G14；nil = 不传）
 	}
 }
 
-// reasoningEffortPtr 把档位配置折成请求字段（G14）：空 = nil（provider 不下发
+// modelFor 取本次 Run **生效的模型名**（G-c/G-d 生效链第三层）：本轮快照覆盖非空 →
+// 用覆盖；空 → loop 基值（Config.Model，hub 默认）。st 只读（冻结在 runState，见
+// RunWithHistory 的冻结点）——并发 Run 各持各的快照。
+func (l *Loop) modelFor(st *runState) string {
+	if st != nil && st.overrides.Model != "" {
+		return st.overrides.Model
+	}
+	return l.model
+}
+
+// reasoningEffortPtr 把档位折成请求字段（G14）：空 = nil（provider 不下发
 // reasoning_effort，端点用自己的默认档）；非空 = 指针（provider trim 后原样透传）。
 //
-// 返回的是 Loop 字段的地址——它在 New 之后不可变（并发 Run 只读），故安全。
-func (l *Loop) reasoningEffortPtr() *string {
+// 档位来源分两层（G-c/G-d 生效链）：本轮快照覆盖优先（指针指向 st.overrides 的字段——
+// st 是 Run 局部、活到本轮结束，请求组装与消费都在本轮内，故安全）；否则回 loop 基值
+// 字段（它在 New 之后不可变，指针跨并发 Run 只读，与旧版等价）。
+func (l *Loop) reasoningEffortPtr(st *runState) *string {
+	if st != nil && st.overrides.ReasoningEffort != "" {
+		return &st.overrides.ReasoningEffort
+	}
 	if l.reasoningEffort == "" {
 		return nil
 	}
@@ -774,11 +856,11 @@ func (l *Loop) requestWithStrategy(ctx context.Context, history []core.Message, 
 		msgs = append(out, ot.message)
 	}
 	return core.ModelRequest{
-		Model:           l.model,
+		Model:           l.modelFor(st), // G-c/G-d：本轮快照覆盖优先，空 = loop 基值
 		System:          l.system,
 		Messages:        msgs,
 		Tools:           tools,
-		ReasoningEffort: l.reasoningEffortPtr(), // 思维链档位（G14；nil = 不传）
+		ReasoningEffort: l.reasoningEffortPtr(st), // 思维链档位（G14；nil = 不传）
 	}, parts
 }
 
