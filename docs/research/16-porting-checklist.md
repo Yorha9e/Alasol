@@ -53,7 +53,7 @@ cmd/  →  host/  →  core/  →  contracts/
 
 | # | 硬约束 | 出处（07 条目 + 仓内实物） | 移植验收问法 |
 |---|---|---|---|
-| **F1** | **一切皆事件**：模型输出 / 工具调用 / 策略判定 / 压缩 / 审批全是事件；**`user.prompt` 与 `model.turn` 也入流**（对话内容进事件流，旁路观测，**不计** `Result.Events`） | 07 **F1**；`contracts/INVENTORY.md` §2 表首两行；`contracts/event.go`（`UserPromptPayload` / `ModelTurnPayload`）；`runtime/replay.go` `FoldConversation` | 新 harness 的事件流里能不能查到"这轮用户说了什么 + 模型答了什么"？ |
+| **F1** | **一切皆事件**：模型输出 / 工具调用 / 策略判定 / 压缩 / 审批全是事件；**`user.prompt` 与 `model.turn` 也入流**（对话内容进事件流，旁路观测，**不计** `Result.Events`）。**并入铁律（dsh 同向且更强，移植验收问法）**：**model-visible ⟺ logged**——凡是进模型请求的内容（含注入区/工具结果/装配快照）必须能从日志重建 | 07 **F1**；`contracts/INVENTORY.md` §2 表首两行；`contracts/event.go`（`UserPromptPayload` / `ModelTurnPayload`）；`runtime/replay.go` `FoldConversation` | 新 harness 的事件流里能不能查到"这轮用户说了什么 + 模型答了什么"？进模型的每个字能不能从日志重建？ |
 | **F5** | **当前态 = fold**：一切状态由事件流 fold 得出，**不另设可变状态源**（含 goal ledger 与黑板） | 07 **F5** / **G23**；`core/sessioncfg/`（config fold）；`runtime/indexer/`（ledger / board / cost 投影）；`contracts/INVENTORY.md` §2（`ledger.updated` / `board.written` 两行都写明"当前态 = 索引器投影"） | 有没有哪个"当前状态"是直接写进某个可变表、而不是从事件流 fold 出来的？ |
 | **X1** | **三段写路径 + 落盘序铁律**：工具调用 = `tool.call.intent`（**durable 落盘**）→ 执行 → `tool.call.completed` / `tool.call.failed`（**durable 落盘**）。**有意图无结果 = 未知结果，不盲目重跑** | 07 **X1** / **X2**；`core/loop/toolcall.go`；`contracts/event.go:33`（intent payload 注释）；`contracts/INVENTORY.md` §2 尾段"写路径铁律（X1）" | intent 是不是**先落盘再执行**？崩溃后能不能只看事件流就知道"这次调用的结果未知"？ |
 | **F7** | **契约只增不删、不改义**；弃用字段标 `x-deprecated`；envelope 带版本字段 `v` | 07 **F7**；`contracts/INVENTORY.md` §3「演进铁律」+ §5「契约变更记账」 | 新字段有没有走全链（schema → codegen → INVENTORY → 样本 → TS 三件套）？ |
@@ -431,7 +431,7 @@ envelope（`contracts/transport.go` `TransportMessage`）：`v` / `id` / `kind` 
 | `role` | 部门标签，**父 agent 在 spawn 时指定**；与 `agent_type` 正交 | 07 **K13** |
 | 内建类型 | `planner` / `coder` / `critic` / `reviewer` / `observer`（**observer = 只读型**，`can_spawn` 空 → 第 4 层类型层面不可达）；用户 `[[agent_types]]` **同名覆盖内建** | 07 **K20**；`host/agenttypes.go` |
 | 保留名 | `root` 是树根类型专用名，**不进注册表**（注册了会与树根同名 → 语义漂移）；**大小写敏感**（`Root` 不是 `root`） | `cmd/alasol/multiagent.go` `reservedAgentTypeIDs`；`host/agenttypes.go` |
-| 单流多 agent 视图 | 主 / 子 agent **共用全局事件流**，靠 `agent_id` 区分；子 loop 与父同 Bus/SessionID、仅 AgentID 不同 | 07 **K25**；`core/loop/events.go` |
+| 单流多 agent 视图 | 主 / 子 agent **共用全局事件流**，靠 `agent_id` 区分；子 loop 与父同 Bus/SessionID、仅 AgentID 不同。**移植口径（D5 拍板 2026-11-05）**：目标 harness 若用**独立子 session**（如 dsh），轨迹归属可变，**验收问法改为「子 agent 事件可被父按 `agent_id` 过滤回放」**——可回放性不可丢，物理归属不强求 | 07 **K25**；`core/loop/events.go` |
 | 收敛通道 | `complete(summary)` 的结构化 summary 是**回主 agent 上下文的唯一通道**（tainted 加 ⚠ 前缀）；`refs` 可核验（`Inquiry` 拉原文） | 07 **K24**；`core/agents/summary.go` |
 | 异常冒泡 | subagent 失败 / 卡住 → 直系父 agent 的 summary **必须报告它**（K23 兜底） | 07 **K23** |
 
@@ -594,6 +594,8 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
 - **fail 重试 ≠ 干净收场**：WAL 六个写点的顺序保证"有 begin 无 end 无 failed"才是崩溃残留（普通失败有 `turn.failed` 收口，不误报）。
 
 ### 8.2 WAL 预写日志（六个写点 + reconcile + GC）
+
+> **移植口径（D3 拍板 2026-11-05）**：目标 harness（dsh）**拒绝 WAL** → 移植线**已砍本面**（以 checkpoint-policy 三屏障 + 尾部推断替代）。移植验收按「**已砍（有意，目标 harness 拒绝 WAL）**」登记——**不是漏项**，不许按本节逐项勾。本节在 Alasol 本体继续有效（补全线按原口径维护）。
 
 **六个写点**（`core/wal.go` 词汇表 + `core/loop/wal.go` 写点；**全在 X1 三段写路径之外**）：
 
