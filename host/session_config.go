@@ -47,9 +47,16 @@ import (
 
 // SessionConfigView 是 GET /api/sessions/{id}/config 的响应形状（配置面板种子化用）。
 //
-// 形状（与 GUI 建议一致）：
+// 形状（与 GUI 建议一致；`config` 是同一生效配置的**嵌套组**——driver 的
+// AlasolSessionConfig 按 {config:{…}, overridden_fields:[…]} 读，平铺五项为
+// 兼容位只增保留）：
 //
 //	{"session_id":"…",
+//	 "config":{"model":"…","reasoning_effort":"…",
+//	           "provider":{"base_url":"…","api_key_env":"…"},
+//	           "tools":{"only":[…],"except":[…]},
+//	           "context":{"kind":"…","window":…,"l1_pct":…,"l2_pct":…,
+//	                       "rules_budget":…,"common_sense_budget":…}},
 //	 "model":"…","reasoning_effort":"…",
 //	 "provider":{"base_url":"…","api_key_env":"…"},
 //	 "tools":{"only":[…],"except":[…]},
@@ -59,6 +66,8 @@ import (
 type SessionConfigView struct {
 	// SessionID 被查询的 session id。
 	SessionID string `json:"session_id"`
+	// Config 是生效配置的嵌套组（与下方平铺五项同值——driver 读嵌套、平铺留给旧消费者）。
+	Config SessionEffectiveConfig `json:"config"`
 	// Model 当前生效模型（fold 覆盖优先；否则 hub 默认）。
 	Model string `json:"model,omitempty"`
 	// ReasoningEffort 当前生效的思维链档位（空 = 不传，端点用默认档）。
@@ -73,6 +82,23 @@ type SessionConfigView struct {
 	//
 	// 恒为数组（空 = [] 不是 null——前端 forEach 不必判空）。
 	OverriddenFields []string `json:"overridden_fields"`
+}
+
+// SessionEffectiveConfig 是生效配置的**嵌套组**（driver / 配置面板读 `config` 字段）。
+//
+// 与 SessionConfigView 的平铺五项同值同语义（只增兼容位：嵌套给 driver 的
+// AlasolSessionConfig 形状 {config:{…}}，平铺留给按旧形状读的消费者）。
+type SessionEffectiveConfig struct {
+	// Model 当前生效模型（fold 覆盖优先；否则 hub 默认）。
+	Model string `json:"model,omitempty"`
+	// ReasoningEffort 当前生效的思维链档位（空 = 不传）。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
+	// Provider 生效的 provider（端点 + 凭据**变量名**；绝不含凭据值）。
+	Provider SessionProviderView `json:"provider"`
+	// Tools 生效的工具白名单（未设置 = 不限；显式空数组 = 一个都不暴露）。
+	Tools SessionToolsView `json:"tools"`
+	// Context 生效的上下文装配面（G-h 六项）。
+	Context SessionContextView `json:"context"`
 }
 
 // SessionProviderView 是生效的 provider 面（端点 + 凭据**变量名**）。
@@ -222,6 +248,14 @@ func (h *Hub) effectiveSessionConfig(sid contracts.Ulid, cur sessioncfg.SessionC
 		L2Pct:             params.L2TargetPct,
 		RulesBudget:       params.RulesBudget,
 		CommonSenseBudget: params.CommonSenseBudget,
+	}
+	// 嵌套组 = 平铺五项的同一份值（driver 读 config 字段；一次赋值防两处漂移）。
+	view.Config = SessionEffectiveConfig{
+		Model:           view.Model,
+		ReasoningEffort: view.ReasoningEffort,
+		Provider:        view.Provider,
+		Tools:           view.Tools,
+		Context:         view.Context,
 	}
 	return view
 }

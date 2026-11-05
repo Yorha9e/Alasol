@@ -10,3 +10,6 @@ dist/
 
 # tool-local config (kimi-code 的本地配置目录——机器本地，不入库)
 .kimi-code/
+
+# 联调本地文件（db/日志/配置——机器本地，不入库）
+debug/

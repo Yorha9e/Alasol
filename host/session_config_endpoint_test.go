@@ -82,6 +82,13 @@ func TestSessionConfigEndpointDefaults(t *testing.T) {
 	if view.Provider.BaseURL != "" {
 		t.Errorf("provider.base_url = %q，want 空（hub 默认没配端点）", view.Provider.BaseURL)
 	}
+	// 嵌套 config 组 = 平铺五项同值（driver 按 {config:{…}} 读）。
+	if view.Config.Model != view.Model || view.Config.ReasoningEffort != view.ReasoningEffort {
+		t.Errorf("嵌套 config 与平铺不同值: config=%+v", view.Config)
+	}
+	if view.Config.Provider != view.Provider || view.Config.Context != view.Context {
+		t.Errorf("嵌套 config 的 provider/context 与平铺不同值: %+v vs %+v", view.Config, view)
+	}
 	// 工具白名单：没写过 → 未设置（不限）——不是"显式空数组"。
 	if view.Tools.Only != nil || view.Tools.Except != nil {
 		t.Errorf("tools 未设置时不该出现白名单: only=%v except=%v", view.Tools.Only, view.Tools.Except)
