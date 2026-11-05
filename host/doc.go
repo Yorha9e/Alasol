@@ -187,14 +187,43 @@
 //
 // # 前端接入方式（v3-S4，G5 口径）：**必须同源，或自备代理**
 //
-// hub 只监听 loopback（N5b）+ WS 校验 Origin（同源才放行）+ **/api/* 不返回 CORS 头**——
-// 这是**有意的安全口径**（无 cookie、无 token，跨源页面不该能驱动本地 hub）。因此第三方前端：
+// hub 只监听 loopback（N5b）+ WS 校验 Origin（同源才放行）+ **默认** /api/* 不返回
+// CORS 头——这是**有意的安全口径**（无 cookie、无 token，跨源页面不该能驱动本地 hub）。
+// 因此第三方前端：
 //
 //   - **同源托管**：把前端静态文件放到 hub 的 Web UI 位（GET / 由嵌入的 index.html 服务），
 //     或用一个**同源反向代理**把静态资源 + /api + /ws 一起转发到 hub；
 //   - **不要**指望跨源 fetch / 直连 ws（浏览器会因 CORS / Origin 校验被拒——403 origin_rejected）。
 //
 // 非浏览器客户端（CLI / 脚本 / curl，无 Origin 头）不受此限，可直连。
+//
+// ## opt-in 例外通道：CORS 来源白名单（GUI 联调缺口）
+//
+// 上一条是**默认**口径，不是唯一口径：hub 有一个**显式 opt-in** 的例外通道——
+// **CORS 来源白名单**（TOML 顶层 `cors_origins`，落到 host.Config.CORSOrigins）。
+//
+// 语义（详见 host/cors.go）：
+//
+//   - **默认关 = 零行为变化**：不配 → **一个 CORS 头都不发**、OPTIONS 照旧 405/404。
+//     上面的"必须同源"口径**继续成立**（那是默认，不是被推翻的旧规矩）；
+//   - **显式列出精确 origin 才放行**：形如 `cors_origins = ["http://127.0.0.1:3080"]`。
+//     请求的 `Origin` 头**精确命中**其中之一 → 响应带
+//     `Access-Control-Allow-Origin: <该 Origin 原样>` + `Vary: Origin`；
+//     preflight（OPTIONS）命中 → **204** + 放行头（`Access-Control-Allow-Methods:
+//     GET, POST, OPTIONS` / `Access-Control-Allow-Headers: Content-Type` / ACAO / Vary）；
+//   - **未命中 / 无 Origin → 什么都不加**（fail-close：没点名的人读不到响应）；
+//   - **不支持通配 `*`**（写了**启动即拒**——`ACAO: *` 等于任何页面都能读本地 hub 的
+//     响应，与"无 cookie、无 token"的 v0 安全模型直接冲突）；条目必须是
+//     `http(s)://host:port` 形态的**精确 origin**（scheme+host+port 齐全、无路径、无
+//     尾斜杠），非法条目**启动即拒**（fail-close：半张有效的白名单比没有更难排查）；
+//   - **作用范围 = `/api/*` 全部**（统一口径，不只协调四面；含未命中路由的 404——
+//     前端 preflight 会打到任意路径）；**静态面（GET /）与 /ws 不放行**（WS 的 Origin
+//     校验维持现状：跨源页面 403 origin_rejected——事件流走 driver，不走浏览器直连）。
+//
+// **取舍**：这条通道确实让"能连上 hub 的本地页面"多了一条驱动路径——但它是**点名
+// 放行**（逐条 origin、默认关、无通配、非法即拒），不是"开一个洞"；换来的是 GUI 联调
+// 不用再架一层同源反向代理。**默认口径不动**（不配就是零行为变化），例外必须显式
+// 写出来——"谁放行了哪个源"在配置文件里看得见。
 
 // # SSH 远程控制（v4-2-A，来源 07 N4b/N5/K19 拍板 2026-10-31）
 //

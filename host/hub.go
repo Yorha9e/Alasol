@@ -166,6 +166,13 @@ type Hub struct {
 	// 其他 hub / 诊断面经 Table.HostOf 查"该 session 谁托管"，冲突 fail-close（拒绝接管）。
 	// 进程本地（发现表 live 态同款）：重启后失活，新进程重新 Claim。
 	hubID string
+	// corsAllow 是 **CORS 来源白名单**（opt-in；nil = 关 = 零行为变化）。
+	//
+	// 由 Config.CORSOrigins 装配期建一次（精确 origin 集合；非法条目在
+	// Config.validate 就启动即拒）。HTTP 出口经 withCORS 挂上（host/cors.go）：
+	// 白名单空 → 原样返回 handler（一个 CORS 头都不发）；非空 → 只放行名单里的
+	// 精确 origin，且**只作用在 /api/***（静态面与 /ws 不动）。
+	corsAllow *corsAllowlist
 
 	// ixCtx 是后台索引器的生命周期（Close 时取消）。
 	ixCtx    context.Context
@@ -674,6 +681,9 @@ func New(cfg Config) (*Hub, error) {
 		vecGate:           vecGate,
 		wal:               walStore,
 		tel:               telFile,
+		// CORS 白名单（opt-in；nil = 关 = 零行为变化）。条目合法性已在
+		// Config.validate 收口（启动即拒），这里只做"集合化"。
+		corsAllow: newCORSAllowlist(cfg.CORSOrigins),
 	}
 	// G-a 活跃窗口单源同步（构造路径）：onlineTableConfig 的 activity_window 是唯一旋钮，
 	// 发现表的活跃判定（K11 peers / agentlink presence / GET /api/sessions）必须拿到同一个

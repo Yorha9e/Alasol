@@ -25,6 +25,10 @@ var httpLog = slog.Default()
 
 // Handler 返回 hub 的 HTTP 多路复用器（GET / 与静态资源、GET /ws、GET /api/*）。
 //
+// **CORS（opt-in）**：出口挂了 CORS 来源白名单中间件（host/cors.go）——白名单空 =
+// **零行为变化**（不配就一个 CORS 头都不发、OPTIONS 照旧 405/404）；非空 = 只放行
+// 名单里的**精确 origin**，且只作用在 **/api/***（静态面与 /ws 不动）。
+//
 // 路由（Go 1.22+ 方法+通配符模式）：
 //
 //	GET /                        → ui/web 嵌入的 index.html（Web UI 单页）
@@ -287,7 +291,13 @@ func (h *Hub) Handler() http.Handler {
 	// 其余路径（非 /api 的未知静态路径）→ JSON 404（保持"前端统一按 JSON 解"）。
 	mux.HandleFunc("/", h.serveStaticNotFound)
 
-	return mux
+	// CORS 来源白名单（**opt-in**；见 host/cors.go）：白名单空 → 原样返回 mux
+	// （**零行为变化**：一个 CORS 头都不发、OPTIONS 照旧 405/404）；非空 → 只对
+	// **/api/*** 生效（静态面与 /ws 不动），命中名单里的精确 origin 才加 ACAO。
+	//
+	// 挂点 = **整个 mux 的出口**（不是逐个路由改）：统一口径（"哪个端点放行"不该
+	// 变成第二份路由表），且未命中路由的 404 也带头（前端 preflight 会打到任意路径）。
+	return h.withCORS(mux)
 }
 
 // apiTable 记录每个 API 路径模板允许的 HTTP 方法（G7 回退面判 405 vs 404 用）。

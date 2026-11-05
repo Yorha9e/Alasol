@@ -423,6 +423,22 @@ type Config struct {
 	// 零查询。数据源是索引器的 cost_tokens 派生表（J21：usage 只进成本，
 	// 绝不回填 context 快照/预算）。
 	BudgetMaxTokens int64
+
+	// ---- CORS 来源白名单（**opt-in**；默认关 = 零行为变化）----
+	//
+	// CORSOrigins 是**显式例外通道**：只有列在这里的**精确 origin** 才拿到
+	// Access-Control-Allow-Origin 放行（GUI 联调缺口：dsh 前端在别的源用浏览器直连
+	// /api/* 协调四面时需要 ACAO，否则浏览器把响应丢掉）。
+	//
+	// 口径（详见 host/cors.go）：
+	//   - **空 = 关 = 零行为变化**：一个 CORS 头都不发、OPTIONS 照旧 405/404
+	//     （host/doc.go「前端接入方式（G5）」的"必须同源"口径继续成立——那是默认）；
+	//   - 条目必须是**精确 origin**：`http(s)://host:port`（scheme+host+port 齐全、
+	//     无路径、无尾斜杠）；
+	//   - **不支持通配 `*`**（写了直接拒：那等于任何页面都能读本地 hub 的响应）；
+	//   - 非法条目**启动即拒**（validate 收口，fail-close）；
+	//   - 作用范围：`/api/*` 全部（含未命中路由的 404）；**静态面与 /ws 不放行**。
+	CORSOrigins []string
 }
 
 // validate 校验并归一化配置。
@@ -662,6 +678,15 @@ func (c *Config) validate() error {
 	// 以为开着的闸门关掉，现场零线索 → fail-close 启动即拒。
 	if c.BudgetMaxTokens < 0 {
 		return fmt.Errorf("host: Config.BudgetMaxTokens 不能为负（得到 %d；0 = 不设上限）", c.BudgetMaxTokens)
+	}
+	// CORS 来源白名单（opt-in）：条目必须是**精确 origin**（http(s)://host:port 齐全、
+	// 无路径），**不支持通配 `*`**；非法条目**启动即拒**（fail-close）。
+	//
+	// 为什么半张有效的白名单比没有更糟：配了个写错的 origin → 浏览器照旧拦跨源响应，
+	// 而现场只有"被 CORS 拦了"这一条线索，看不出是白名单写错还是没配 → 启动期当场拒，
+	// 报错文案点名是哪一条（唯一事实源 = host.ValidateCORSOrigin）。
+	if err := ValidateCORSOrigins(c.CORSOrigins); err != nil {
+		return err
 	}
 	return nil
 }

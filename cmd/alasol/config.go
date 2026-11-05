@@ -260,6 +260,12 @@ func (f *hubFlags) buildConfig() (host.Config, error) {
 		// **默认不设上限**（0）——W15 拍板口径；非 0 才在 Run 前/后设检查点。
 		BudgetMaxTokens: fc.Budget.MaxTokens,
 
+		// CORS 来源白名单（**opt-in**；**只走文件配置面**——安全敏感的放行名单 +
+		// 结构化列表，不进命令行，与 [[mcp.servers]] / [[profiles]] 同款纪律）。
+		// 空 = 关 = 零行为变化（一个 CORS 头都不发）；条目非法 → host.Config.validate
+		// 启动即拒（fail-close）。
+		CORSOrigins: append([]string(nil), fc.CORSOrigins...),
+
 		// 沙箱（v2-S4，K8/H9）：显式 flag > 文件。默认关（与 v1 等价，走 local）。
 		Sandbox:                   sandboxEnabled(f, fc),
 		SandboxWriteDirs:          sandboxWriteDirs(f, fc),

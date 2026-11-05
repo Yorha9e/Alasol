@@ -122,6 +122,20 @@ type FileConfig struct {
 	// Budget 成本预算闸门（W15，v4-4-B）：[budget] 段。**默认不设上限**（max_tokens 0）
 	// ——W15 拍板"长时程自主是卖点，预算不可控"；配了才启用 per-Run 粒度的检查点。
 	Budget BudgetFileConfig `toml:"budget"`
+	// CORSOrigins 是 CORS 来源白名单（**opt-in**；GUI 联调缺口：别的源的页面要直连
+	// /api/* 协调四面时需要 ACAO 放行）。形如：
+	//
+	//	cors_origins = ["http://127.0.0.1:3080"]
+	//
+	// 口径（与 host.Config.CORSOrigins 一致）：
+	//   - **空/缺省 = 关** = 一个 CORS 头都不发、OPTIONS 照旧 405/404（零行为变化）；
+	//   - 条目必须是**精确 origin**（http(s)://host:port 齐全、无路径、无尾斜杠）；
+	//   - **不支持通配 `*`**（写了直接拒：那等于任何页面都能读本地 hub 的响应）；
+	//   - 非法条目**启动即拒**（host.Config.validate 收口，fail-close）。
+	//
+	// **只走文件配置面**（不给 flag）：这是安全敏感的放行名单 + 结构化列表——与
+	// [[mcp.servers]] / [[profiles]] 同款纪律（不进命令行：命令行泄进 shell 历史/ps）。
+	CORSOrigins []string `toml:"cors_origins"`
 }
 
 // BlobFileConfig 是大 payload 外置 blob 的文件级配置（v4-3-A，G2e/D4）。
