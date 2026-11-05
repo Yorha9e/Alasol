@@ -30,8 +30,11 @@
 //
 // # 路径与 shell（陷阱 7 / 陷阱 8）
 //
-//   - read/write 的路径**原样**交给 FSCapability（local 实现也不做守卫）：
-//     守卫是策略层的事，bash 又天然能绕开——V0 已知边界，UI 必须声明；
+//   - read/write 的路径交给 FSCapability 之前，先按**会话工作区**解析（L2 per-session
+//     执行上下文 · 件 1）：相对路径锚到工作区根、越出工作区根即拒；绝对路径原样透传；
+//     工作区为空 = 零行为变化（相对路径按进程 cwd）。详见 workspace.go。
+//     **能力层（local）仍不做任何校验**——那是内核/沙箱的事，这里只是"别让模型手滑"
+//     的软边界，不是安全边界（真隔离归 runtime/cap/sandbox）；
 //   - bash **显式**起 shell（Unix: bash -c，Windows: cmd /c，build tag 分平台）。
 //     这与 Exec 能力"不走 shell"不矛盾：那是能力层不猜语义，这里是工具层明确要用 shell。
 package tools

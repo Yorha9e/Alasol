@@ -197,6 +197,9 @@ func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 	if err := validateContextChange(cfg.Context); err != nil {
 		return err
 	}
+	if err := validateExecChange(cfg.Exec); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -211,6 +214,21 @@ func validatePromptConfig(cfg *contracts.ConfigChangedPayload) error {
 func (h *Hub) validatePromptConfigFor(sid contracts.Ulid, cfg *contracts.ConfigChangedPayload) error {
 	if err := validatePromptConfig(cfg); err != nil {
 		return err
+	}
+	// L2 件 2：执行面变更的**宿主口径**校验——sandbox / remote 执行面不支持
+	// per-session 工作区（v1）→ 写时拒绝（400 bad_config + 零事件），不静默回落。
+	//
+	// 与创建面同一口径（CreateSession 的 fail-close）：那条拒绝的是"新建带工作区的
+	// 会话"，这条拒绝的是"给已有会话改工作区"——两者都是"这个执行面没有确定语义"。
+	if cfg != nil && cfg.Exec != nil && !h.hubExecWorkspaceSupported() {
+		return errExecUnsupportedOnSandbox
+	}
+	// L2 件 2（critic P1-1）：exec 组两项**互斥**——已绑 worktree 时不能只改 cwd
+	// （worktree 优先 → cwd 静默 no-op，用户以为改了其实没改）。
+	if cfg != nil && cfg.Exec != nil {
+		if err := h.validateExecWorkspaceAmbiguity(sid, cfg.Exec); err != nil {
+			return err
+		}
 	}
 	if cfg == nil || cfg.Context == nil {
 		return nil // 没有上下文面变更 → 宿主口径无额外校验
@@ -514,8 +532,11 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	//
 	// **context 出现即是有变更**（G-h）：同款口径——`{"config":{"context":{}}}` 落一条
 	// 事件（子字段各自 LWW：各项都没带 = 各项都不变；但"这次动过上下文面"要可审计）。
+	//
+	// **exec 出现即是有变更**（L2 件 2）：同款口径——`{"config":{"exec":{}}}` 落一条
+	// 事件（子字段各自 LWW：两项都没带 = 两项都不变；但"这次动过执行面"要可审计）。
 	if cfg.Model == nil && cfg.ReasoningEffort == nil && cfg.Provider == nil &&
-		cfg.Tools == nil && cfg.Context == nil {
+		cfg.Tools == nil && cfg.Context == nil && cfg.Exec == nil {
 		return nil
 	}
 	if ctx == nil {
@@ -543,6 +564,13 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	// 例外：`tools:{}`（**两子项都缺**）= **清除整组**（回默认）——回填不适用
 	// （"清除"就是"两项都未设置"，不能拿旧值填回去）。
 	cfg = backfillToolsFromFold(cfg, h.cfgTable.Current(sid).Tools)
+	// L2 件 2（critic P2-5）：exec.cwd **规范化**后再落——两入口同一口径（创建面也
+	// 规范化）：相对路径会随调用点的 cwd 漂移，且"配置里显示的"与"工具实际落点"
+	//	得是同一个字符串。规范化失败 → fail-close（不落半条配置）。
+	cfg, err := canonicalizeExecPayload(cfg)
+	if err != nil {
+		return err
+	}
 	raw, err := json.Marshal(normalizeConfigPayload(cfg))
 	if err != nil {
 		return fmt.Errorf("host: 序列化 config.changed payload: %w", err)
@@ -567,6 +595,18 @@ func (h *Hub) recordConfigChanged(ctx context.Context, sid, agentID contracts.Ul
 	if _, err := h.cfgFeed.catchUp(ctx); err != nil {
 		hubLog.Warn("host: config.changed 落库后配置 fold catch-up 失败（下一次 Run 会重试）",
 			"session_id", string(sid), "err", err.Error())
+	}
+	// L2 件 2：exec 组变了 → **失效缓存的 loop**（工作区是 loop 的**构造期**值，
+	// 件 1 的设计：会话事实，不随每次调用变）。不失效的话，运行期改了工作区而
+	// loop 还缓存着 → 新工作区**不生效**（用户改了配置却看到老行为 = 静默失效）。
+	//
+	// 失效手法照 activateWorkflow 的同款（delete h.loops[sid]）：下次 RunPrompt 走
+	// loopFor 时重建（主 agent id 稳定、agent 树保留——树是 session 活状态）。
+	//
+	// 注意：**创建时**落的那条 exec 事件也走这里——那时 loop 还没建，删一个不存在的
+	// 键 = 无副作用（nil map 的 delete 也是 no-op）。
+	if cfg.Exec != nil {
+		h.invalidateLoopForWorkspace(sid)
 	}
 	return nil
 }

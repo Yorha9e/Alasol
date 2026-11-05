@@ -27,6 +27,7 @@ func BashDescriptor() contracts.Tool {
 	return contracts.Tool{
 		Name: toolNameBash,
 		Description: strPtr(fmt.Sprintf("执行一条 shell 命令（按 %s 语法解释，同步等待并返回退出码/stdout/stderr）。"+
+			"命令在会话工作区目录里执行（未配置工作区时为进程当前工作目录）。"+
 			"输出可能含环境回显（命令自己 echo 出来的），框架已对**注入的凭据**做脱敏（值替换为 ***），"+
 			"但请不要依赖回显来取凭据。", shellSyntax)),
 		Schema:     bashSchema,
@@ -89,7 +90,13 @@ func (e *BashExecutor) Execute(ctx context.Context, intent contracts.ToolCallInt
 	res, err := e.exec.Run(ctx, core.ExecSpec{
 		Name: shellName, // 平台常量（build tag）
 		Args: []string{shellFlag, args.Command},
-		Env:  childEnv(ctx), // 净化父 env + ctx 注入键（H16/H18/H21）
+		// 工作目录（L2 per-session 执行上下文 · 件 1）：会话工作区；**空 = 继承进程 cwd**
+		// （现状，零行为变化）。命令的相对路径（cd 过去再写文件之类）因此落在工作区里。
+		//
+		// ExecSpec.Dir 本来就有（接口零改动）；这里只是**填**它——执行器仍只注册一份，
+		// 每次调用带一份工作目录。
+		Dir: workspaceFromCtx(ctx),
+		Env: childEnv(ctx), // 净化父 env + ctx 注入键（H16/H18/H21）
 	})
 	if err != nil {
 		// 起不来 / 被取消 / IO 失败——这些才是 error。

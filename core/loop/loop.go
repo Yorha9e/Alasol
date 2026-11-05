@@ -110,6 +110,21 @@ type Config struct {
 	System string
 	// SessionEnv session 级 env 注入（H21：与单次调用注入合并；值永不进事件/日志）。
 	SessionEnv core.EnvScope
+	// Workspace 是**会话工作区根**（L2 per-session 执行上下文 · 件 1）：工具相对路径的
+	// 锚点 + bash / git 的工作目录。
+	//
+	// **每 session 一值、构造期固定**（与 SessionEnv 同款位置）：会话工作区是"这次会话
+	// 在哪个目录里干活"的**会话事实**，不是每次调用各填一份的参数——故它是**构造期**
+	// 的值（loop 建成时定下，不随单次调用变化）。
+	//
+	// **运行期改工作区（config.changed{exec}）的口径**：宿主会**失效并重建**缓存的
+	// loop（见 host/config_fold.go 的 recordConfigChanged），故新工作区对**之后重建的
+	// Run** 生效；**已经在跑的那一轮不中断**（它用的是本 loop 构造时定下的工作区——
+	// 事件流里的路径与那一轮的实际落点因此仍自洽）。
+	//
+	// 空 = **不锚定**：工具按现状行为走（相对路径按进程 cwd、bash 继承进程 cwd）——
+	// 零行为变化的老装配（cmd 直连 / 单测）不受影响。
+	Workspace string
 	// MaxTurns 单次 Run 的最大轮数（0 = DefaultMaxTurns；防模型失控）。
 	MaxTurns int
 	// ContextBudget 上下文窗口预算 token（0 = DefaultContextBudget）。只用于
@@ -486,8 +501,11 @@ type Loop struct {
 	model      string
 	system     string
 	sessionEnv core.EnvScope
-	maxTurns   int
-	agents     *Agents
+	// workspace 是**会话工作区根**（L2 per-session 执行上下文 · 件 1）：构造期固定，
+	// 每次工具调用经 ctx 带给执行器（见 execContext）。
+	workspace string
+	maxTurns  int
+	agents    *Agents
 
 	// reasoningEffort 思维链档位（G14；空 = 不传）。见 Config.ReasoningEffort。
 	reasoningEffort string
@@ -641,6 +659,7 @@ func New(cfg Config) (*Loop, error) {
 		model:                cfg.Model,
 		system:               cfg.System,
 		sessionEnv:           cfg.SessionEnv,
+		workspace:            cfg.Workspace,
 		maxTurns:             maxTurns,
 		agents:               cfg.Agents,
 		reasoningEffort:      strings.TrimSpace(cfg.ReasoningEffort),

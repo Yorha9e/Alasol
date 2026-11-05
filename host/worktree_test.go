@@ -143,13 +143,17 @@ func TestHostWorktreeHTTP(t *testing.T) {
 	}
 }
 
-// TestCreateSessionWarnsWorktreeIsolationNotEnabled：绑定 worktree 时必须打一条
-// **醒目告警**——"绑了 worktree" 目前**不等于**"工具在 worktree 里跑"（工具仍在进程 cwd）。
+// TestCreateSessionWarnsWorktreeWorkspaceIsSoftBoundary：绑定 worktree 时必须打一条
+// **醒目告警**——L2 per-session 执行上下文（件 2）之后，绑定 worktree **确实**把会话
+// 工作区锚到了该目录（工具相对路径锚它、bash 的 cwd 是它），但那是**软边界**：
+// 绝对路径原样透传、越界判定是词法的。真隔离归沙箱。
 //
-// 为什么要有这条告警：绑定只影响自动 gate 的 repo_id 与工作区登记，工具执行仍是
-// hub 一次性注册的（host/hub.go：tools.NewRead(local.FS{})）——相对路径落到进程 cwd。
-// 静默绑定 = 用户以为工具被隔离了（实测会写错地方），这是必须喊出来的边界。
-func TestCreateSessionWarnsWorktreeIsolationNotEnabled(t *testing.T) {
+// 为什么要有这条告警：静默绑定 = 用户以为工具被**安全**隔离了（实测：绝对路径照样
+// 能写出去）——这是必须喊出来的边界。
+//
+// （L2 之前这条告警说的是"工具级隔离未启用"；件 2 落地后语义变了：工具**会**在
+// worktree 里跑，故告警改成"已锚定 + 这是软边界"。）
+func TestCreateSessionWarnsWorktreeWorkspaceIsSoftBoundary(t *testing.T) {
 	repo := initGitRepo(t, filepath.Join(t.TempDir(), "repo"))
 	h := newTestHub(t)
 	ctx := context.Background()
@@ -169,8 +173,11 @@ func TestCreateSessionWarnsWorktreeIsolationNotEnabled(t *testing.T) {
 		t.Fatalf("CreateSession(Worktree): %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "工具级隔离未启用") {
-		t.Fatalf("绑定 worktree 必须告警\"工具级隔离未启用\"，日志 = %q", out)
+	if !strings.Contains(out, "会话工作区") {
+		t.Fatalf("绑定 worktree 必须告警\"会话工作区已锚定\"，日志 = %q", out)
+	}
+	if !strings.Contains(out, "软边界") {
+		t.Fatalf("告警必须点明这是软边界（绝对路径不受限、真隔离归沙箱），日志 = %q", out)
 	}
 	if !strings.Contains(out, wt.Name) {
 		t.Fatalf("告警应带上 worktree 名 %q，日志 = %q", wt.Name, out)
@@ -181,27 +188,31 @@ func TestCreateSessionWarnsWorktreeIsolationNotEnabled(t *testing.T) {
 	if _, err := h.CreateSession(host.SessionSpec{CWD: t.TempDir()}); err != nil {
 		t.Fatalf("CreateSession(无 worktree): %v", err)
 	}
-	if out := buf.String(); strings.Contains(out, "工具级隔离未启用") {
+	if out := buf.String(); strings.Contains(out, "会话工作区") {
 		t.Fatalf("没绑 worktree 不该告警，日志 = %q", out)
 	}
 }
 
-// TestSessionSpecWorktreeDocStatesToolIsolationGap：**文档契约**钉子——
-// SessionSpec.Worktree 的注释必须写明"工具级隔离未启用"，不许再宣称"有效工作目录
-// 即该 worktree 路径"（那是 v1-S5 早期的不实描述，会让用户以为工具被隔离了）。
-func TestSessionSpecWorktreeDocStatesToolIsolationGap(t *testing.T) {
+// TestSessionSpecWorktreeDocStatesWorkspaceBoundary：**文档契约**钉子——
+// SessionSpec.Worktree 的注释必须写明"绑了 worktree = 会话工作区锚到该目录"以及
+// "这是软边界、真隔离归沙箱"，不许再宣称旧的"工具级隔离未启用"（那是 L2 之前的
+// 事实，现在是错的——工具确实在 worktree 里跑了）。
+func TestSessionSpecWorktreeDocStatesWorkspaceBoundary(t *testing.T) {
 	src, err := os.ReadFile("discovery.go")
 	if err != nil {
 		t.Fatalf("读 discovery.go: %v", err)
 	}
 	doc := string(src)
-	if !strings.Contains(doc, "工具级隔离") {
-		t.Fatalf("SessionSpec 的文档必须写明工具级隔离未启用（否则又会对用户撒谎）")
+	if !strings.Contains(doc, "会话工作区") {
+		t.Fatalf("SessionSpec 的文档必须写明绑定 worktree = 会话工作区锚到该目录（否则用户不知道工具在哪跑）")
+	}
+	if !strings.Contains(doc, "软边界") {
+		t.Fatalf("SessionSpec 的文档必须写明这是软边界（绝对路径不受限、真隔离归沙箱）")
+	}
+	if strings.Contains(doc, "工具级隔离未启用") {
+		t.Fatalf("SessionSpec 的文档仍在宣称\"工具级隔离未启用\"——L2 件 2 之后这句已经不成立（工具确实在 worktree 里跑）")
 	}
 	if strings.Contains(doc, "有效工作目录") {
 		t.Fatalf("SessionSpec 的文档仍在宣称\"有效工作目录即 worktree 路径\"——与实现不符")
-	}
-	if !strings.Contains(doc, "进程 cwd") {
-		t.Fatalf("SessionSpec 的文档必须写明工具仍在进程 cwd 执行")
 	}
 }

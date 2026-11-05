@@ -21,7 +21,10 @@ package host
 //     空数组**（前者不限、后者一个工具都不暴露）；
 //   - context：kind 走 resolveContextKindWith（session 覆盖叠加基线 kind），数值走
 //     effectiveContextParams（写时校验与本读面共用同一份合并），再按 compaction 的
-//     缺省归一（Params.Normalized）。
+//     缺省归一（Params.Normalized）；
+//   - exec（L2 件 2）：会话工作区——**没有 hub 默认**（hub 级 Config.CWD 是 gate 推导
+//     输入，不是工具的工作目录），生效值 = fold 的 exec 组（子字段各自：空串 = 清除
+//     → 不锚定）。
 //
 // # 凭据纪律（H15）
 //
@@ -48,7 +51,7 @@ import (
 // SessionConfigView 是 GET /api/sessions/{id}/config 的响应形状（配置面板种子化用）。
 //
 // 形状（与 GUI 建议一致；`config` 是同一生效配置的**嵌套组**——driver 的
-// AlasolSessionConfig 按 {config:{…}, overridden_fields:[…]} 读，平铺五项为
+// AlasolSessionConfig 按 {config:{…}, overridden_fields:[…]} 读，平铺六项为
 // 兼容位只增保留）：
 //
 //	{"session_id":"…",
@@ -56,17 +59,19 @@ import (
 //	           "provider":{"base_url":"…","api_key_env":"…"},
 //	           "tools":{"only":[…],"except":[…]},
 //	           "context":{"kind":"…","window":…,"l1_pct":…,"l2_pct":…,
-//	                       "rules_budget":…,"common_sense_budget":…}},
+//	                       "rules_budget":…,"common_sense_budget":…},
+//	           "exec":{"workspace":"…","cwd":"…","worktree":"…"}},
 //	 "model":"…","reasoning_effort":"…",
 //	 "provider":{"base_url":"…","api_key_env":"…"},
 //	 "tools":{"only":[…],"except":[…]},
 //	 "context":{"kind":"…","window":…,"l1_pct":…,"l2_pct":…,
 //	             "rules_budget":…,"common_sense_budget":…},
-//	 "overridden_fields":["model","context.kind",…]}
+//	 "exec":{"workspace":"…","cwd":"…","worktree":"…"},
+//	 "overridden_fields":["model","context.kind","exec.cwd",…]}
 type SessionConfigView struct {
 	// SessionID 被查询的 session id。
 	SessionID string `json:"session_id"`
-	// Config 是生效配置的嵌套组（与下方平铺五项同值——driver 读嵌套、平铺留给旧消费者）。
+	// Config 是生效配置的嵌套组（与下方平铺六项同值——driver 读嵌套、平铺留给旧消费者）。
 	Config SessionEffectiveConfig `json:"config"`
 	// Model 当前生效模型（fold 覆盖优先；否则 hub 默认）。
 	Model string `json:"model,omitempty"`
@@ -78,6 +83,8 @@ type SessionConfigView struct {
 	Tools SessionToolsView `json:"tools"`
 	// Context 当前生效的上下文装配面。
 	Context SessionContextView `json:"context"`
+	// Exec 当前生效的**执行面**（会话工作区；L2 per-session 执行上下文 · 件 2）。
+	Exec SessionExecView `json:"exec"`
 	// OverriddenFields 是"session 级显式写过"的字段清单（点分路径；空 = 全用 hub 默认）。
 	//
 	// 恒为数组（空 = [] 不是 null——前端 forEach 不必判空）。
@@ -86,7 +93,7 @@ type SessionConfigView struct {
 
 // SessionEffectiveConfig 是生效配置的**嵌套组**（driver / 配置面板读 `config` 字段）。
 //
-// 与 SessionConfigView 的平铺五项同值同语义（只增兼容位：嵌套给 driver 的
+// 与 SessionConfigView 的平铺六项同值同语义（只增兼容位：嵌套给 driver 的
 // AlasolSessionConfig 形状 {config:{…}}，平铺留给按旧形状读的消费者）。
 type SessionEffectiveConfig struct {
 	// Model 当前生效模型（fold 覆盖优先；否则 hub 默认）。
@@ -99,6 +106,32 @@ type SessionEffectiveConfig struct {
 	Tools SessionToolsView `json:"tools"`
 	// Context 生效的上下文装配面（G-h 六项）。
 	Context SessionContextView `json:"context"`
+	// Exec 生效的执行面（会话工作区；L2 件 2 两项）。
+	Exec SessionExecView `json:"exec"`
+}
+
+// SessionExecView 是**执行面**（会话工作区；L2 per-session 执行上下文 · 件 2）的读面。
+//
+// **三个字段，两种语义**（别混）：
+//
+//   - **workspace = 生效值**：真正生效的工作区根（解析结果：exec 组 ⊕ 创建登记 +
+//     worktree 名 → 路径）。空 = **不锚定**（工具按进程 cwd）。
+//   - **cwd / worktree = 声明原值**：fold 里写了什么（用户/创建时声明的）。
+//
+// 为什么分开：cwd 与 worktree 是**同一件事的两种写法**（路径 / 受管根里的具名工作区），
+// 两者都在时 **worktree 优先**（见 host/exec_workspace.go）——于是"声明的 cwd"未必
+// 是"生效的工作区"。只回显声明值 = 读面谎报"生效的工作区"（critic P1-1）。
+//
+// **没有 hub 默认这一层**：hub 级 Config.CWD 是**自动 gate 的 repo_id 推导输入**，不是
+// 工具的工作目录——把它当默认工作区会静默改变既有部署的工具行为。故两项都空 =
+// "本 session 不锚定工作区"（相对路径按进程 cwd）。
+type SessionExecView struct {
+	// Workspace 真正生效的工作区根（空 = 不锚定 = 工具按进程 cwd）。
+	Workspace string `json:"workspace,omitempty"`
+	// Cwd **声明原值**：会话工作区目录（空 = 未声明 / 已清除）。
+	Cwd string `json:"cwd,omitempty"`
+	// Worktree **声明原值**：受管 worktree 名（空 = 未声明 / 已清除）。
+	Worktree string `json:"worktree,omitempty"`
 }
 
 // SessionProviderView 是生效的 provider 面（端点 + 凭据**变量名**）。
@@ -249,13 +282,31 @@ func (h *Hub) effectiveSessionConfig(sid contracts.Ulid, cur sessioncfg.SessionC
 		RulesBudget:       params.RulesBudget,
 		CommonSenseBudget: params.CommonSenseBudget,
 	}
-	// 嵌套组 = 平铺五项的同一份值（driver 读 config 字段；一次赋值防两处漂移）。
+	// exec（L2 件 2）：会话工作区。
+	//
+	// **workspace = 真正生效的工作区根**（解析结果：exec 组 ⊕ 创建登记 + worktree 名
+	// → 路径）；空 = 不锚定（工具按进程 cwd）。
+	//
+	// **cwd / worktree 是"声明原值"**（fold 里写了什么），**不是**生效值——两者在
+	// "绑了 worktree + 又手写 cwd"时可能不同（worktree 优先，见
+	// host/exec_workspace.go）。只回显声明值会让读面**谎报"生效的工作区"**
+	//（critic P1-1）→ 面板要问"工具到底在哪跑"，看 workspace。
+	specCwd, specWorktree := h.sessionSpecExec(sid)
+	view.Exec.Workspace = h.execWorkspaceResolve(cur.Exec, specCwd, specWorktree)
+	if cur.Exec.Cwd.Written {
+		view.Exec.Cwd = strings.TrimSpace(cur.Exec.Cwd.Value)
+	}
+	if cur.Exec.Worktree.Written {
+		view.Exec.Worktree = strings.TrimSpace(cur.Exec.Worktree.Value)
+	}
+	// 嵌套组 = 平铺六项的同一份值（driver 读 config 字段；一次赋值防两处漂移）。
 	view.Config = SessionEffectiveConfig{
 		Model:           view.Model,
 		ReasoningEffort: view.ReasoningEffort,
 		Provider:        view.Provider,
 		Tools:           view.Tools,
 		Context:         view.Context,
+		Exec:            view.Exec,
 	}
 	return view
 }
@@ -314,6 +365,13 @@ func overriddenFieldsOf(cur sessioncfg.SessionConfig) []string {
 	}
 	if cur.Context.CommonSenseBudget.Written {
 		out = append(out, "context.common_sense_budget")
+	}
+	// exec（L2 件 2）：会话工作区两项（点分路径 exec.cwd / exec.worktree）。
+	if cur.Exec.Cwd.Written {
+		out = append(out, "exec.cwd")
+	}
+	if cur.Exec.Worktree.Written {
+		out = append(out, "exec.worktree")
 	}
 	return out
 }

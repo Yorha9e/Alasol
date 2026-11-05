@@ -140,6 +140,17 @@ func wantEventCount(t *testing.T, cwd string) int {
 	return n
 }
 
+// wantEventCountWithWorkspace 是「**创建时显式声明了工作区**」的变体：多一条
+// config.changed{exec}（L2 per-session 执行上下文 · 件 2 的创建时持久化——会话工作区
+// 是会话事实，落成事件才能重启不丢）。
+//
+// 只对**经 CreateSession 带 cwd/worktree 建出来的** session 成立；用 host.NewSession()
+// 裸建的 session 没有执行面 → 仍是 wantEventCount 条。
+func wantEventCountWithWorkspace(t *testing.T, cwd string) int {
+	t.Helper()
+	return wantEventCount(t, cwd) + 1
+}
+
 // newRepoHub 装配一个 Hub 并把 hub 级默认工作目录指到 repo（自动 gate 按它算）。
 func newRepoHub(t *testing.T, repo string) *host.Hub {
 	t.Helper()
@@ -703,7 +714,9 @@ func TestConcurrentPromptsTwoSessionsOneHub(t *testing.T) {
 			}
 		}
 	}
-	// 在线表 n 行，事件数一致（每 session = gate.joined + 7 条 loop 事件）。
+	// 在线表 n 行，事件数一致（每 session = gate.joined + 7 条 loop 事件
+	// + **1 条创建时的 config.changed{exec}**——L2 件 2：显式声明了工作区的创建要落
+	// 一条持久化事件，见 wantEventCountWithWorkspace）。
 	rows, err := h.Sessions(context.Background())
 	if err != nil {
 		t.Fatalf("Sessions: %v", err)
@@ -711,9 +724,10 @@ func TestConcurrentPromptsTwoSessionsOneHub(t *testing.T) {
 	if len(rows) != n {
 		t.Fatalf("在线表 = %d 行，want %d", len(rows), n)
 	}
+	want := wantEventCountWithWorkspace(t, repo)
 	for _, r := range rows {
-		if r.EventCount != 8 {
-			t.Fatalf("session %s event_count = %d，want 8", r.SessionID, r.EventCount)
+		if r.EventCount != int64(want) {
+			t.Fatalf("session %s event_count = %d，want %d", r.SessionID, r.EventCount, want)
 		}
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -786,9 +785,12 @@ func New(cfg Config) (*Hub, error) {
 	h.monitor.Start(h.monCtx)
 
 	// 多 worktree 隔离（v1-S5 D）：受管根目录（可配，缺省派生自事件库目录）。
+	//
+	// 派生口径走 **DefaultWorktreeRoot**（唯一口径）：CLI resume 也用同一套派生
+	// （否则 CLI 解析不到 hub 建的 worktree → 工作区静默回落 cwd）。
 	wtRoot := strings.TrimSpace(cfg.WorktreeRoot)
 	if wtRoot == "" {
-		wtRoot = filepath.Join(filepath.Dir(cfg.DBPath), "worktrees")
+		wtRoot = DefaultWorktreeRoot(cfg.DBPath)
 	}
 	wm, werr := worktree.NewManager(wtRoot)
 	if werr != nil {
@@ -1091,6 +1093,18 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	if sessionID == "" {
 		return nil, false, errors.New("host: sessionID 必填（空 = 用 NewSession()/CreateSession() 先取一个）")
 	}
+	// ① **先扫平配置 fold**（DB I/O，**必须在取 h.mu 之前**）：会话工作区的持久真相在
+	//    事件流里（config.changed{exec}）——扫不平就不知道当前工作区（fail-close：
+	//    拿一个不确定的工作区开跑，工具的落点会与事件流里的路径对不上）。
+	//
+	//    **为什么放在锁外**：h.mu 是 hub 的总锁（loops / specs / mainAgents / …）；
+	//    在它里面做 DB I/O 会把**整个 hub 的其它请求**一起挡住（一次扫库几十毫秒，
+	//    足以让并发调用排队）。解析本身只读 fold 表（表自带锁），不碰 h.mu。
+	//
+	//    代价：缓存命中的路径也扫一次（增量扫描 = 水位查询，无新事件时几乎零成本）。
+	if _, err := h.cfgFeed.catchUp(ctx); err != nil {
+		return nil, false, fmt.Errorf("host: 扫配置事件流（会话工作区）: %w", err)
+	}
 	h.mu.Lock()
 	if h.hubID == "" {
 		h.hubID = string(core.NewUlid()) // 字面量构造的 Hub（内部测试）兜底：Claim 需要非空宿主标识
@@ -1200,6 +1214,24 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 			ChildStrategy: h.childStrategyFactory(sessionID),
 		}
 	}
+	// L2 per-session 执行上下文 · 件 2：解析本 session 的**会话工作区**（构造期值 =
+	// 会话事实）。
+	//
+	// 生效链：**config.changed 的 exec 组（fold，持久真相）⊕ SessionSpec（创建时登记，
+	// 纯内存）** → 解析 worktree 名到实际路径 → loop.Config.Workspace。
+	// 详见 host/exec_workspace.go（"生效链"与"fold ⊕ spec 的取舍"）。
+	//
+	// **hub 级 cfg.CWD 不做默认工作区**（有意为之）：它是**自动 gate 的 repo_id 推导
+	// 输入**，不是工具的工作目录——拿它当默认会**静默改变既有部署的工具行为**（今天
+	// 所有没配工作区的 session 都在进程 cwd 里跑）。三者都空 → "" → 件 1 的零行为
+	// 变化路径。
+	//
+	// 数据来源：fold 表（**自带锁**，这里只读）+ specs（本函数已持 h.mu，直接读 map）。
+	// **不做 DB I/O**（扫平已在取锁之前做完）。
+	//
+	// spec 先取出来（后面装配完还要用它做自动 gate 的输入；这里只读，早取无副作用）。
+	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
+	workspace := h.execWorkspaceResolve(h.cfgTable.Current(sessionID).Exec, spec.CWD, spec.Worktree)
 	lp, err := loop.New(loop.Config{
 		Provider:        h.provider,
 		Bus:             h.bus,
@@ -1212,6 +1244,9 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 		System:          system,
 		MaxTurns:        h.cfg.MaxTurns,
 		ReasoningEffort: h.cfg.ReasoningEffort, // 思维链档位（G14；空 = 不传）
+		// 会话工作区（L2 件 2）：工具相对路径的锚点 + bash / git 的工作目录；
+		// 空 = 不锚定（相对路径按进程 cwd、bash 继承进程 cwd = 件 1 的零行为变化路径）。
+		Workspace: workspace,
 		// G-c/G-d 生效链第三层：per-Run 覆盖钩子——每个 prompt 的 Run 开头重取
 		// config.fold（扫平事件流）+ 叠 hub 默认 → 冻结进 runState（轮 = Run 开始
 		// 重取；运行中变更不影响已冻结的本轮，下一轮生效）。无配置事件时返回零值
@@ -1261,7 +1296,6 @@ func (h *Hub) loopFor(ctx context.Context, sessionID contracts.Ulid) (*loop.Loop
 	}
 	// ⚠ **这里不发布**（P0-1）：loop 建好但还没进 h.loops——托管权（Claim）拿到之后才发布。
 	// 提前发布 = 冲突方能从缓存里拿到一个"本 hub 没托管"的 loop → 双写事件（G25 破）。
-	spec := h.specs[sessionID] // 未登记 → 零值（CWD/RunID 空）→ 用 hub 级默认
 	autoDone := h.autoGates[sessionID]
 	hubID := h.hubID
 	h.mu.Unlock()

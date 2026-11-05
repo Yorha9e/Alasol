@@ -187,6 +187,31 @@ type ContextState struct {
 	CommonSenseBudget NumField
 }
 
+// ExecState 是 session **执行面**（会话工作区，L2 per-session 执行上下文）的折叠态。
+//
+// 形态照 ProviderState：**子字段各自 LWW**（cwd 与 worktree 各带一个戳，后写的子项
+// 只覆盖自己那一项；没带的子项沿用上一次的值）。
+//
+// 为什么不学 ToolsState 的整组 LWW：cwd 与 worktree 是**同一件事的两种写法**（路径 /
+// 受管 worktree 根里的具名工作区）——整组 LWW 下"只改 cwd"会把 worktree 静默清掉，
+// 而 worktree 往往是**创建时登记的归属**（清掉它等于悄悄解绑）。
+//
+// 子项三态（字符串三态，见 Field）：
+//
+//	出现 = 覆盖该项；空串 = 清除该项（回到不锚定 / 不绑 worktree）；缺失 = 不变。
+//
+// **没有"hub 默认"这一层**：会话工作区**不**从 hub 级 Config.CWD 继承（那是 gate 推导
+// 的输入，不是工具的工作目录——把它当默认会静默改变既有部署的工具行为）。故
+// HasValue=false = "这一项没设"（由调用方按"不锚定"处理），而不是"回默认"。
+type ExecState struct {
+	// Touched 表示 exec 对象曾在变更集里出现过（含"两项都没带"的空对象）。
+	Touched bool
+	// Cwd 是会话工作区根目录的折叠态（字符串三态：空串 = 清除该项）。
+	Cwd Field
+	// Worktree 是受管 worktree 名的折叠态（字符串三态：空串 = 清除该项）。
+	Worktree Field
+}
+
 // SessionConfig 是一个 session 的配置 fold 结果（**值类型**：Current 返回副本，
 // 调用方读它不持有表锁）。生效值 = 各字段 HasValue() 的 Value，否则由调用方叠
 // hub 默认（生效链第一层在 host/loop 装配里）。
@@ -198,6 +223,8 @@ type SessionConfig struct {
 	Tools ToolsState
 	// Context 是 session 上下文装配面（G-h）的折叠态（子字段各自 LWW，见 ContextState）。
 	Context ContextState
+	// Exec 是 session 执行面（会话工作区，L2）的折叠态（子字段各自 LWW，见 ExecState）。
+	Exec ExecState
 }
 
 // fieldState 是表内单字段的折叠态（值 + LWW 戳）。
@@ -270,10 +297,23 @@ type sessionState struct {
 	tools toolsState
 	// context 是上下文装配面（G-h）的折叠态（**子字段各自 LWW**：每个子项自带戳）。
 	context contextState
+	// exec 是执行面（会话工作区，L2）的折叠态（**子字段各自 LWW**：cwd / worktree
+	// 各自带戳）。
+	exec execState
 	// seen 是已折叠的 config.changed 事件 id 集合（Generation 的计数源：按事件 id
 	// 去重 → 幂等重放不重数、乱序投递不漏数）。id 为空的事件不计（纵深防御：拿不到
 	// 稳定判别位就不拿它推进"届数"，避免所有无 id 事件挤成一个计数）。
 	seen map[contracts.Ulid]struct{}
+}
+
+// execState 是表内 exec 面的折叠态（**子字段各自 LWW**：cwd / worktree 各一个戳）。
+type execState struct {
+	// seen 表示 exec 对象出现过（含空对象；"出现过"是事实）。
+	seen bool
+	// cwd 是会话工作区根目录的折叠态（字符串三态）。
+	cwd fieldState[string]
+	// worktree 是受管 worktree 名的折叠态（字符串三态）。
+	worktree fieldState[string]
 }
 
 // contextState 是表内 context 面的折叠态（**子字段各自 LWW**：每个子项一个戳，
@@ -431,6 +471,20 @@ func (t *Table) Apply(ev *contracts.Event) {
 			st.context.cs.apply(*p.Context.CommonSenseBudget, seq, ev.TS)
 		}
 	}
+	// exec 面（L2 per-session 执行上下文 · 件 2）：**子字段各自 LWW**（与 provider 同口径）。
+	// cwd / worktree 各带一个戳：后写的子项只覆盖自己那一项；没带的子项**沿用上一次
+	// 的值**（整组 LWW 会把"只改 cwd"变成"顺带解绑 worktree"——那不是我们要的语义）。
+	//
+	// 子项三态：出现 = 覆盖；**空串 = 清除该项**（不锚定 / 不绑 worktree）；缺失 = 不变。
+	if p.Exec != nil {
+		st.exec.seen = true // exec 对象出现过（含空对象；"出现过"是事实）
+		if p.Exec.Cwd != nil {
+			st.exec.cwd.apply(*p.Exec.Cwd, seq, ev.TS)
+		}
+		if p.Exec.Worktree != nil {
+			st.exec.worktree.apply(*p.Exec.Worktree, seq, ev.TS)
+		}
+	}
 }
 
 // Current 返回某 session 的配置 fold 结果（值类型副本；未知 session → 零值 =
@@ -466,6 +520,11 @@ func (t *Table) Current(sessionID contracts.Ulid) SessionConfig {
 			L2Pct:             floatFieldOf(&st.context.l2),
 			RulesBudget:       numFieldOf(&st.context.rules),
 			CommonSenseBudget: numFieldOf(&st.context.cs),
+		},
+		Exec: ExecState{
+			Touched:  st.exec.seen,
+			Cwd:      stringFieldOf(&st.exec.cwd),
+			Worktree: stringFieldOf(&st.exec.worktree),
 		},
 	}
 }

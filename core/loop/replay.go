@@ -80,6 +80,16 @@ func (l *Loop) Replay(ctx context.Context, op durable.Op) (durable.ReplayResult,
 
 	// 执行 env：重放不注入新凭据（H21：session/单次注入是发起时刻的事）；用进程 env 经 ctx。
 	execCtx := core.WithEnv(ctx, l.sessionEnv)
+	// 执行作用域（L2 per-session 执行上下文 · 件 1，**执行点 B**）：重放同样要把"本次在
+	// 哪个工作区跑"带给执行器。
+	//
+	// 为什么这里**必须**注入（漏了 = 最隐蔽的一种错）：重放的是上一次进程发起的同一个
+	// 已授权操作，它要落在**同一个工作区**——漏注入时工具按进程 cwd 解析相对路径，
+	// 于是重放把文件写到了别处：结果**看起来成功**（有 completed 事件），但内容错位，
+	// 而且没有任何报错能提示（"写成功了"）。比"重放失败"更糟——失败至少是显性的。
+	//
+	// 与执行点 A（toolcall.go）同款：只加 ctx 值，X1 三段形状与落盘序一字不动。
+	execCtx = l.withExecScope(execCtx)
 	res, execErr := executeSafely(execCtx, exec, intent)
 	if execErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {

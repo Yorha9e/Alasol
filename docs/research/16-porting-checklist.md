@@ -126,7 +126,7 @@ cmd/  →  host/  →  core/  →  contracts/
 | `btw.forked` | true | `BtwForkedPayload` | 一次 `/btw` 旁支 fork 的事实记录：`source_session_id` + `question`；**只附带上下文**（对话历史，带条数/长度上限 + 截断告知）、**不复制 ledger/gate**；envelope 归属 fork session → 主 session **零新增**；预埋 `BtwPromote` 钩子（只埋点不实现）。 |
 | `workflow.activated` | true | `WorkflowActivatedPayload` | 一个 session 激活一个工作流能力包：`workflow_id` + 可选 `command`（**实际敲出来的** slash 命令名）+ `philosophy` 原文；能力包**不是流程、非强制**（W1/W2）。 |
 | `workflow.milestone` | true | `WorkflowMilestonePayload` | 一次工作流里程碑被处理：`workflow_id` + `milestone`（开放字符串）+ `passed` + 可选 `note`；**框架不强制序列**（W2/W21）。 |
-| `config.changed` | true | `ConfigChangedPayload` | per-prompt 配置变更的事实记录：`model` / `reasoning_effort` / `provider{base_url, api_key_env}` / `tools{only, except}` / `context{kind, window, l1_pct, l2_pct, rules_budget, common_sense_budget}`；**当前配置 = 事件 fold**（逐字段 LWW）；envelope 归属被改配置的 session。 |
+| `config.changed` | true | `ConfigChangedPayload` | per-prompt 配置变更的事实记录：`model` / `reasoning_effort` / `provider{base_url, api_key_env}` / `tools{only, except}` / `context{kind, window, l1_pct, l2_pct, rules_budget, common_sense_budget}` / `exec{cwd, worktree}`（L2 per-session 执行上下文 · 会话工作区）；**当前配置 = 事件 fold**（逐字段 LWW）；envelope 归属被改配置的 session。 |
 
 **kind 表的纪律**（移植时最容易破的三处）：
 1. **kind 是开放字符串**（D6）——不是封闭枚举；新 harness 收到未知 kind 要**跳过但持久化**（D7）。
@@ -200,7 +200,7 @@ envelope（`contracts/transport.go` `TransportMessage`）：`v` / `id` / `kind` 
 | 7 | GET | `/api/extensions` | 扩展注册表**只读**快照（全 kind + Health；空能力列表归一为 `[]`） | — |
 | 8 | POST | `/api/extensions/{name}/enable` | E3 能力裁决后启用 | 200 / 403（能力未获准）/ 404 `extension_not_found` / 409（`ErrStale`）/ 400 `bad_extension_name` |
 | 9 | POST | `/api/extensions/{name}/disable` | 软停用（幂等，可再 enable） | 200 / 404 `extension_not_found` / 400 `bad_extension_name` / 500 `extension_disable_failed` |
-| 10 | GET | `/api/sessions` | 在线表（最多 `MaxSessionRows` 行；`hostable` / `host_hub` / `online` / `running` / `last_activity` / `waiting`）；`?online=true\|false\|1\|0` | 400 `bad_online`（**显式给了空值也 400**）/ 500 `sessions_failed` |
+| 10 | GET | `/api/sessions` | 在线表（最多 `MaxSessionRows` 行；`hostable` / `host_hub` / `online` / `running` / `last_activity` / `waiting`）；`?online=true\|false\|1\|0`。**带工作区的 session 创建即上表**（L2 件 2：创建时落一条 `config.changed{exec}` → 事件流里有它 → 投影收它——**有意**：工作区是会话事实，创建即有事实；否则"会话存在但工作区没登记"是查不出来的半截状态） | 400 `bad_online`（**显式给了空值也 400**）/ 500 `sessions_failed` |
 | 11 | POST | `/api/sessions` | 开新会话（201 `{"session_id"}`；**不自动跑 prompt**）；体 `{"cwd","run_id","worktree","profile"}` | 400 `bad_body` / 400 `session_create_failed` / 400 `bad_profile` / 500 `session_host_failed` |
 | 12 | GET | `/api/cost` | 跨 session token 成本汇总（J21） | 500 `cost_failed` |
 | 13 | GET | `/api/cost/{session_id}` | 单 session token 成本（按模型分组） | 400 `bad_session_id` / 404 `no_cost` / 500 `cost_failed` |
@@ -238,7 +238,7 @@ envelope（`contracts/transport.go` `TransportMessage`）：`v` / `id` / `kind` 
 | 45 | GET | `/api/approvals/pending` | 挂起审批枚举面（G11；空表 → `[]`） | — |
 | 46 | GET | `/api/sessions/{session_id}/agents` | agent 树只读快照（`agent_id`/`parent_agent_id`/`depth`/`agent_type`/`role`/`status` + summary） | 404 `unknown_session`（既没树也不由本进程托管） |
 | 47 | GET | `/api/profiles` | 命名 profile 表（按 name 升序；空表 → `{"profiles":[]}`；**只出 `api_key_env` 变量名，绝不含 key 值**） | — |
-| 48 | GET | `/api/sessions/{session_id}/config` | 该 session 当前**生效**配置（嵌套 `config` 组 + 平铺五项 + `overridden_fields`） | 404 `unknown_session`（事件流里没见过）/ 500 `session_config_failed` |
+| 48 | GET | `/api/sessions/{session_id}/config` | 该 session 当前**生效**配置（嵌套 `config` 组 + 平铺六项 + `overridden_fields`；含 L2 的 `exec{cwd, worktree}`） | 404 `unknown_session`（事件流里没见过）/ 500 `session_config_failed` |
 
 **路由面纪律**：
 - **第 1–3 行不走 `reg`**：它们用 `mux.HandleFunc` 直接注册（静态面与 WS 面不进"路径→方法"表，故不受 405 口径管）；第 4 行起的 45 条 `/api/*` **全部经 `reg(...)`**。
@@ -537,11 +537,12 @@ hub 启动默认（Config）
 | provider | `provider{base_url, api_key_env}` | **子字段各自 LWW** | 同上；**改 `base_url` 必须同时给 `api_key_env`**（不静默把 hub 凭据发给第三方端点）；值只从 env 取 |
 | 工具 | `tools{only, except}` | **整组 LWW**（不拆子字段跨事件合并） | 组出现 = 整组覆盖 / 组缺失 = 不变 / `tools:{}` = 清除回默认；组内子项：出现 = 覆盖、**空数组 = 清空该项**、缺失 = 该项未设置 |
 | 上下文 | `context{kind, window, l1_pct, l2_pct, rules_budget, common_sense_budget}` | **子字段各自 LWW**（不学 tools 的整组 LWW） | 出现 = 覆盖 / 缺失 = 不变 / **数值 0 = 清除回默认** / `kind` 空串 = 清除回默认 |
+| 执行面 | `exec{cwd, worktree}`（L2 会话工作区） | **子字段各自 LWW** | 出现 = 覆盖 / 缺失 = 不变 / **空串 = 清除该项**（回到不锚定）；**没有 hub 默认这一层**（hub 级 `Config.CWD` 是 gate 推导输入，不是工作目录）；`worktree` 名字 → 路径由 host 经受管根解析（解析不到回落 `cwd`） |
 | 策略 | `policy` | **不实现** | G-g 拍板不做运行时权限修改面（见 §9.6） |
 
 **`kind` 的值域（可来回切）**：`""`（清除回默认）/ `append`（显式追加式，session 能把 tiered 显式切回来）/ `tiered`。**"来回切"是无损的**：tiered 段有 `stage:N` 压缩痕迹，append 段全量原样，**切回 append 后全量历史完整**（压缩摘要是投影，丢的是摘要不是原文）。
 
-**写时校验（host 层，fail-close、零事件）**：`reasoning_effort` 白名单；`base_url` 必须配 `api_key_env`；`tools` 元素非空串、**单数组上限 256**、**不校验是否已注册**；`context.kind` 白名单、数值非负、tiered 时 window ≥ **256k**、百分比 ∈ (0,100] 且 L2 ≤ L1、布局自洽（唯一事实源 = `compaction.ValidateLayout`）。**生效组合校验** = fold + 本次提交 + 宿主默认叠起来仍合法。
+**写时校验（host 层，fail-close、零事件）**：`reasoning_effort` 白名单；`base_url` 必须配 `api_key_env`；`tools` 元素非空串、**单数组上限 256**、**不校验是否已注册**；`context.kind` 白名单、数值非负、tiered 时 window ≥ **256k**、百分比 ∈ (0,100] 且 L2 ≤ L1、布局自洽（唯一事实源 = `compaction.ValidateLayout`）；`exec.cwd` 须是可用的绝对目录、`exec.worktree` 须是名字（不含路径分隔符）、**sandbox / remote 执行面下带工作区的会话创建时拒绝**（v1）。**生效组合校验** = fold + 本次提交 + 宿主默认叠起来仍合法。
 
 **profile 叠放次序**（G-i）：**先展开 profile → 再让显式 config 逐字段压过 → 合成一条 `config.changed`**（审计里看得见**展开后的值**）。各组按自己的 LWW 口径压。**profile 的空字段 = 不覆盖**（模板语义），**不是**"清除"语义（清除是显式 config 层的空串）。
 
@@ -1038,7 +1039,7 @@ env 面固定：`ALASOL_MODEL` / `ALASOL_BASE_URL` / `ALASOL_EMBEDDING_MODEL` / 
 | telemetry model 未随覆盖 | telemetry record 的 model 字段不随 per-Run 覆盖更新 | 同上 |
 | standby 可被白名单藏掉 | session 工具白名单能把 `standby` 藏掉（**预期语义**） | 07 批次3 收口挂账 |
 | fork 预算口径 | `RunBtw` 只查**主 session** 的账；旁支花费记在 fork session 名下、不在闸门口径内 | `host/budget.go` 文件头 |
-| worktree 工具级隔离 | 工具仍跑进程 cwd（worktree 登记表**不持久化**） | 07 v1-S5 挂账段 |
+| worktree 会话工作区 | **会话工作区已锚定**（L2 per-session 执行上下文：绑 worktree 的 session，工具的相对路径 / bash 工作目录落在该 worktree 里）；**仍是软边界**——绝对路径原样透传、越界判定是词法的（不解析符号链接/junction），**真隔离归沙箱**；worktree 登记表**不持久化**（进程内活状态，启动时从 git 元数据重建） | 07 v1-S5 挂账段 + L2 件 2 |
 | `tui` 自动化交互测试 | 未做 | 07 v1-S5 挂账段 |
 | **`ui` 依赖规则的窄例外** | `ui/doc.go` 自述"只依赖 contracts，不 import core"，但 `ui/tui/approver.go` 为实现 `core.Approver` 桥 import 了 core（接口断言）——**如实标注，移植时重新决定去留** | §0.2 |
 | 二进制打包 A/B/C | **二进制打包 A/B/C**（GUI 页面嵌入与否）：待拍板（建议 C） | `14-v4-plan.md:34` |

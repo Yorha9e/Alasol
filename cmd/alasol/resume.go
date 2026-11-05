@@ -25,6 +25,7 @@ import (
 	"github.com/Yorha9e/alasol/runtime/store/sqlite"
 	"github.com/Yorha9e/alasol/runtime/store/walfile"
 	"github.com/Yorha9e/alasol/runtime/verify"
+	"github.com/Yorha9e/alasol/runtime/worktree"
 )
 
 // resumeCapText 把恢复上界说成人话（分钟 / 秒 / 毫秒；测试调小后不至于说"0 分钟"）。
@@ -334,6 +335,26 @@ func resumeMain(args []string) int {
 		return ov, nil
 	}
 
+	// L2 per-session 执行上下文 · 件 2（critic P1-2）：**会话工作区**也要跟着走。
+	//
+	// 为什么必须解析：重放执行的是"上一次进程发起的同一个已授权操作"——它要落在
+	// **同一个工作区**里。漏了的话工具按**进程 cwd** 解析相对路径 → 重放把文件写到
+	// 别处：结果**看起来成功**（有 completed 事件），但内容错位，且没有任何报错能提示
+	// （比"重放失败"更糟——失败至少是显性的）。
+	//
+	// **与 serve 面同一取值口**（host.ResolveSessionWorkspace = 唯一取值口）：两边各
+	// 写一份解析，迟早漂移成"serve 里工具落在 A、resume 重放落在 B"。
+	//
+	// CLI 没有 hub 的 specs（纯内存登记）+ worktree 登记表（进程内活状态）：
+	//   - specs → 传空（fold 是持久真相，CLI 单进程无并发写者，折一次即得）；
+	//   - worktree 名 → 经**同一套派生口径**（host.DefaultWorktreeRoot：<事件库目录>/
+	//     worktrees）建管理器并从磁盘重建登记表；重建不了 / 根不存在 → **回落 cwd**
+	//     （解析不到 worktree 名 → cwd 兜底，见 ResolveSessionWorkspace 的口径）。
+	workspace := host.ResolveSessionWorkspace(cfgTable.Current(sid).Exec, "", "", resumeWorktreeResolver(*dbPath))
+	if workspace != "" {
+		fmt.Fprintf(os.Stderr, "[resume] 会话工作区: %s\n", workspace)
+	}
+
 	// loop：恢复流程里它只作 durable.Replayer（重放时按 op.Intent 直接执行工具、落结果事件）。
 	//
 	// ReasoningEffort（G14）：上面已解析（flag > 文件 + 白名单校验）；这里只把它交给 loop。
@@ -347,6 +368,9 @@ func resumeMain(args []string) int {
 		Model:           modelName,
 		ReasoningEffort: reasoningEffortVal,
 		RunOverrides:    runOverrides,
+		// L2 件 2：会话工作区（重放要在**同一个工作区**里落地——见上面的解析段）。
+		// 空 = 不锚定（工具按进程 cwd = 件 1 的零行为变化路径）。
+		Workspace: workspace,
 		// G-c（F7）：续跑也走生效链——Run 开头冻结 fold 的覆盖（优先于上面的基值）。
 		Store: st,
 		// D4：大 payload 外置（v4-3-A，G2e）——重放落下的 completed 与续跑那一轮的
@@ -494,4 +518,39 @@ type noopProvider struct{}
 
 func (noopProvider) Run(context.Context, core.ModelRequest, func(core.ProviderEvent)) (core.ModelResult, error) {
 	return core.ModelResult{}, fmt.Errorf("resume 回路不调用模型（仅重放工具，X2）")
+}
+
+// resumeWorktreeResolver 造"worktree 名 → 实际路径"的解析口（CLI 侧；L2 件 2）。
+//
+// **为什么 CLI 要自己建**：worktree 登记表是**进程内活状态**（host 的 worktree.Manager），
+// CLI 是另一个进程 → 拿不到那张表。按**同一套派生口径**（host.DefaultWorktreeRoot：
+// <事件库目录>/worktrees）建一个管理器，并从**磁盘上的 git 元数据**重建登记表
+// （runtime/worktree 的 Rebuild —— hub 启动时做的是同一件事）。
+//
+// 拿不到就返回 nil（解析不到 worktree 名 → 取值口回落 cwd；见
+// host.ResolveSessionWorkspace 的口径）：**不猜**——猜错 = 工作区静默换地方。
+//
+// 根目录不存在（这个事件库压根没用过 worktree）→ 直接 nil（不建目录、不留痕）。
+func resumeWorktreeResolver(dbPath string) func(name string) (string, bool) {
+	root := host.DefaultWorktreeRoot(dbPath)
+	if root == "" {
+		return nil
+	}
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		return nil // 受管根不存在 → 没有 worktree 可解析
+	}
+	wm, err := worktree.NewManager(root)
+	if err != nil {
+		return nil
+	}
+	if _, err := wm.Rebuild(context.Background()); err != nil {
+		return nil // 重建失败 → 解析不到 → 回落 cwd（不猜）
+	}
+	return func(name string) (string, bool) {
+		wt, ok := wm.Get(strings.TrimSpace(name))
+		if !ok {
+			return "", false
+		}
+		return wt.Path, true
+	}
 }

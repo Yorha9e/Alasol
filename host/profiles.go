@@ -168,7 +168,9 @@ func profileConfigPayload(p ProfileConfig) *contracts.ConfigChangedPayload {
 //     凭据纪律由合并后的变更集统一校验）；
 //   - tools：**整组**压（tools 组本来就是整组 LWW——显式带 tools 就整组覆盖 profile 的）；
 //   - context：**子字段各自**压（context 面的子字段各自 LWW——显式只改窗口不该把
-//     profile 的百分比一起打回未设置）。
+//     profile 的百分比一起打回未设置）；
+//   - exec：**子字段各自**压（L2 件 2：exec 组是子字段各自 LWW——显式只改 cwd 不该
+//     把 profile 的 worktree 一起打回未设置）。
 //
 // 返回**新**对象（不改调用方的结构体）。
 func overlayConfig(base, top *contracts.ConfigChangedPayload) *contracts.ConfigChangedPayload {
@@ -236,6 +238,27 @@ func overlayConfig(base, top *contracts.ConfigChangedPayload) *contracts.ConfigC
 			ctx.CommonSenseBudget = &v
 		}
 		out.Context = ctx
+	}
+	// exec（L2 件 2）：**子字段各自**压（与 provider / context 同口径）。
+	//
+	// profile 的**执行面**（CWD / Worktree）不在这里——它们是**会话创建面**的参数
+	// （进 SessionSpec → 创建时落 config.changed{exec}），不是 config.changed 变更集
+	// 的内容（profileConfigPayload 只折"配置面"）。这里处理的是**显式请求里带来的
+	// exec 组**——不能被 profile 展开吞掉（否则"带 profile 提交工作区"会被静默丢弃）。
+	if top.Exec != nil {
+		exec := &contracts.ExecConfigChange{}
+		if base.Exec != nil {
+			*exec = *base.Exec
+		}
+		if top.Exec.Cwd != nil {
+			v := *top.Exec.Cwd
+			exec.Cwd = &v
+		}
+		if top.Exec.Worktree != nil {
+			v := *top.Exec.Worktree
+			exec.Worktree = &v
+		}
+		out.Exec = exec
 	}
 	return &out
 }

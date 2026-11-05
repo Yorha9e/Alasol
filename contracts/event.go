@@ -448,7 +448,7 @@ type BtwForkedPayload struct {
 	Question string `json:"question"`
 }
 
-// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}；第二批字段：tools（工具白名单，G-e）；第三批字段：context（上下文装配面，G-h）；后续批次只增 policy 字段，不预留占位——F7 只增，届时再加。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）；tools 的元素非空串、数量上限由 host 层校验（工具名**不**校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行，白名单语义天然容错）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
+// config.changed —— G-c per-prompt 配置体系的载体（F7 只增全链）：POST /prompt body 的 config 与 WS command.submit 的 config 槽位修改 session 配置（本轮生效 + 持久 + 重启生效），修改本身作为 durable 事件落流——当前配置 = 事件 fold（逐字段 last-write-wins，F5 纪律：当前态 = 索引器投影，事件流是唯一事实源），重启回放即得、审计免费（谁何时改了什么都在事件流）。**变更集语义**：字段**出现**（含显式空串）= 覆盖该项；字段**缺失** = 不变；空串 = 清除回 hub 默认。首批字段：model / reasoning_effort / provider{base_url, api_key_env}；第二批字段：tools（工具白名单，G-e）；第三批字段：context（上下文装配面，G-h）；第四批字段：exec（执行面 / 会话工作区，L2 per-session 执行上下文）；后续批次只增 policy 字段，不预留占位——F7 只增，届时再加。合法性与凭据纪律由 host 层校验（契约层只定形状、不校验取值）：reasoning_effort 非空时取值白名单 low/medium/high/xhigh（G14）；改 base_url 必须同时显式给 api_key_env（不静默把 hub 凭据发给第三方端点）；tools 的元素非空串、数量上限由 host 层校验（工具名**不**校验是否已注册——注册表可变，点名未注册的工具只是**模型看不到**：隐藏的工具仍按 policy/perm 正常判定——可见≠可执行，白名单语义天然容错）。session 归属在 envelope（session_id/agent_id = 被修改配置的该 session 及其主 agent），payload 不带 id。
 type ConfigChangedPayload struct {
 	// 目标模型名覆盖：出现 = 覆盖为该值；空串 = 清除回 hub 默认；缺失 = 不变。
 	Model *string `json:"model,omitempty"`
@@ -460,6 +460,16 @@ type ConfigChangedPayload struct {
 	Tools *ToolsConfigChange `json:"tools,omitempty"`
 	// 上下文装配面变更集（G-h）：缺失 = 不变；出现 = 按 ContextConfigChange 的语义覆盖（**子字段各自 LWW**：与 provider 同口径，不学 tools 的整组 LWW——避免一次只带部分子项的提交把别的子项静默丢掉）。
 	Context *ContextConfigChange `json:"context,omitempty"`
+	// 执行面（会话工作区）变更集（L2 per-session 执行上下文 · 件 2）：缺失 = 不变；出现 = 按 ExecConfigChange 的语义覆盖或清除（**子字段各自 LWW**，与 provider 同口径）。
+	Exec *ExecConfigChange `json:"exec,omitempty"`
+}
+
+// 会话**执行面**（工作区）的变更集（config.changed 的 payload.exec）：修改该 session 的**会话工作区**——工具相对路径的锚点 + bash / git 的工作目录（L2 per-session 执行上下文）。持久化（config.changed 落流 → fold → 重启不丢：h.specs 那种纯内存登记重启即丢，懒接管回来的 session 不能悄悄换工作区）+ **重建 loop 后生效**（Workspace 是 per-loop 构造期值 = 会话事实，不是每次调用各填一份的参数）。**子字段各自 LWW**（与 provider 同口径）：每个子项出现 = 覆盖该项；缺失 = 该项不变；**空串 = 清除该项**（回到不锚定 / 进程 cwd）。cwd 与 worktree 是同一件事的两种写法（路径 / 受管 worktree 根里的具名工作区）：两者都有时**以 worktree 解析出的路径为准、cwd 兜底**（创建时两者一致——cwd 就是该 worktree 的路径）；worktree 名解析不到（受管根里没有它）时回落 cwd。合法性与取值由 host 层校验（契约层只定形状）：sandbox / remote 执行面下 per-session 工作区 v1 **不支持**（创建时拒绝，不静默回落）；cwd 须是存在的本地目录；**cwd 与 worktree 不能同时指向工作区**（歧义：worktree 优先会让 cwd 静默 no-op）→ 写时 400 bad_config（要改用 cwd 需**同时**把 worktree 写空串清除）。
+type ExecConfigChange struct {
+	// 会话工作区根目录（本地绝对路径）：出现 = 覆盖为该路径；空串 = 清除（回到不锚定：相对路径按进程 cwd、bash 继承进程 cwd）；缺失 = 不变。
+	Cwd *string `json:"cwd,omitempty"`
+	// 受管 worktree 名（hub 的 worktree 根里的具名工作区）：出现 = 覆盖为该名；空串 = 清除（不绑 worktree）；缺失 = 不变。名字 → 实际路径由 host 层解析（runtime/worktree 的受管根查询）——解析不到时回落 cwd。
+	Worktree *string `json:"worktree,omitempty"`
 }
 
 // 上下文装配面的变更集（config.changed 的 payload.context）：修改该 session 的上下文装配旋钮（策略 kind / 窗口 W / L1 与 L2 目标残留百分比 / 注入区预算），持久化 + 本轮生效（生效链同 config.model：hub 默认 → session 折叠 → 本轮快照冻结）。**子字段各自 LWW**（与 provider 同口径，**不学 tools 的整组 LWW**）：每个子项出现 = 覆盖该项；缺失 = 该项不变（沿用上一次的值）；**数值 0 = 清除该项回默认**（沿用 host.Config 的 0 = 默认口径）；kind 的值空间 = 空串（清除回默认）/ append（显式追加式）/ tiered（两级压缩）。合法性与取值范围由 host 层校验（契约层只定形状）：kind 取值白名单（空串 / append / tiered）、数值非负、tiered 时窗口须过 compaction 的 W ≥ 256k 硬约束、L1 与 L2 百分比在 (0,100] 内且 L2 ≤ L1、注入区预算与窗口的布局自洽。

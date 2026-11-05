@@ -138,7 +138,7 @@ standby({wait: "message"|"handoff"|"event", timeout_min: ≤30, on_timeout: "ret
 | G-g | 权限面（config.policy）——**已拍板不做（2026-11-03 用户）**：运行时权限修改面取消，权限维持两层静态现状；理由与 F7 预留见 §5 尾条 | 3 |
 | G-j | standby 的 `event` 等待条件（等任意事件流条件的表达式与匹配） | 3（G-f 本体之后） |
 | G-h | 上下文面（context_strategy/注入区配置化） | 4 |
-| G-i | profile 机制（命名装配模板）+ 执行面（cwd/worktree/remote） | 4/后置 |
+| G-i | profile 机制（命名装配模板）+ 执行面（cwd/worktree/remote）——**执行面已落地（2026-11-05 L2）**：per-session 执行上下文（工具真锚定会话工作区；`config.changed` 增 `exec{cwd,worktree}` 持久化；详见 07 尾注与 16 清单） | 4/后置 |
 
 ## 7. 相关
 

@@ -405,6 +405,17 @@ func (h *Hub) forkLoopConfig(forkSID, forkAgent contracts.Ulid) loop.Config {
 		// G-h：fork **不继承**父 session 的上下文面配置（config.context）——与
 		// model / reasoning_effort / tools 同口径：fork 出来的是**新 session**，配置继承
 		// **hub 默认**。挂账：旁支那次请求的上下文边界另由 RunBtw ④ 的有界读兜着。
+		//
+		// L2 件 2：fork **同样不继承**父 session 的**会话工作区**（config.exec /
+		// Workspace）——与 model / tools / context 同口径：fork 出来的是**新 session**，
+		// 它的配置继承 hub 默认 = **不锚定**（工具按进程 cwd 跑）。
+		//
+		// 为什么"不继承"是对的（而不是"抄一份过来"）：工作区是**会话事实**——父会话在
+		// A 目录里干活，旁支若也锚在 A，两者会**同时**在同一个目录里写文件（互相踩），
+		// 而旁支的结果又不回灌主上下文（它是一次性执行线）。让旁支落在自己的地盘
+		// （默认 = 进程 cwd）更安全。要继承得另开一刀（fork 时显式带上父 session 的
+		// exec 组）。
+		Workspace: "", // 刻意不继承（同上：fork = 新 session，配置继承 hub 默认）
 	}
 }
 

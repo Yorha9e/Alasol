@@ -489,6 +489,7 @@ func (l *Loop) emitAgentFailed(ctx context.Context, causation *contracts.Ulid, c
 // # 透传清单（哪些跟着子 agent 走，哪些**刻意不跟**）
 //
 //	透传：Provider / Bus / Registry / Policy / Approver / SessionID / SessionEnv /
+//	      **Workspace**（L2 per-session 执行上下文：父子同 session → 同一工作区）/
 //	      MaxTurns（每层各自的上限）/ **TurnBudget**（逐轮预算闸门）/ ReasoningEffort /
 //	      BlobSink+BlobMaxInline（大 payload 外置）/ Agents（共享树）/
 //	      **RunOverrides 快照**（G-c/G-d：子 loop 复用父 Run 冻结的本轮覆盖——见 cfg）
@@ -532,7 +533,14 @@ func (l *Loop) buildChildLoop(child agents.Node, childType agents.AgentType, tas
 		Model:      model,
 		System:     system,       // type.Prompt + task
 		SessionEnv: l.sessionEnv, // 同 session 注入域
-		MaxTurns:   l.maxTurns,   // 每层独立轮数上限（层数由深度闸门限制）
+		// Workspace 透传（L2 per-session 执行上下文 · 件 1）：子 agent 与父**同 session**
+		// （K25 单流多 agent）→ 同一个会话工作区。子 agent 的工具调用若不跟着走，
+		// 就会出现"父在 worktree A 里干活、子在进程 cwd 里干活"——同一会话两个工作目录，
+		// 事件流里的路径与磁盘上的落点对不上（且子写出去的东西没人找得到）。
+		//
+		// 与 SessionEnv 同款处理：父子同 session，同一值。
+		Workspace: l.workspace,
+		MaxTurns:  l.maxTurns, // 每层独立轮数上限（层数由深度闸门限制）
 		// W15（MaxTurns 先行）：子 loop 的 MaxTurns **透传**父的（l.maxTurns）——每层各自
 		// 受这份轮数上限约束，父跑满不等于子跑满（子的截断另行冒泡成 agent.failed）。这与
 		// 父 Run 的 ctx 同源（见 runSpawn：childLoop.Run(ctx, ...)）共同覆盖子任务：

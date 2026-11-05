@@ -510,6 +510,18 @@ func TestSampleEventsDecodeIntoContracts(t *testing.T) {
 			if p.Context.CommonSenseBudget == nil || *p.Context.CommonSenseBudget <= 0 {
 				t.Errorf("line %d: config.changed context.common_sense_budget 应带正数（0 = 清除回默认）", lineNo)
 			}
+			// L2 per-session 执行上下文 · 件 2：样本钉住 exec 的真实形状（cwd + worktree
+			// 两项都带；**出现 = 覆盖**，空串 = 清除该项——样本演示覆盖形状，不该拿空串占位）。
+			if p.Exec == nil {
+				t.Errorf("line %d: config.changed 应带 exec 执行面（L2 会话工作区）", lineNo)
+				break
+			}
+			if p.Exec.Cwd == nil || strings.TrimSpace(*p.Exec.Cwd) == "" {
+				t.Errorf("line %d: config.changed exec.cwd 应带非空路径（出现 = 覆盖；空串 = 清除该项）", lineNo)
+			}
+			if p.Exec.Worktree == nil || strings.TrimSpace(*p.Exec.Worktree) == "" {
+				t.Errorf("line %d: config.changed exec.worktree 应带非空名（出现 = 覆盖；空串 = 清除该项）", lineNo)
+			}
 		default:
 			// Unknown kinds are tolerated (D7): the payload stays raw JSON.
 		}

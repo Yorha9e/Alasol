@@ -35,7 +35,7 @@ const discoveryScanBatch = 500
 // 事实源里写垃圾）。
 var ErrSessionNotHosted = errors.New("host: session 不是本 hub 在托管的 session")
 
-// worktreeIsolationNotice 是"worktree 绑定**未**启用工具级隔离"的醒目告警出口。
+// worktreeIsolationNotice 是"worktree 绑定**已**锚定会话工作区"的醒目告警出口。
 //
 // 走 slog.Default() 且**调用时**取（不是包级 var）：这样宿主换掉默认 logger 就能接住它、
 // 测试也能断言"绑定时确实告警了"（host/worktree_test.go）。默认输出与 hubLog 一致。
@@ -43,30 +43,45 @@ func worktreeIsolationNotice(msg string, args ...any) {
 	slog.Default().Warn(msg, args...)
 }
 
-// SessionSpec 是新建 session 的归属（K12 自动 gate 的输入）。
+// SessionSpec 是新建 session 的归属（K12 自动 gate 的输入）+ **会话工作区**
+// （L2 per-session 执行上下文 · 件 2）。
 //
 // v1-S2 只用到 CWD/RunID；多 worktree 隔离（v1-S5 D）加 Worktree：把一个 session **登记**到
-// 某个 hub 托管的 worktree —— **仅影响自动 gate 的 repo_id 计算与工作区登记**
-// （自动 gate 的 repo_id 按 worktree 路径算——经 git root 聚合，与主仓库同一 repo_id，S14）。
+// 某个 hub 托管的 worktree —— 影响自动 gate 的 repo_id 计算（自动 gate 的 repo_id 按
+// worktree 路径算——经 git root 聚合，与主仓库同一 repo_id，S14）与**会话工作区**。
 // gate 机制本身不随绑定改变（成员关系按 session 算，与 session 从哪来无关）。
 //
-// ⚠ **worktree 绑定目前不提供工具级隔离**：工具（read/write/bash）由 hub **一次性注册**
-// （host/hub.go：tools.NewRead(local.FS{}) 等）——相对路径落到**进程 cwd**、bash 继承进程 cwd。
-// 也就是说：绑了 worktree 的 session 写文件**不会**落在该 worktree 里（实测：落在进程 cwd）。
-// 把工具执行真正 chroot 进各 worktree 要改 core/loop 的工具执行上下文（与 X1 冲突），
-// 留作后续项；CreateSession 命中 Worktree 时会打一条醒目告警（见 worktreeIsolationNotice）。
+// # 会话工作区（L2 件 2）：CWD / Worktree 现在**锚定工具执行**
+//
+// 绑了 worktree（或给了 CWD）的 session，工具（read/write/bash/git_status）就在**那个
+// 目录**里干活：相对路径锚到工作区根、bash 的工作目录 = 工作区、git_status 探测那个
+// 目录（件 1 的 core.ExecContext + runtime/tools 的路径解析；件 2 的宿主接线见
+// host/exec_workspace.go）。
+//
+// **边界（诚实口径）**：这是**软边界**，不是安全边界——绝对路径原样透传（不被限制在
+// 工作区内），词法越界判定不解析符号链接/junction。真隔离归沙箱（runtime/cap/sandbox
+// 的 ACL + 受限 token，内核强制）。
+//
+// **sandbox / remote 执行面下不支持 per-session 工作区（v1）**：CreateSession **拒绝**
+// （fail-close，不静默回落成"照旧在进程 cwd 跑"）。
+//
+// **工作区是会话事实**：创建时落一条 config.changed{exec:{cwd,worktree}} → 持久化
+// （重启不丢；见 host/exec_workspace.go 的"为什么落 config.changed"）。因此"重启后
+// 懒接管回来的 session"不会悄悄换工作区。
 type SessionSpec struct {
 	// CWD 工作目录。自动 gate repo:<repo_id> 按它算（runtime/identity 的 RepoID，
 	// 复用其 worktree 聚合语义：同 git root 的多个 worktree 聚成同一 repo_id）。
-	// 空 = 用 hub 级默认（Config.CWD，再缺省用进程 cwd）。设了 Worktree 时以 worktree 路径为准。
-	// **不影响工具执行**（工具仍在进程 cwd——见类型注释的 ⚠）。
+	// 空 = 用 hub 级默认（Config.CWD，再缺省用进程 cwd）——**仅用于 gate 推导**：
+	// hub 级 CWD **不**作为会话工作区的默认值（那是工具的工作目录，见 host/exec_workspace.go）。
+	// 设了 Worktree 时以 worktree 路径为准。
+	// 非空 = **本 session 的会话工作区**（工具相对路径的锚点 + bash 的工作目录）。
 	CWD string
 	// RunID 工作流运行 id。有则自动加入 workflow:<run_id>；空 = 不加。
 	// 工作流引擎在 v3，这里只留钩子（没有 run_id 就没有 workflow gate）。
 	RunID string
 	// Worktree 是把本 session **登记**到哪个 hub 托管的 worktree（名字，非路径）。
-	// 非空 → CreateSession 校验它存在，并按该 worktree 路径算自动 gate 的 repo_id。
-	// ⚠ **不提供工具级隔离**（工具仍在进程 cwd 执行）——见类型注释。
+	// 非空 → CreateSession 校验它存在，并按该 worktree 路径算自动 gate 的 repo_id；
+	// 同时**该 worktree 的路径就是本 session 的会话工作区**（见类型注释）。
 	Worktree string
 }
 
@@ -234,28 +249,67 @@ func (f *discoveryFeed) forkSessions() []contracts.Ulid {
 // Hub 侧的 gate / 可见性 API
 // ---------------------------------------------------------------------------
 
-// CreateSession 生成新 session id 并登记它的归属（CWD / run_id），返回 id。
+// CreateSession 生成新 session id 并登记它的归属（CWD / run_id / worktree），返回 id。
 //
 // 调用方先拿 id 再 RunPrompt（与包级 NewSession 的关系：那个不登记归属，自动 gate 退到
 // hub 级默认）。**登记不等于激活**——自动 gate 在该 session 的 loop 建成时（第一次
 // RunPrompt）才加入，因为 gate.joined 事件的 envelope 必须带 agent_id（契约必填），
 // 而主 agent 的 id 在 loop 建成时才知道。
+//
+// # L2 per-session 执行上下文 · 件 2：创建时**持久化**会话工作区
+//
+// 给了 CWD / Worktree 时（= 显式声明了会话工作区），除登记 specs 外**落一条
+// config.changed{exec:{cwd,worktree}}**（既有写路径：bus.Publish + 确定性 id）：
+//
+//   - **为什么必须落**：specs 是纯内存（进程重启即丢）。只靠 specs 的话，重启后
+//     懒接管回来的 session 会**悄悄换工作区**（工具的落点与事件流里的路径对不上）。
+//     落成 config.changed → fold → 重启回放即得（F5：事件流是唯一事实源）。
+//   - **没给 CWD / Worktree 的普通创建仍然零事件**（既有语义不变：登记 specs 即可，
+//     自动 gate 退到 hub 级默认，工作区不锚定 = 件 1 的零行为变化路径）。
+//   - **profile 带执行参数时同样落这条事件**：profile 的执行面（CWD / Worktree）在
+//     会话创建面展开进 SessionSpec（host/http.go 的 serveSessionCreate），故走的是
+//     同一条路径、同一份落库口径。
+//   - **创建即上会话表**（有意）：这条 durable 事件让投影收下该 session → 它**提前**
+//     出现在 GET /api/sessions（在线表）里。取舍：会话工作区是**会话事实**，创建即有
+//     事实就该可查；反之"会话存在但工作区没登记"是查不出来的半截状态。
+//
+// # 主 agent id：创建时还没有 loop，故这里**先登记**一个
+//
+// config.changed 的 envelope.agent_id 是必填的（契约），而"这条配置变更归属哪个
+// agent"要有确定答案。故创建时造一个主 agent id 并**同时**用于事件 envelope 与
+// h.mainAgents 登记——两者同源（后续 loopFor 取主 agent 拿到的就是它，事件流口径
+// 与进程内登记一致）。
+//
+// # sandbox / remote 执行面：fail-close（v1）
+//
+// 执行面是 sandbox / remote 时，带工作区的会话**创建时拒绝**——那两个执行面换掉了
+// 整个工具执行环境，per-session 工作区在它们上面没有确定语义。**不静默回落**成
+// "照旧在进程 cwd 跑"（那会让用户以为工作区生效了）。
 func (h *Hub) CreateSession(spec SessionSpec) (contracts.Ulid, error) {
 	if h == nil {
 		return "", errors.New("host: Hub 为 nil")
 	}
 	cwd := strings.TrimSpace(spec.CWD)
 	wtName := strings.TrimSpace(spec.Worktree)
+	// L2 件 2：sandbox / remote 执行面不支持 per-session 工作区 → 创建时拒绝
+	// （fail-close；不静默回落成"照旧在进程 cwd 跑"）。
+	//
+	// 放在**最前面**：被拒绝的会话不该先打"工作区已锚定"的告警（那条告警是在告诉
+	// 用户"锚定了"，而这次创建根本没成）。
+	if (cwd != "" || wtName != "") && !h.hubExecWorkspaceSupported() {
+		return "", errExecUnsupportedOnSandbox
+	}
 	if wtName != "" {
 		// 登记到 worktree：校验它存在，并按 worktree 路径算自动 gate 的 repo_id。
-		// ⚠ 工具级隔离未启用（工具仍在进程 cwd）——见 SessionSpec 的注释。
 		wt, ok := h.worktrees.Get(wtName)
 		if !ok {
 			return "", fmt.Errorf("host: worktree %q 不存在（先用 CreateWorktree 建）", wtName)
 		}
 		cwd = wt.Path
-		// 醒目告警：别让用户以为"绑了 worktree = 工具在 worktree 里跑"。
-		worktreeIsolationNotice("⚠ 工具级隔离未启用：工具仍在进程 cwd 执行，worktree 绑定仅影响 gate/登记",
+		// 醒目告警：**这条边界的诚实口径**——绑定 worktree 现在确实把工具锚到该
+		// worktree（L2 件 2），但那是**软边界**（绝对路径原样透传、词法判定不解析
+		// 符号链接），不是安全边界；真隔离归沙箱。
+		worktreeIsolationNotice("⚠ worktree 绑定 = 会话工作区锚定到该目录（软边界：绝对路径不受限、真隔离归沙箱）",
 			"worktree", wtName, "worktree_path", wt.Path)
 	}
 	if cwd != "" {
@@ -275,7 +329,58 @@ func (h *Hub) CreateSession(spec SessionSpec) (contracts.Ulid, error) {
 	h.mu.Lock()
 	h.specs[sid] = SessionSpec{CWD: cwd, RunID: runID, Worktree: wtName}
 	h.mu.Unlock()
+	// L2 件 2：显式声明了工作区 → 落一条 config.changed{exec:{cwd,worktree}}（持久化）。
+	// 没声明（普通创建）→ **零事件**（既有语义不变）。
+	if cwd != "" || wtName != "" {
+		if err := h.persistSessionWorkspace(sid, cwd, wtName); err != nil {
+			// 落库失败 → **回滚**本次登记（不留半个建好的 session：specs / 主 agent
+			// 登记都撤掉）。fail-close：工作区没持久化的 session 不该被发出去用。
+			h.mu.Lock()
+			delete(h.specs, sid)
+			delete(h.mainAgents, sid)
+			h.mu.Unlock()
+			return "", err
+		}
+	}
 	return sid, nil
+}
+
+// persistSessionWorkspace 在创建时把会话工作区落成一条 config.changed 事件。
+//
+// 三件事（顺序即依赖）：
+//
+//  1. **登记主 agent id**：创建时还没有 loop，但事件 envelope 的 agent_id 必填——
+//     先造一个并登记进 h.mainAgents（与事件里的 agent_id 同源），后续 loopFor 取
+//     主 agent 拿到的就是它。
+//  2. **落事件**：经既有写路径 recordConfigChanged（bus.Publish + 确定性 id + 届数）——
+//     与其它 session 配置同一套 fold、同一套审计口径。
+//  3. **登记完再落**：主 agent id 先登记，事件落库后即使发现表还没扫到，进程内登记
+//     也已经有一致的答案（loopFor 的主 agent 解析顺序：进程内登记 → 事件流 → 新造）。
+//
+// ctx 用 hub 的**生命周期 ctx**（lifeCtx）：CreateSession 没有 ctx 参数，而落事件
+// 需要一个可取消的 ctx（hub 关库后不该再往已关的库写事件）。字面量构造的 Hub
+// （内部测试）没有 lifeCtx → 退回 context.Background()。
+func (h *Hub) persistSessionWorkspace(sid contracts.Ulid, cwd, worktree string) error {
+	if h == nil {
+		return errors.New("host: Hub 为 nil")
+	}
+	if err := h.ensureOpen(); err != nil {
+		return err
+	}
+	// ① 主 agent id：创建时登记（与事件 envelope 同源）。
+	agentID := core.NewUlid()
+	h.mu.Lock()
+	if h.mainAgents == nil {
+		h.mainAgents = make(map[contracts.Ulid]contracts.Ulid)
+	}
+	h.mainAgents[sid] = agentID
+	h.mu.Unlock()
+	// ② 落事件（既有写路径）。
+	ctx := h.lifeCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.recordExecWorkspace(ctx, sid, agentID, cwd, worktree)
 }
 
 // Discovery 返回发现表（宿主内部 / 诊断面：K10 的查询 API 都在它上面）。

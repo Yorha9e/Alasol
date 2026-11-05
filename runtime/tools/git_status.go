@@ -87,13 +87,13 @@ func GitStatusDescriptor() contracts.Tool {
 	}
 }
 
-// gitStatusSchema 是 git_status 的参数 Schema（path 可选：空 = 进程当前目录）。
+// gitStatusSchema 是 git_status 的参数 Schema（path 可选：空 = 会话工作区，再空 = 进程 cwd）。
 var gitStatusSchema = json.RawMessage(`{
   "type": "object",
   "properties": {
     "path": {
       "type": "string",
-      "description": "git 仓库目录路径（可选；空 = 进程当前工作目录）。仅用于定位仓库，本工具只读、不做任何写操作"
+      "description": "git 仓库目录路径（可选；空 = 会话工作区，未配置工作区时为进程当前工作目录）。仅用于定位仓库，本工具只读、不做任何写操作"
     }
   },
   "additionalProperties": false
@@ -134,7 +134,7 @@ func defaultGitRun(ctx context.Context, dir string, args ...string) ([]byte, err
 
 // Execute implements core.ToolExecutor。
 func (e *GitStatusExecutor) Execute(ctx context.Context, intent contracts.ToolCallIntentPayload) (contracts.ToolResult, error) {
-	// path 可选：intent.Arguments 为空 = 全默认（进程 cwd）；非空才解码校验。
+	// path 可选：intent.Arguments 为空 = 全默认（工作区，再空则进程 cwd）；非空才解码校验。
 	var args gitStatusArgs
 	if len(strings.TrimSpace(string(intent.Arguments))) > 0 {
 		if err := decodeArgs(toolNameGitStatus, intent.Arguments, &args); err != nil {
@@ -142,6 +142,12 @@ func (e *GitStatusExecutor) Execute(ctx context.Context, intent contracts.ToolCa
 		}
 	}
 	dir := strings.TrimSpace(args.Path)
+	if dir == "" {
+		// path 空 → 用会话工作区（L2 per-session 执行上下文 · 件 1）：与 bash 的工作目录
+		// 同源，"模型在哪个目录里干活"三处（read/write 的相对路径、bash 的 cwd、git 的
+		// 探测目录）说的是同一件事。工作区也空 → 回落进程 cwd（现状）。
+		dir = workspaceFromCtx(ctx)
+	}
 
 	p, err := e.probeGitStatus(ctx, dir)
 	if err != nil {

@@ -12,26 +12,21 @@ import (
 // 工作区。底层创建/清理/junction-safe 全在 runtime/worktree；本层只做装配面的方法 +
 // session 绑定（SessionSpec.Worktree，见 discovery.go）+ HTTP 绑定。
 //
-// 边界说明：worktree 的**磁盘隔离**（独立工作区、junction-safe 清理）在本段落地；但工具
-// 执行（read/write/bash）仍跑在 hub 进程 cwd——把工具执行真正 chroot 进各 worktree 需要
-// 改 core/loop 的工具执行上下文，属更深改动（与 X1 冲突），留作后续（见汇报"缺口"）。
+// # 边界（L2 per-session 执行上下文 · 件 2 落地后的现状）
 //
-// **v2-S5 重新评估后仍然留挂（①）**，具体阻塞点（不是"懒得做"）：
-//   - 工具执行器在 host.New 里**一次性注册**（tools.NewRead(local.FS{}) / tools.NewWrite /
-//     tools.NewBash(execCap)）——一个 hub 只有一套 FS/Exec 能力面，没有 per-session 的；
-//   - core/loop 也没有 per-session 执行上下文：工具调用路径是 X1 的三段写路径
-//     （intent 落盘 → 执行 → result 落盘），在这里插"按 session 换 cwd/能力"要动
-//     toolcall 的执行段——**X1 红线明令本刀不碰**；
-//   - 折中做法（每个 session 复制一套执行器 + loop 传 cwd）要么改 core/loop，要么在 host
-//     里维护 N 套注册表并与 loop 的执行段对不齐（两处真相）。
-// 因此结论：**留挂**，正确做法是作为独立一刀（"per-session 执行上下文"）连 core/loop 一起改，
-// 并配 X1 三段事件的回归测试。当前的缓解：CreateSession 命中 Worktree 时打醒目告警 +
-// SessionSpec 文档写清边界（不让用户以为"绑了 worktree = 工具在 worktree 里跑"）。
+// worktree 的**磁盘隔离**（独立工作区、junction-safe 清理）在本段落地；**工具执行**现在
+// 也**落在该 worktree 里**了：session 绑到 worktree → 该 worktree 的路径就是本 session
+// 的**会话工作区**（工具相对路径的锚点 + bash / git 的工作目录）——解析见
+// host/exec_workspace.go，执行见件 1 的 core.ExecContext / runtime/tools。
 //
-// 因此 session 绑到 worktree（SessionSpec.Worktree）**只**影响自动 gate 的 repo_id 计算与
-// 工作区登记，**不**改变工具的工作目录：CreateSession 命中 Worktree 时会打一条醒目告警
-//（"⚠ 工具级隔离未启用…"，见 host/discovery.go 的 worktreeIsolationNotice），
-// SessionSpec 的文档也据此写清了边界——别让用户以为"绑了 worktree = 工具在 worktree 里跑"。
+// **但那仍是软边界，不是安全边界**：绝对路径原样透传（不被限制在工作区内）、越界判定
+// 是**词法**的（不解析符号链接 / junction）。真隔离归沙箱（runtime/cap/sandbox 的 ACL +
+// 受限 token，内核强制）。CreateSession 命中 Worktree 时会打一条醒目告警把这条边界
+// 说清楚（见 host/discovery.go 的 worktreeIsolationNotice）。
+//
+// **sandbox / remote 执行面下不支持 per-session 工作区（v1）**：那两个执行面换掉了整个
+// 工具执行环境，per-session 工作区在它们上面没有确定语义 → **创建时拒绝**（fail-close，
+// 不静默回落成"照旧在进程 cwd 跑"）。
 
 // CreateWorktree 在 repoPath 仓库上建一个 worktree 并登记（并行任务工作区）。
 func (h *Hub) CreateWorktree(ctx context.Context, repoPath, name string) (worktree.Worktree, error) {

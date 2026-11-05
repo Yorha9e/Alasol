@@ -39,7 +39,7 @@ var readSchema = json.RawMessage(`{
   "properties": {
     "path": {
       "type": "string",
-      "description": "要读取的文件路径（原样传给文件系统；路径守卫由策略层负责，本工具不做限制）"
+      "description": "要读取的文件路径（相对路径按会话工作区根解析、越出工作区根即拒；绝对路径原样传给文件系统）"
     }
   },
   "required": ["path"],
@@ -77,7 +77,14 @@ func (e *ReadExecutor) Execute(ctx context.Context, intent contracts.ToolCallInt
 		return contracts.ToolResult{}, fmt.Errorf("%s: path 不能为空；期望形如 %s", toolNameRead, argsHint(toolNameRead))
 	}
 
-	data, err := e.fs.ReadFile(ctx, args.Path)
+	// 路径解析（L2 per-session 执行上下文 · 件 1）：相对路径按会话工作区根锚定，越界即拒；
+	// 绝对路径原样透传；工作区为空 = 现状（相对路径按进程 cwd）。详见 workspace.go 的三条口径。
+	path, err := resolveWorkspacePath(ctx, toolNameRead, args.Path)
+	if err != nil {
+		return contracts.ToolResult{}, err
+	}
+
+	data, err := e.fs.ReadFile(ctx, path)
 	if err != nil {
 		// %w：保住错误链——调用方要能 errors.Is(err, remote.ErrUnsupported) 之类
 		// 地判"这个能力面没实现"（如 Proc/Net 面的显式 ErrUnsupported）。
@@ -87,7 +94,7 @@ func (e *ReadExecutor) Execute(ctx context.Context, intent contracts.ToolCallInt
 	// （那会把文件内容污染成错的，模型还以为是原文）。
 	if !utf8.Valid(data) {
 		return contracts.ToolResult{}, fmt.Errorf("%s: 文件 %s 不是有效的 UTF-8 文本（v0 仅支持文本读取；二进制/图片内容块留 v1）",
-			toolNameRead, args.Path)
+			toolNameRead, path)
 	}
 
 	text, truncated := truncateText(data)

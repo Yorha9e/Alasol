@@ -209,6 +209,15 @@ func (l *Loop) runToolCall(ctx context.Context, turn int, tc core.ToolCallReq, s
 	// ② 执行：执行 env 只经 ctx 传递（H12/H19：值永不进事件/日志）。
 	execScope, secrets := l.buildExecEnv(ctx, desc)
 	execCtx := core.WithEnv(ctx, execScope)
+	// ②' 执行作用域（L2 per-session 执行上下文 · 件 1）：把"本次在哪个工作区跑"经 ctx
+	// 带给执行器——执行器仍只注册一份，但**每次调用**带一份作用域（工具侧据此解析相对
+	// 路径、给 bash 定工作目录）。
+	//
+	// 放在 env 注入**之后**叠：两者都只是往 ctx 上挂值，互不覆盖（键不同），顺序不影响
+	// 语义；放在一起是为了让"这次执行带了什么"在代码里一眼看得全。
+	//
+	// **X1 三段写路径与落盘序一字不动**：这里只改传给执行器的 ctx，不改任何落盘点。
+	execCtx = l.withExecScope(execCtx)
 	res, execErr := executeSafely(execCtx, exec, intent)
 	// 秘密收口（P1-1）：工具输出（命令回显）进事件、进下一轮 prompt 之前，
 	// 把**框架注入的值**逐个精确替换成 "***"。命令自己的输出是数据，原样保留。

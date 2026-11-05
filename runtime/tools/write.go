@@ -44,7 +44,7 @@ var writeSchema = json.RawMessage(`{
   "properties": {
     "path": {
       "type": "string",
-      "description": "目标文件路径（原样传给文件系统；路径守卫由策略层负责，本工具不做限制）"
+      "description": "目标文件路径（相对路径按会话工作区根解析、越出工作区根即拒；绝对路径原样传给文件系统）"
     },
     "content": {
       "type": "string",
@@ -90,10 +90,18 @@ func (e *WriteExecutor) Execute(ctx context.Context, intent contracts.ToolCallIn
 			toolNameWrite, argsHint(toolNameWrite))
 	}
 
-	if err := e.fs.WriteFile(ctx, args.Path, []byte(*args.Content)); err != nil {
+	// 路径解析（L2 per-session 执行上下文 · 件 1）：相对路径按会话工作区根锚定，越界即拒；
+	// 绝对路径原样透传；工作区为空 = 现状（相对路径按进程 cwd）。详见 workspace.go 的三条口径。
+	path, err := resolveWorkspacePath(ctx, toolNameWrite, args.Path)
+	if err != nil {
+		return contracts.ToolResult{}, err
+	}
+
+	if err := e.fs.WriteFile(ctx, path, []byte(*args.Content)); err != nil {
 		// %w：保住错误链（调用方要能 errors.Is 判底层原因，如 remote.ErrUnsupported）。
 		return contracts.ToolResult{}, fmt.Errorf("%s: %w", toolNameWrite, err)
 	}
 	// 回执里只报字节数与路径——**不回声内容**（内容模型刚给过，回显纯浪费 token）。
-	return resultText(fmt.Sprintf("wrote %d bytes to %s", len(*args.Content), args.Path)), nil
+	// 报的是**实际落点**（解析后的路径）：模型要知道东西落在哪儿，才知道下一步去哪儿读。
+	return resultText(fmt.Sprintf("wrote %d bytes to %s", len(*args.Content), path)), nil
 }
